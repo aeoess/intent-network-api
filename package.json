@@ -1,0 +1,28 @@
+{
+  "name": "intent-network-api",
+  "version": "0.1.0",
+  "description": "Hosted API for the AEOESS Intent Network — persistent IntentCard storage, matching, and intro protocol",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "agent-passport-system": "^1.13.0",
+    "helmet": "^8.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/express": "^5.0.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/cors": "^2.8.0",
+    "@types/node": "^22.0.0"
+  }
+}
