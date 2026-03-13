@@ -264,6 +264,82 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
 })
 
 // ══════════════════════════════════════
+// GET /api/resolve — Cross-protocol identity resolution
+// Implements the APS side of the AIP↔APS bridge spec
+// ══════════════════════════════════════
+
+router.get('/resolve', (req, res) => {
+  const did = String(req.query.did || '')
+
+  if (!did) {
+    res.status(400).json({ error: 'Missing ?did= query parameter. Usage: /api/resolve?did=did:aps:agentId' })
+    return
+  }
+
+  // Support did:aps:<agentId> format
+  const apsMatch = did.match(/^did:aps:(.+)$/)
+  // Also support raw agentId lookup
+  const agentId = apsMatch ? apsMatch[1] : did
+
+  const card = db.getCard(agentId)
+  if (!card) {
+    res.status(404).json({ error: `Identity not found: ${did}` })
+    return
+  }
+
+  // Return unified bridge response format (hex-encoded public key)
+  const pubKeyHex = Buffer.from(card.publicKey, 'base64').toString('hex')
+
+  res.json({
+    did: `did:aps:${card.agentId}`,
+    source_protocol: 'aps',
+    public_key: pubKeyHex,
+    public_key_type: 'Ed25519VerificationKey2020',
+    trust_summary: {
+      behavioral: null,
+    },
+    challenge_endpoint: `${req.protocol}://${req.get('host')}/api/challenge/create`,
+    resolved_at: new Date().toISOString(),
+    card_summary: {
+      needs: card.needs?.map((n: any) => n.description || n) || [],
+      offers: card.offers?.map((o: any) => o.description || o) || [],
+      expiresAt: card.expiresAt,
+    },
+  })
+})
+
+// ══════════════════════════════════════
+// POST /api/challenge/create — Challenge-response verification
+// ══════════════════════════════════════
+
+router.post('/challenge/create', (req, res) => {
+  const { did, nonce } = req.body
+  if (!did || !nonce) {
+    res.status(400).json({ error: 'Missing did or nonce' })
+    return
+  }
+
+  const apsMatch = did.match(/^did:aps:(.+)$/)
+  const agentId = apsMatch ? apsMatch[1] : did
+
+  const card = db.getCard(agentId)
+  if (!card) {
+    res.status(404).json({ error: `Identity not found: ${did}` })
+    return
+  }
+
+  const pubKeyHex = Buffer.from(card.publicKey, 'base64').toString('hex')
+
+  res.json({
+    did: `did:aps:${card.agentId}`,
+    public_key: pubKeyHex,
+    public_key_type: 'Ed25519VerificationKey2020',
+    challenge_nonce: nonce,
+    message: 'Use the public key to verify Ed25519 signatures from this agent.',
+  })
+})
+
+// ══════════════════════════════════════
 // GET /api/stats — Public network stats
 // ══════════════════════════════════════
 
