@@ -23,13 +23,22 @@ const LIMITS = {
 
 function rateLimit(action: string, limit: number) {
   return (req: AuthenticatedRequest, res: any, next: any) => {
+    // Check per-key rate limit
     const key = req.verifiedPublicKey || String(req.headers['x-public-key'] || '') || req.ip || 'anonymous'
     const check = db.checkRateLimit(key, action, limit)
     if (!check.allowed) {
       res.status(429).json({ error: 'Rate limit exceeded', retryAfterSeconds: 3600 })
       return
     }
-    res.setHeader('X-RateLimit-Remaining', check.remaining)
+    // Also check per-IP rate limit (prevents key rotation bypass)
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown'
+    const ipLimit = limit * 5 // IP limit is 5x per-key limit
+    const ipCheck = db.checkRateLimit(`ip:${ip}`, action, ipLimit)
+    if (!ipCheck.allowed) {
+      res.status(429).json({ error: 'IP rate limit exceeded', retryAfterSeconds: 3600 })
+      return
+    }
+    res.setHeader('X-RateLimit-Remaining', Math.min(check.remaining, ipCheck.remaining))
     next()
   }
 }
@@ -50,6 +59,17 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (r
   if ((!card.needs || card.needs.length === 0) && (!card.offers || card.offers.length === 0)) {
     res.status(400).json({ error: 'Card must have at least one need or offer' })
     return
+  }
+
+  // Field-level size constraints — prevent bloat and injection payloads
+  const MAX_ITEMS = 10
+  const MAX_FIELD_LEN = 1000
+  if (card.agentId.length > 200) { res.status(400).json({ error: 'agentId too long (max 200)' }); return }
+  if ((card.needs?.length || 0) > MAX_ITEMS) { res.status(400).json({ error: `Too many needs (max ${MAX_ITEMS})` }); return }
+  if ((card.offers?.length || 0) > MAX_ITEMS) { res.status(400).json({ error: `Too many offers (max ${MAX_ITEMS})` }); return }
+  for (const item of [...(card.needs || []), ...(card.offers || [])]) {
+    const desc = typeof item === 'string' ? item : item?.description || ''
+    if (desc.length > MAX_FIELD_LEN) { res.status(400).json({ error: `Field too long (max ${MAX_FIELD_LEN} chars)` }); return }
   }
 
   // Verify card signature

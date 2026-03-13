@@ -15,13 +15,22 @@ const LIMITS = {
 };
 function rateLimit(action, limit) {
     return (req, res, next) => {
+        // Check per-key rate limit
         const key = req.verifiedPublicKey || String(req.headers['x-public-key'] || '') || req.ip || 'anonymous';
         const check = db.checkRateLimit(key, action, limit);
         if (!check.allowed) {
             res.status(429).json({ error: 'Rate limit exceeded', retryAfterSeconds: 3600 });
             return;
         }
-        res.setHeader('X-RateLimit-Remaining', check.remaining);
+        // Also check per-IP rate limit (prevents key rotation bypass)
+        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+        const ipLimit = limit * 5; // IP limit is 5x per-key limit
+        const ipCheck = db.checkRateLimit(`ip:${ip}`, action, ipLimit);
+        if (!ipCheck.allowed) {
+            res.status(429).json({ error: 'IP rate limit exceeded', retryAfterSeconds: 3600 });
+            return;
+        }
+        res.setHeader('X-RateLimit-Remaining', Math.min(check.remaining, ipCheck.remaining));
         next();
     };
 }
@@ -38,6 +47,28 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (r
     if ((!card.needs || card.needs.length === 0) && (!card.offers || card.offers.length === 0)) {
         res.status(400).json({ error: 'Card must have at least one need or offer' });
         return;
+    }
+    // Field-level size constraints — prevent bloat and injection payloads
+    const MAX_ITEMS = 10;
+    const MAX_FIELD_LEN = 1000;
+    if (card.agentId.length > 200) {
+        res.status(400).json({ error: 'agentId too long (max 200)' });
+        return;
+    }
+    if ((card.needs?.length || 0) > MAX_ITEMS) {
+        res.status(400).json({ error: `Too many needs (max ${MAX_ITEMS})` });
+        return;
+    }
+    if ((card.offers?.length || 0) > MAX_ITEMS) {
+        res.status(400).json({ error: `Too many offers (max ${MAX_ITEMS})` });
+        return;
+    }
+    for (const item of [...(card.needs || []), ...(card.offers || [])]) {
+        const desc = typeof item === 'string' ? item : item?.description || '';
+        if (desc.length > MAX_FIELD_LEN) {
+            res.status(400).json({ error: `Field too long (max ${MAX_FIELD_LEN} chars)` });
+            return;
+        }
     }
     // Verify card signature
     if (!verifyIntentCard(card)) {
@@ -218,6 +249,69 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
         introsReceived: intros.received,
         hasCard: !!myCard,
         networkSize: db.getCardCount(),
+    });
+});
+// ══════════════════════════════════════
+// GET /api/resolve — Cross-protocol identity resolution
+// Implements the APS side of the AIP↔APS bridge spec
+// ══════════════════════════════════════
+router.get('/resolve', (req, res) => {
+    const did = String(req.query.did || '');
+    if (!did) {
+        res.status(400).json({ error: 'Missing ?did= query parameter. Usage: /api/resolve?did=did:aps:agentId' });
+        return;
+    }
+    // Support did:aps:<agentId> format
+    const apsMatch = did.match(/^did:aps:(.+)$/);
+    // Also support raw agentId lookup
+    const agentId = apsMatch ? apsMatch[1] : did;
+    const card = db.getCard(agentId);
+    if (!card) {
+        res.status(404).json({ error: `Identity not found: ${did}` });
+        return;
+    }
+    // Return unified bridge response format (hex-encoded public key)
+    const pubKeyHex = Buffer.from(card.publicKey, 'base64').toString('hex');
+    res.json({
+        did: `did:aps:${card.agentId}`,
+        source_protocol: 'aps',
+        public_key: pubKeyHex,
+        public_key_type: 'Ed25519VerificationKey2020',
+        trust_summary: {
+            behavioral: null,
+        },
+        challenge_endpoint: `https://${req.get('host')}/api/challenge/create`,
+        resolved_at: new Date().toISOString(),
+        card_summary: {
+            needs: card.needs?.map((n) => n.description || n) || [],
+            offers: card.offers?.map((o) => o.description || o) || [],
+            expiresAt: card.expiresAt,
+        },
+    });
+});
+// ══════════════════════════════════════
+// POST /api/challenge/create — Challenge-response verification
+// ══════════════════════════════════════
+router.post('/challenge/create', (req, res) => {
+    const { did, nonce } = req.body;
+    if (!did || !nonce) {
+        res.status(400).json({ error: 'Missing did or nonce' });
+        return;
+    }
+    const apsMatch = did.match(/^did:aps:(.+)$/);
+    const agentId = apsMatch ? apsMatch[1] : did;
+    const card = db.getCard(agentId);
+    if (!card) {
+        res.status(404).json({ error: `Identity not found: ${did}` });
+        return;
+    }
+    const pubKeyHex = Buffer.from(card.publicKey, 'base64').toString('hex');
+    res.json({
+        did: `did:aps:${card.agentId}`,
+        public_key: pubKeyHex,
+        public_key_type: 'Ed25519VerificationKey2020',
+        challenge_nonce: nonce,
+        message: 'Use the public key to verify Ed25519 signatures from this agent.',
     });
 });
 // ══════════════════════════════════════
