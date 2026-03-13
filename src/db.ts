@@ -120,9 +120,10 @@ export function getCard(agentId: string): IntentCard | null {
   return row ? JSON.parse(row.card_json) : null
 }
 
-export function removeCard(cardId: string, agentId: string): boolean {
+export function removeCard(cardId: string, publicKey: string): boolean {
+  // NW-006: Use public_key (cryptographically verified) not agent_id (self-reported)
   const d = getDb()
-  const result = d.prepare('DELETE FROM cards WHERE card_id = ? AND agent_id = ?').run(cardId, agentId)
+  const result = d.prepare('DELETE FROM cards WHERE card_id = ? AND public_key = ?').run(cardId, publicKey)
   return result.changes > 0
 }
 

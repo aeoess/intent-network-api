@@ -106,9 +106,10 @@ export function getCard(agentId) {
     const row = d.prepare('SELECT card_json FROM cards WHERE agent_id = ? AND expires_at > datetime(\'now\')').get(agentId);
     return row ? JSON.parse(row.card_json) : null;
 }
-export function removeCard(cardId, agentId) {
+export function removeCard(cardId, publicKey) {
+    // NW-006: Use public_key (cryptographically verified) not agent_id (self-reported)
     const d = getDb();
-    const result = d.prepare('DELETE FROM cards WHERE card_id = ? AND agent_id = ?').run(cardId, agentId);
+    const result = d.prepare('DELETE FROM cards WHERE card_id = ? AND public_key = ?').run(cardId, publicKey);
     return result.changes > 0;
 }
 export function getAllActiveCards() {

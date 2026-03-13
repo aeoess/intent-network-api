@@ -117,7 +117,8 @@ router.get('/cards/:agentId', (req, res) => {
 // ══════════════════════════════════════
 
 router.delete('/cards/:cardId', requireSignature, (req: AuthenticatedRequest, res) => {
-  const removed = db.removeCard(String(req.params.cardId), req.verifiedAgentId || '')
+  // NW-006: Use verifiedPublicKey (cryptographically proven) for ownership check
+  const removed = db.removeCard(String(req.params.cardId), req.verifiedPublicKey || '')
   if (!removed) {
     res.status(404).json({ error: 'Card not found or not owned by you' })
     return

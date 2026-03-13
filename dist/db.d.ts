@@ -6,7 +6,7 @@ export declare function publishCard(card: IntentCard): {
     error?: string;
 };
 export declare function getCard(agentId: string): IntentCard | null;
-export declare function removeCard(cardId: string, agentId: string): boolean;
+export declare function removeCard(cardId: string, publicKey: string): boolean;
 export declare function getAllActiveCards(): IntentCard[];
 export declare function getCardCount(): number;
 export declare function createIntro(intro: IntroRequest): {
