@@ -298,7 +298,7 @@ router.get('/resolve', (req, res) => {
     trust_summary: {
       behavioral: null,
     },
-    challenge_endpoint: `${req.protocol}://${req.get('host')}/api/challenge/create`,
+    challenge_endpoint: `https://${req.get('host')}/api/challenge/create`,
     resolved_at: new Date().toISOString(),
     card_summary: {
       needs: card.needs?.map((n: any) => n.description || n) || [],
