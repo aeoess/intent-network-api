@@ -256,11 +256,37 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
 // GET /api/resolve — Cross-protocol identity resolution
 // Implements the APS side of the AIP↔APS bridge spec
 // ══════════════════════════════════════
-router.get('/resolve', (req, res) => {
+router.get('/resolve', async (req, res) => {
     const did = String(req.query.did || '');
     if (!did) {
-        res.status(400).json({ error: 'Missing ?did= query parameter. Usage: /api/resolve?did=did:aps:agentId' });
+        res.status(400).json({ error: 'Missing ?did= query parameter. Usage: /api/resolve?did=did:aps:agentId or did:aip:suffix' });
         return;
+    }
+    // ── Cross-protocol proxy: did:aip → forward to AIP service ──
+    const aipMatch = did.match(/^did:aip:(.+)$/);
+    if (aipMatch) {
+        try {
+            const aipUrl = `https://aip-service.fly.dev/resolve/${did}`;
+            const aipRes = await fetch(aipUrl);
+            if (!aipRes.ok) {
+                res.status(aipRes.status).json({ error: `AIP service returned ${aipRes.status}`, did, proxied_to: aipUrl });
+                return;
+            }
+            const aipData = await aipRes.json();
+            // Return with bridge metadata
+            res.json({
+                ...aipData,
+                resolved_via: 'aps-bridge',
+                source_protocol: 'aip',
+                bridge_note: 'Resolved via APS→AIP cross-protocol bridge at api.aeoess.com',
+                resolved_at: new Date().toISOString(),
+            });
+            return;
+        }
+        catch (err) {
+            res.status(502).json({ error: `Failed to reach AIP service: ${err.message}`, did });
+            return;
+        }
     }
     // Support did:aps:<agentId> format
     const apsMatch = did.match(/^did:aps:(.+)$/);
