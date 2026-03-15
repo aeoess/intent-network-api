@@ -4,7 +4,8 @@
 import { Router } from 'express';
 import { requireSignature, identifyAgent } from './auth.js';
 import * as db from './db.js';
-import { computeRelevance, verifyIntentCard, isCardExpired, } from 'agent-passport-system';
+import { embedBatch } from './embeddings.js';
+import { verifyIntentCard, isCardExpired, } from 'agent-passport-system';
 const router = Router();
 // ── Rate limit config ──
 const LIMITS = {
@@ -37,7 +38,7 @@ function rateLimit(action, limit) {
 // ══════════════════════════════════════
 // POST /api/cards — Publish IntentCard
 // ══════════════════════════════════════
-router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (req, res) => {
+router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), async (req, res) => {
     const card = req.body.card || req.body;
     // Validate the card structure
     if (!card.cardId || !card.agentId || !card.publicKey) {
@@ -89,12 +90,60 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (r
         res.status(500).json({ error: result.error });
         return;
     }
+    // ── Phase 1B: Embed needs and offers for semantic matching ──
+    let topMatches = [];
+    try {
+        const needTexts = (card.needs || []).map((n) => typeof n === 'string' ? n : n.description || '');
+        const offerTexts = (card.offers || []).map((o) => typeof o === 'string' ? o : o.description || '');
+        const contextText = card.context || '';
+        // Embed all texts
+        const allTexts = [
+            ...needTexts.map((t) => contextText ? `${t} ${contextText}` : t),
+            ...offerTexts.map((t) => contextText ? `${t} ${contextText}` : t),
+        ];
+        const vectors = await embedBatch(allTexts.filter((t) => t.length > 0));
+        // Store embeddings
+        const items = [];
+        let vi = 0;
+        for (const t of needTexts) {
+            if (t) {
+                items.push({ type: 'need', text: t, vector: vectors[vi++] });
+            }
+        }
+        for (const t of offerTexts) {
+            if (t) {
+                items.push({ type: 'offer', text: t, vector: vectors[vi++] });
+            }
+        }
+        if (items.length > 0) {
+            db.storeEmbeddings(card.cardId, card.agentId, items);
+            // Return top 3 matches inline
+            const needVecs = items.filter(i => i.type === 'need').map(i => i.vector);
+            const offerVecs = items.filter(i => i.type === 'offer').map(i => i.vector);
+            if (needVecs.length > 0 || offerVecs.length > 0) {
+                const matches = db.semanticSearch(needVecs, offerVecs, card.agentId, 3);
+                topMatches = matches.map(m => ({
+                    agentId: m.agentId,
+                    score: Math.round(m.score * 100) / 100,
+                    mutual: m.mutual,
+                    needMatch: m.needMatch,
+                    offerMatch: m.offerMatch,
+                }));
+            }
+        }
+    }
+    catch (e) {
+        console.error('[embeddings] Failed to embed card:', e.message);
+    }
     res.status(201).json({
         published: true,
         cardId: card.cardId,
         agentId: card.agentId,
         expiresAt: card.expiresAt,
         networkSize: db.getCardCount(),
+        topMatches,
+        matchingVersion: topMatches.length > 0 ? 'semantic-v1' : 'pending-embeddings',
+        embeddingsStored: topMatches.length > 0 || db.hasEmbeddings(card.agentId),
     });
 });
 // ══════════════════════════════════════
@@ -123,42 +172,48 @@ router.delete('/cards/:cardId', requireSignature, (req, res) => {
 // ══════════════════════════════════════
 // GET /api/matches/:agentId — Ranked matches
 // ══════════════════════════════════════
-router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search), (req, res) => {
+router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search), async (req, res) => {
     const agentId = String(req.params.agentId);
     const myCard = db.getCard(agentId);
     if (!myCard) {
         res.status(404).json({ error: 'No active card. Publish a card first.' });
         return;
     }
-    const allCards = db.getAllActiveCards();
-    const matches = [];
-    // Ensure cards have all fields computeRelevance expects
-    const normalize = (c) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] });
-    const myNorm = normalize(myCard);
-    for (const other of allCards) {
-        if (other.agentId === agentId)
-            continue;
+    const maxResults = Math.min(parseInt(String(req.query.max || '15')), 50);
+    const minScore = parseFloat(String(req.query.minScore || '0.3'));
+    // Semantic matching via embeddings
+    if (db.hasEmbeddings(agentId)) {
         try {
-            const match = computeRelevance(myNorm, normalize(other));
-            if (match && match.score > 0) {
-                matches.push(match);
-            }
+            const needTexts = (myCard.needs || []).map((n) => typeof n === 'string' ? n : n.description || '');
+            const offerTexts = (myCard.offers || []).map((o) => typeof o === 'string' ? o : o.description || '');
+            const needVecs = await embedBatch(needTexts.filter((t) => t));
+            const offerVecs = await embedBatch(offerTexts.filter((t) => t));
+            const matches = db.semanticSearch(needVecs, offerVecs, agentId, maxResults)
+                .filter(m => m.score >= minScore);
+            // Enrich with card info
+            const enriched = matches.map(m => {
+                const card = db.getCard(m.agentId);
+                return {
+                    matchId: `match_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    agentId: m.agentId,
+                    name: card?.principalAlias || m.agentId,
+                    score: Math.round(m.score * 100) / 100,
+                    mutual: m.mutual,
+                    needMatch: m.needMatch,
+                    offerMatch: m.offerMatch,
+                    source: card?.source || 'organic',
+                    matchingVersion: 'semantic-v1',
+                };
+            });
+            res.json({ agentId, matchCount: enriched.length, totalCandidates: db.getCardCount() - 1, matches: enriched });
+            return;
         }
         catch (e) {
-            // Skip cards that fail matching
+            console.error('[matches] Semantic search failed, falling back:', e.message);
         }
     }
-    // Sort by score descending
-    matches.sort((a, b) => b.score - a.score);
-    const maxResults = Math.min(parseInt(String(req.query.max || '10')), 50);
-    const minScore = parseFloat(String(req.query.minScore || '0'));
-    const filtered = matches.filter(m => m.score >= minScore).slice(0, maxResults);
-    res.json({
-        agentId,
-        matchCount: filtered.length,
-        totalCandidates: allCards.length - 1,
-        matches: filtered,
-    });
+    // Fallback: old matching (for cards without embeddings)
+    res.json({ agentId, matchCount: 0, totalCandidates: db.getCardCount() - 1, matches: [], matchingVersion: 'pending-embeddings' });
 });
 // ══════════════════════════════════════
 // POST /api/intros — Request introduction
@@ -225,34 +280,33 @@ router.put('/intros/:introId', requireSignature, (req, res) => {
 // ══════════════════════════════════════
 // GET /api/digest/:agentId — Personalized digest
 // ══════════════════════════════════════
-router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest), (req, res) => {
+router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest), async (req, res) => {
     const agentId = String(req.params.agentId);
     const myCard = db.getCard(agentId);
-    // Get matches
-    let matches = [];
-    if (myCard) {
-        const allCards = db.getAllActiveCards();
-        const normalize = (c) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] });
-        const myNorm = normalize(myCard);
-        for (const other of allCards) {
-            if (other.agentId === agentId)
-                continue;
-            try {
-                const match = computeRelevance(myNorm, normalize(other));
-                if (match && match.score > 0)
-                    matches.push(match);
-            }
-            catch (e) { }
+    // Get matches via semantic search
+    let semanticMatches = [];
+    if (myCard && db.hasEmbeddings(agentId)) {
+        try {
+            const needTexts = (myCard.needs || []).map((n) => typeof n === 'string' ? n : n.description || '');
+            const offerTexts = (myCard.offers || []).map((o) => typeof o === 'string' ? o : o.description || '');
+            const needVecs = await embedBatch(needTexts.filter((t) => t));
+            const offerVecs = await embedBatch(offerTexts.filter((t) => t));
+            semanticMatches = db.semanticSearch(needVecs, offerVecs, agentId, 10)
+                .map(m => {
+                const card = db.getCard(m.agentId);
+                return { agentId: m.agentId, name: card?.principalAlias || m.agentId, score: Math.round(m.score * 100) / 100, mutual: m.mutual, needMatch: m.needMatch, offerMatch: m.offerMatch, source: card?.source || 'organic' };
+            });
         }
-        matches.sort((a, b) => b.score - a.score);
-        matches = matches.slice(0, 10);
+        catch (e) {
+            console.error('[digest] Semantic match failed:', e.message);
+        }
     }
     // Get intros
     const intros = db.getIntrosForAgent(agentId);
     // Build summary
     const parts = [];
-    if (matches.length > 0)
-        parts.push(`${matches.length} relevant match${matches.length > 1 ? 'es' : ''}`);
+    if (semanticMatches.length > 0)
+        parts.push(`${semanticMatches.length} relevant match${semanticMatches.length > 1 ? 'es' : ''}`);
     if (intros.sent.length > 0)
         parts.push(`${intros.sent.length} intro${intros.sent.length > 1 ? 's' : ''} pending response`);
     if (intros.received.length > 0)
@@ -262,7 +316,7 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
         agentId,
         generatedAt: new Date().toISOString(),
         summary,
-        matches,
+        matches: semanticMatches,
         introsPending: intros.sent,
         introsReceived: intros.received,
         hasCard: !!myCard,
@@ -378,6 +432,7 @@ router.get('/health', (_req, res) => {
     const d = db.getDb();
     const uniqueKeys = d.prepare('SELECT COUNT(DISTINCT public_key) as cnt FROM cards WHERE expires_at > datetime(\'now\')').get()?.cnt || 0;
     const lastCard = d.prepare('SELECT created_at FROM cards ORDER BY created_at DESC LIMIT 1').get()?.created_at || null;
+    const embCount = db.getEmbeddingCount();
     res.json({
         status: 'ok',
         activeCards: stats.active_cards,
@@ -386,8 +441,9 @@ router.get('/health', (_req, res) => {
         totalIntrosApproved: stats.total_intros_approved,
         pendingIntros: stats.pending_intros,
         lastCardPublished: lastCard,
+        embeddingsStored: embCount,
         uptime: Math.round(process.uptime()),
-        version: '0.2.0',
+        version: '0.3.0',
     });
 });
 export default router;

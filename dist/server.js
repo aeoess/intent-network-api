@@ -13,6 +13,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import routes from './routes.js';
 import { getDb, purgeExpired, closeDb } from './db.js';
+import { warmupModel } from './embeddings.js';
 const PORT = parseInt(process.env.PORT || '3100');
 const app = express();
 // ── Middleware ──
@@ -55,6 +56,8 @@ app.listen(PORT, () => {
     console.log(`Intent Network API running on port ${PORT}`);
     console.log(`Database: ${process.env.DB_PATH || 'data/intent-network.db'}`);
     console.log(`Endpoints: http://localhost:${PORT}/`);
+    // Warm up embedding model in background (don't block startup)
+    warmupModel().catch(e => console.error('[embeddings] Warmup failed:', e.message));
 });
 // ── Graceful shutdown ──
 process.on('SIGINT', () => { closeDb(); process.exit(0); });

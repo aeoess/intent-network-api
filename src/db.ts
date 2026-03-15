@@ -5,6 +5,7 @@
 // Ed25519 public keys are the identity — no accounts needed.
 
 import Database from 'better-sqlite3'
+import * as sqliteVec from 'sqlite-vec'
 import { join } from 'node:path'
 import type { IntentCard, IntroRequest, IntroResponse, RelevanceMatch } from 'agent-passport-system'
 
@@ -15,6 +16,7 @@ let db: Database.Database
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH)
+    sqliteVec.load(db)
     db.pragma('journal_mode = WAL')
     db.pragma('busy_timeout = 5000')
     db.pragma('synchronous = NORMAL')
@@ -81,6 +83,23 @@ function initSchema(): void {
       ('total_intros_requested', 0),
       ('total_intros_approved', 0),
       ('total_intros_declined', 0);
+  `)
+
+  // ── Embeddings table (Phase 1B) ──
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS card_embeddings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      card_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      item_text TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (card_id) REFERENCES cards(card_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_emb_card ON card_embeddings(card_id);
+    CREATE INDEX IF NOT EXISTS idx_emb_agent ON card_embeddings(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_emb_type ON card_embeddings(item_type);
   `)
 }
 
@@ -268,4 +287,153 @@ export function getNetworkStats(): Record<string, number> {
 
 export function closeDb(): void {
   if (db) db.close()
+}
+
+// ══════════════════════════════════════
+// Embedding Operations (Phase 1B)
+// ══════════════════════════════════════
+
+/**
+ * Store embeddings for a card's needs and offers.
+ * Deletes previous embeddings for this card first (upsert).
+ */
+export function storeEmbeddings(cardId: string, agentId: string, items: { type: 'need' | 'offer', text: string, vector: Float32Array }[]): void {
+  const d = getDb()
+  // Clear old embeddings for this card
+  d.prepare('DELETE FROM card_embeddings WHERE card_id = ?').run(cardId)
+  // Also clear by agent_id for upserted cards that got a new card_id
+  d.prepare('DELETE FROM card_embeddings WHERE agent_id = ?').run(agentId)
+
+  const insert = d.prepare('INSERT INTO card_embeddings (card_id, agent_id, item_type, item_text, embedding) VALUES (?, ?, ?, ?, ?)')
+  for (const item of items) {
+    const buf = Buffer.from(item.vector.buffer)
+    insert.run(cardId, agentId, item.type, item.text, buf)
+  }
+}
+
+/**
+ * Cross-vector search: find cards where their OFFERS match my NEEDS.
+ * Returns top N agent_ids with best cosine similarity.
+ */
+export function searchOffersForNeeds(needVectors: Float32Array[], excludeAgentId: string, limit: number = 15): { agentId: string, score: number, offerText: string, needIdx: number }[] {
+  const d = getDb()
+  // Get all offer embeddings for active cards
+  const offers = d.prepare(`
+    SELECT ce.agent_id, ce.item_text, ce.embedding
+    FROM card_embeddings ce
+    JOIN cards c ON ce.agent_id = c.agent_id
+    WHERE ce.item_type = 'offer'
+    AND c.expires_at > datetime('now')
+    AND ce.agent_id != ?
+  `).all(excludeAgentId) as { agent_id: string, item_text: string, embedding: Buffer }[]
+
+  const matches: { agentId: string, score: number, offerText: string, needIdx: number }[] = []
+
+  for (let ni = 0; ni < needVectors.length; ni++) {
+    const needVec = needVectors[ni]
+    for (const offer of offers) {
+      const offerVec = new Float32Array(offer.embedding.buffer, offer.embedding.byteOffset, offer.embedding.byteLength / 4)
+      // Dot product = cosine sim (vectors are normalized)
+      let dot = 0
+      for (let i = 0; i < needVec.length; i++) dot += needVec[i] * offerVec[i]
+      if (dot > 0.3) {
+        matches.push({ agentId: offer.agent_id, score: dot, offerText: offer.item_text, needIdx: ni })
+      }
+    }
+  }
+
+  // Dedupe by agentId (keep best score), sort desc
+  const best = new Map<string, typeof matches[0]>()
+  for (const m of matches) {
+    const existing = best.get(m.agentId)
+    if (!existing || m.score > existing.score) best.set(m.agentId, m)
+  }
+
+  return Array.from(best.values()).sort((a, b) => b.score - a.score).slice(0, limit)
+}
+
+/**
+ * Cross-vector search: find cards where their NEEDS match my OFFERS.
+ */
+export function searchNeedsForOffers(offerVectors: Float32Array[], excludeAgentId: string, limit: number = 15): { agentId: string, score: number, needText: string, offerIdx: number }[] {
+  const d = getDb()
+  const needs = d.prepare(`
+    SELECT ce.agent_id, ce.item_text, ce.embedding
+    FROM card_embeddings ce
+    JOIN cards c ON ce.agent_id = c.agent_id
+    WHERE ce.item_type = 'need'
+    AND c.expires_at > datetime('now')
+    AND ce.agent_id != ?
+  `).all(excludeAgentId) as { agent_id: string, item_text: string, embedding: Buffer }[]
+
+  const matches: { agentId: string, score: number, needText: string, offerIdx: number }[] = []
+
+  for (let oi = 0; oi < offerVectors.length; oi++) {
+    const offerVec = offerVectors[oi]
+    for (const need of needs) {
+      const needVec = new Float32Array(need.embedding.buffer, need.embedding.byteOffset, need.embedding.byteLength / 4)
+      let dot = 0
+      for (let i = 0; i < offerVec.length; i++) dot += offerVec[i] * needVec[i]
+      if (dot > 0.3) {
+        matches.push({ agentId: need.agent_id, score: dot, needText: need.item_text, offerIdx: oi })
+      }
+    }
+  }
+
+  const best = new Map<string, typeof matches[0]>()
+  for (const m of matches) {
+    const existing = best.get(m.agentId)
+    if (!existing || m.score > existing.score) best.set(m.agentId, m)
+  }
+  return Array.from(best.values()).sort((a, b) => b.score - a.score).slice(0, limit)
+}
+
+/**
+ * Combined semantic search: finds matches in both directions.
+ * Returns top N candidates with combined scores and mutual bonus.
+ */
+export function semanticSearch(
+  needVectors: Float32Array[],
+  offerVectors: Float32Array[],
+  agentId: string,
+  limit: number = 15
+): { agentId: string, score: number, mutual: boolean, needMatch: string | null, offerMatch: string | null }[] {
+  const offersForMyNeeds = searchOffersForNeeds(needVectors, agentId, 50)
+  const needsForMyOffers = searchNeedsForOffers(offerVectors, agentId, 50)
+
+  // Merge: agents appearing in both get a mutual bonus
+  const combined = new Map<string, { score: number, mutual: boolean, needMatch: string | null, offerMatch: string | null }>()
+
+  for (const m of offersForMyNeeds) {
+    combined.set(m.agentId, { score: m.score, mutual: false, needMatch: m.offerText, offerMatch: null })
+  }
+  for (const m of needsForMyOffers) {
+    const existing = combined.get(m.agentId)
+    if (existing) {
+      existing.mutual = true
+      existing.score = Math.min(1.0, (existing.score + m.score) / 2 + 0.15) // mutual bonus
+      existing.offerMatch = m.needText
+    } else {
+      combined.set(m.agentId, { score: m.score, mutual: false, needMatch: null, offerMatch: m.needText })
+    }
+  }
+
+  return Array.from(combined.entries())
+    .map(([agentId, data]) => ({ agentId, ...data }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+}
+
+/**
+ * Check if a card has embeddings stored.
+ */
+export function hasEmbeddings(agentId: string): boolean {
+  const d = getDb()
+  const row = d.prepare('SELECT COUNT(*) as cnt FROM card_embeddings WHERE agent_id = ?').get(agentId) as any
+  return row.cnt > 0
+}
+
+export function getEmbeddingCount(): number {
+  const d = getDb()
+  return (d.prepare('SELECT COUNT(*) as cnt FROM card_embeddings').get() as any).cnt
 }

@@ -6,6 +6,7 @@ import { Router } from 'express'
 import { requireSignature, identifyAgent } from './auth.js'
 import type { AuthenticatedRequest } from './auth.js'
 import * as db from './db.js'
+import { embed, embedBatch } from './embeddings.js'
 import {
   computeRelevance, verifyIntentCard, isCardExpired,
 } from 'agent-passport-system'
@@ -47,7 +48,7 @@ function rateLimit(action: string, limit: number) {
 // POST /api/cards — Publish IntentCard
 // ══════════════════════════════════════
 
-router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (req: AuthenticatedRequest, res) => {
+router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), async (req: AuthenticatedRequest, res) => {
   const card = req.body.card || req.body as IntentCard
 
   // Validate the card structure
@@ -95,12 +96,56 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (r
     return
   }
 
+  // ── Phase 1B: Embed needs and offers for semantic matching ──
+  let topMatches: any[] = []
+  try {
+    const needTexts = (card.needs || []).map((n: any) => typeof n === 'string' ? n : n.description || '')
+    const offerTexts = (card.offers || []).map((o: any) => typeof o === 'string' ? o : o.description || '')
+    const contextText = card.context || ''
+
+    // Embed all texts
+    const allTexts = [
+      ...needTexts.map((t: string) => contextText ? `${t} ${contextText}` : t),
+      ...offerTexts.map((t: string) => contextText ? `${t} ${contextText}` : t),
+    ]
+    const vectors = await embedBatch(allTexts.filter((t: string) => t.length > 0))
+
+    // Store embeddings
+    const items: { type: 'need' | 'offer', text: string, vector: Float32Array }[] = []
+    let vi = 0
+    for (const t of needTexts) { if (t) { items.push({ type: 'need', text: t, vector: vectors[vi++] }); } }
+    for (const t of offerTexts) { if (t) { items.push({ type: 'offer', text: t, vector: vectors[vi++] }); } }
+
+    if (items.length > 0) {
+      db.storeEmbeddings(card.cardId, card.agentId, items)
+
+      // Return top 3 matches inline
+      const needVecs = items.filter(i => i.type === 'need').map(i => i.vector)
+      const offerVecs = items.filter(i => i.type === 'offer').map(i => i.vector)
+      if (needVecs.length > 0 || offerVecs.length > 0) {
+        const matches = db.semanticSearch(needVecs, offerVecs, card.agentId, 3)
+        topMatches = matches.map(m => ({
+          agentId: m.agentId,
+          score: Math.round(m.score * 100) / 100,
+          mutual: m.mutual,
+          needMatch: m.needMatch,
+          offerMatch: m.offerMatch,
+        }))
+      }
+    }
+  } catch (e) {
+    console.error('[embeddings] Failed to embed card:', (e as Error).message)
+  }
+
   res.status(201).json({
     published: true,
     cardId: card.cardId,
     agentId: card.agentId,
     expiresAt: card.expiresAt,
     networkSize: db.getCardCount(),
+    topMatches,
+    matchingVersion: topMatches.length > 0 ? 'semantic-v1' : 'pending-embeddings',
+    embeddingsStored: topMatches.length > 0 || db.hasEmbeddings(card.agentId),
   })
 })
 
@@ -135,7 +180,7 @@ router.delete('/cards/:cardId', requireSignature, (req: AuthenticatedRequest, re
 // GET /api/matches/:agentId — Ranked matches
 // ══════════════════════════════════════
 
-router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search), (req: AuthenticatedRequest, res) => {
+router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search), async (req: AuthenticatedRequest, res) => {
   const agentId = String(req.params.agentId)
   const myCard = db.getCard(agentId)
   if (!myCard) {
@@ -143,39 +188,45 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
     return
   }
 
-  const allCards = db.getAllActiveCards()
-  const matches: RelevanceMatch[] = []
+  const maxResults = Math.min(parseInt(String(req.query.max || '15')), 50)
+  const minScore = parseFloat(String(req.query.minScore || '0.3'))
 
-  // Ensure cards have all fields computeRelevance expects
-  const normalize = (c: any) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] })
-  const myNorm = normalize(myCard)
-
-  for (const other of allCards) {
-    if (other.agentId === agentId) continue
+  // Semantic matching via embeddings
+  if (db.hasEmbeddings(agentId)) {
     try {
-      const match = computeRelevance(myNorm, normalize(other))
-      if (match && match.score > 0) {
-        matches.push(match)
-      }
+      const needTexts = (myCard.needs || []).map((n: any) => typeof n === 'string' ? n : n.description || '')
+      const offerTexts = (myCard.offers || []).map((o: any) => typeof o === 'string' ? o : o.description || '')
+      const needVecs = await embedBatch(needTexts.filter((t: string) => t))
+      const offerVecs = await embedBatch(offerTexts.filter((t: string) => t))
+
+      const matches = db.semanticSearch(needVecs, offerVecs, agentId, maxResults)
+        .filter(m => m.score >= minScore)
+
+      // Enrich with card info
+      const enriched = matches.map(m => {
+        const card = db.getCard(m.agentId)
+        return {
+          matchId: `match_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+          agentId: m.agentId,
+          name: card?.principalAlias || m.agentId,
+          score: Math.round(m.score * 100) / 100,
+          mutual: m.mutual,
+          needMatch: m.needMatch,
+          offerMatch: m.offerMatch,
+          source: (card as any)?.source || 'organic',
+          matchingVersion: 'semantic-v1',
+        }
+      })
+
+      res.json({ agentId, matchCount: enriched.length, totalCandidates: db.getCardCount() - 1, matches: enriched })
+      return
     } catch (e) {
-      // Skip cards that fail matching
+      console.error('[matches] Semantic search failed, falling back:', (e as Error).message)
     }
   }
 
-  // Sort by score descending
-  matches.sort((a, b) => b.score - a.score)
-
-  const maxResults = Math.min(parseInt(String(req.query.max || '10')), 50)
-  const minScore = parseFloat(String(req.query.minScore || '0'))
-
-  const filtered = matches.filter(m => m.score >= minScore).slice(0, maxResults)
-
-  res.json({
-    agentId,
-    matchCount: filtered.length,
-    totalCandidates: allCards.length - 1,
-    matches: filtered,
-  })
+  // Fallback: old matching (for cards without embeddings)
+  res.json({ agentId, matchCount: 0, totalCandidates: db.getCardCount() - 1, matches: [], matchingVersion: 'pending-embeddings' })
 })
 
 // ══════════════════════════════════════
@@ -258,25 +309,26 @@ router.put('/intros/:introId', requireSignature, (req: AuthenticatedRequest, res
 // GET /api/digest/:agentId — Personalized digest
 // ══════════════════════════════════════
 
-router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest), (req: AuthenticatedRequest, res) => {
+router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest), async (req: AuthenticatedRequest, res) => {
   const agentId = String(req.params.agentId)
   const myCard = db.getCard(agentId)
 
-  // Get matches
-  let matches: RelevanceMatch[] = []
-  if (myCard) {
-    const allCards = db.getAllActiveCards()
-    const normalize = (c: any) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] })
-    const myNorm = normalize(myCard)
-    for (const other of allCards) {
-      if (other.agentId === agentId) continue
-      try {
-        const match = computeRelevance(myNorm, normalize(other))
-        if (match && match.score > 0) matches.push(match)
-      } catch (e) {}
+  // Get matches via semantic search
+  let semanticMatches: any[] = []
+  if (myCard && db.hasEmbeddings(agentId)) {
+    try {
+      const needTexts = (myCard.needs || []).map((n: any) => typeof n === 'string' ? n : n.description || '')
+      const offerTexts = (myCard.offers || []).map((o: any) => typeof o === 'string' ? o : o.description || '')
+      const needVecs = await embedBatch(needTexts.filter((t: string) => t))
+      const offerVecs = await embedBatch(offerTexts.filter((t: string) => t))
+      semanticMatches = db.semanticSearch(needVecs, offerVecs, agentId, 10)
+        .map(m => {
+          const card = db.getCard(m.agentId)
+          return { agentId: m.agentId, name: card?.principalAlias || m.agentId, score: Math.round(m.score * 100) / 100, mutual: m.mutual, needMatch: m.needMatch, offerMatch: m.offerMatch, source: (card as any)?.source || 'organic' }
+        })
+    } catch (e) {
+      console.error('[digest] Semantic match failed:', (e as Error).message)
     }
-    matches.sort((a, b) => b.score - a.score)
-    matches = matches.slice(0, 10)
   }
 
   // Get intros
@@ -284,7 +336,7 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
 
   // Build summary
   const parts: string[] = []
-  if (matches.length > 0) parts.push(`${matches.length} relevant match${matches.length > 1 ? 'es' : ''}`)
+  if (semanticMatches.length > 0) parts.push(`${semanticMatches.length} relevant match${semanticMatches.length > 1 ? 'es' : ''}`)
   if (intros.sent.length > 0) parts.push(`${intros.sent.length} intro${intros.sent.length > 1 ? 's' : ''} pending response`)
   if (intros.received.length > 0) parts.push(`${intros.received.length} intro${intros.received.length > 1 ? 's' : ''} for you to review`)
   const summary = parts.length > 0 ? parts.join(', ') : 'Nothing new right now'
@@ -293,7 +345,7 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
     agentId,
     generatedAt: new Date().toISOString(),
     summary,
-    matches,
+    matches: semanticMatches,
     introsPending: intros.sent,
     introsReceived: intros.received,
     hasCard: !!myCard,
@@ -426,6 +478,7 @@ router.get('/health', (_req, res) => {
   const d = db.getDb()
   const uniqueKeys = (d.prepare('SELECT COUNT(DISTINCT public_key) as cnt FROM cards WHERE expires_at > datetime(\'now\')').get() as any)?.cnt || 0
   const lastCard = (d.prepare('SELECT created_at FROM cards ORDER BY created_at DESC LIMIT 1').get() as any)?.created_at || null
+  const embCount = db.getEmbeddingCount()
   res.json({
     status: 'ok',
     activeCards: stats.active_cards,
@@ -434,8 +487,9 @@ router.get('/health', (_req, res) => {
     totalIntrosApproved: stats.total_intros_approved,
     pendingIntros: stats.pending_intros,
     lastCardPublished: lastCard,
+    embeddingsStored: embCount,
     uptime: Math.round(process.uptime()),
-    version: '0.2.0',
+    version: '0.3.0',
   })
 })
 
