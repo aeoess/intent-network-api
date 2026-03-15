@@ -93,6 +93,36 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_emb_agent ON card_embeddings(agent_id);
     CREATE INDEX IF NOT EXISTS idx_emb_type ON card_embeddings(item_type);
   `);
+    // ── Phase 4: Trust signals + feedback ──
+    d.exec(`
+    CREATE TABLE IF NOT EXISTS identity_profiles (
+      public_key TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      total_cards_published INTEGER NOT NULL DEFAULT 0,
+      total_intros_sent INTEGER NOT NULL DEFAULT 0,
+      total_intros_received INTEGER NOT NULL DEFAULT 0,
+      total_intros_accepted INTEGER NOT NULL DEFAULT 0,
+      total_intros_declined INTEGER NOT NULL DEFAULT 0,
+      total_feedback_useful INTEGER NOT NULL DEFAULT 0,
+      total_feedback_neutral INTEGER NOT NULL DEFAULT 0,
+      total_feedback_not_useful INTEGER NOT NULL DEFAULT 0,
+      github_url TEXT,
+      website_url TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ip_agent ON identity_profiles(agent_id);
+
+    CREATE TABLE IF NOT EXISTS intro_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      intro_id TEXT NOT NULL,
+      from_agent TEXT NOT NULL,
+      rating TEXT NOT NULL CHECK(rating IN ('useful', 'neutral', 'not_useful')),
+      comment TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(intro_id, from_agent)
+    );
+  `);
 }
 // ══════════════════════════════════════
 // Card Operations
@@ -387,5 +417,99 @@ export function hasEmbeddings(agentId) {
 export function getEmbeddingCount() {
     const d = getDb();
     return d.prepare('SELECT COUNT(*) as cnt FROM card_embeddings').get().cnt;
+}
+// ══════════════════════════════════════
+// Phase 4: Trust Signals + Feedback
+// ══════════════════════════════════════
+/** Ensure an identity profile exists. Called on every card publish. */
+export function ensureProfile(publicKey, agentId) {
+    const d = getDb();
+    const existing = d.prepare('SELECT public_key FROM identity_profiles WHERE public_key = ?').get(publicKey);
+    if (!existing) {
+        d.prepare('INSERT INTO identity_profiles (public_key, agent_id) VALUES (?, ?)').run(publicKey, agentId);
+    }
+}
+/** Increment a profile counter. */
+export function incrementProfile(publicKey, field) {
+    const d = getDb();
+    d.prepare(`UPDATE identity_profiles SET ${field} = ${field} + 1, updated_at = datetime('now') WHERE public_key = ?`).run(publicKey);
+}
+/** Get trust signals for an agent. */
+export function getTrustSignals(agentId) {
+    const d = getDb();
+    const profile = d.prepare('SELECT * FROM identity_profiles WHERE agent_id = ?').get(agentId);
+    if (!profile)
+        return { identityAge: 0, responseRate: 0, acceptanceRate: 0, trustLevel: 'new' };
+    const ageDays = Math.floor((Date.now() - new Date(profile.first_seen).getTime()) / 86400000);
+    const totalReceived = profile.total_intros_received || 0;
+    const totalResponded = (profile.total_intros_accepted || 0) + (profile.total_intros_declined || 0);
+    const responseRate = totalReceived > 0 ? Math.round((totalResponded / totalReceived) * 100) : 0;
+    const acceptanceRate = totalResponded > 0 ? Math.round((profile.total_intros_accepted / totalResponded) * 100) : 0;
+    // Trust level based on age + activity
+    let trustLevel = 'new';
+    if (ageDays >= 1 && profile.total_intros_accepted >= 1)
+        trustLevel = 'established';
+    if (ageDays >= 7 && profile.total_intros_accepted >= 3 && responseRate >= 50)
+        trustLevel = 'trusted';
+    if (ageDays >= 30 && profile.total_intros_accepted >= 10 && responseRate >= 70)
+        trustLevel = 'veteran';
+    return {
+        identityAge: ageDays,
+        responseRate,
+        acceptanceRate,
+        totalPublished: profile.total_cards_published,
+        totalIntrosSent: profile.total_intros_sent,
+        totalIntrosAccepted: profile.total_intros_accepted,
+        feedbackUseful: profile.total_feedback_useful,
+        feedbackNotUseful: profile.total_feedback_not_useful,
+        trustLevel,
+        githubUrl: profile.github_url,
+        websiteUrl: profile.website_url,
+        linkedProofs: [profile.github_url, profile.website_url].filter(Boolean).length,
+    };
+}
+/** Submit feedback for a completed intro. */
+export function submitFeedback(introId, fromAgent, rating, comment) {
+    const d = getDb();
+    try {
+        d.prepare('INSERT OR REPLACE INTO intro_feedback (intro_id, from_agent, rating, comment) VALUES (?, ?, ?, ?)').run(introId, fromAgent, rating, comment || null);
+        // Update the other party's profile
+        const intro = d.prepare('SELECT requested_by, target_agent_id FROM intros WHERE intro_id = ?').get(introId);
+        if (intro) {
+            const otherAgent = fromAgent === intro.requested_by ? intro.target_agent_id : intro.requested_by;
+            const otherCard = d.prepare('SELECT public_key FROM cards WHERE agent_id = ?').get(otherAgent);
+            if (otherCard) {
+                if (rating === 'useful')
+                    incrementProfile(otherCard.public_key, 'total_feedback_useful');
+                else if (rating === 'not_useful')
+                    incrementProfile(otherCard.public_key, 'total_feedback_not_useful');
+                else
+                    incrementProfile(otherCard.public_key, 'total_feedback_neutral');
+            }
+        }
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/** Update linked proofs for an identity. */
+export function updateLinkedProofs(publicKey, githubUrl, websiteUrl) {
+    const d = getDb();
+    const updates = [];
+    const params = [];
+    if (githubUrl !== undefined) {
+        updates.push('github_url = ?');
+        params.push(githubUrl || null);
+    }
+    if (websiteUrl !== undefined) {
+        updates.push('website_url = ?');
+        params.push(websiteUrl || null);
+    }
+    if (updates.length > 0) {
+        updates.push("updated_at = datetime('now')");
+        params.push(publicKey);
+        d.prepare(`UPDATE identity_profiles SET ${updates.join(', ')} WHERE public_key = ?`).run(...params);
+    }
 }
 //# sourceMappingURL=db.js.map

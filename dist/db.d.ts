@@ -70,3 +70,13 @@ export declare function semanticSearch(needVectors: Float32Array[], offerVectors
  */
 export declare function hasEmbeddings(agentId: string): boolean;
 export declare function getEmbeddingCount(): number;
+/** Ensure an identity profile exists. Called on every card publish. */
+export declare function ensureProfile(publicKey: string, agentId: string): void;
+/** Increment a profile counter. */
+export declare function incrementProfile(publicKey: string, field: string): void;
+/** Get trust signals for an agent. */
+export declare function getTrustSignals(agentId: string): any;
+/** Submit feedback for a completed intro. */
+export declare function submitFeedback(introId: string, fromAgent: string, rating: 'useful' | 'neutral' | 'not_useful', comment?: string): boolean;
+/** Update linked proofs for an identity. */
+export declare function updateLinkedProofs(publicKey: string, githubUrl?: string, websiteUrl?: string): void;

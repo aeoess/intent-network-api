@@ -96,6 +96,10 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), as
     return
   }
 
+  // Phase 4: Track identity profile
+  db.ensureProfile(card.publicKey, card.agentId)
+  db.incrementProfile(card.publicKey, 'total_cards_published')
+
   // ── Phase 1B: Embed needs and offers for semantic matching ──
   let topMatches: any[] = []
   try {
@@ -202,9 +206,10 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
       const matches = db.semanticSearch(needVecs, offerVecs, agentId, maxResults)
         .filter(m => m.score >= minScore)
 
-      // Enrich with card info
+      // Enrich with card info + trust signals
       const enriched = matches.map(m => {
         const card = db.getCard(m.agentId)
+        const trust = db.getTrustSignals(m.agentId)
         return {
           matchId: `match_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
           agentId: m.agentId,
@@ -214,6 +219,7 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
           needMatch: m.needMatch,
           offerMatch: m.offerMatch,
           source: (card as any)?.source || 'organic',
+          trust: { level: trust.trustLevel, age: trust.identityAge, responseRate: trust.responseRate, linkedProofs: trust.linkedProofs },
           matchingVersion: 'semantic-v1',
         }
       })
@@ -308,6 +314,12 @@ router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), (req:
     return
   }
 
+  // Phase 4: Track intro stats
+  if (req.verifiedPublicKey) db.incrementProfile(req.verifiedPublicKey, 'total_intros_sent')
+  // Track target's received count
+  const targetProfile = db.getCard(targetAgentId)
+  if (targetProfile?.publicKey) db.incrementProfile(targetProfile.publicKey, 'total_intros_received')
+
   res.status(201).json({ introId, status: 'pending', targetAgentId })
 })
 
@@ -340,6 +352,15 @@ router.put('/intros/:introId', requireSignature, (req: AuthenticatedRequest, res
 
   const responseJson = JSON.stringify({ verdict, message: responseMessage, disclosedFields, respondedAt: new Date().toISOString() })
   db.updateIntroStatus(String(req.params.introId), verdict === 'approve' ? 'approved' : 'declined', responseJson)
+
+  // Phase 4: Track accepted/declined on requester's profile
+  const introRecord = db.getDb().prepare('SELECT requested_by FROM intros WHERE intro_id = ?').get(String(req.params.introId)) as any
+  if (introRecord) {
+    const requesterCard = db.getCard(introRecord.requested_by)
+    if (requesterCard?.publicKey) {
+      db.incrementProfile(requesterCard.publicKey, verdict === 'approve' ? 'total_intros_accepted' : 'total_intros_declined')
+    }
+  }
 
   res.json({ introId: String(req.params.introId), status: verdict === 'approve' ? 'approved' : 'declined' })
 })
@@ -528,8 +549,35 @@ router.get('/health', (_req, res) => {
     lastCardPublished: lastCard,
     embeddingsStored: embCount,
     uptime: Math.round(process.uptime()),
-    version: '0.3.0',
+    version: '0.4.0',
   })
+})
+
+// ══════════════════════════════════════
+// POST /api/feedback/:introId — Submit intro feedback
+// ══════════════════════════════════════
+
+router.post('/feedback/:introId', identifyAgent, (req: AuthenticatedRequest, res) => {
+  const { rating, comment } = req.body || {}
+  if (!rating || !['useful', 'neutral', 'not_useful'].includes(rating)) {
+    res.status(400).json({ error: 'Rating must be useful, neutral, or not_useful' })
+    return
+  }
+  const agentId = req.verifiedAgentId
+  if (!agentId) { res.status(401).json({ error: 'Missing agent identity' }); return }
+
+  const ok = db.submitFeedback(String(req.params.introId), agentId, rating, comment)
+  if (!ok) { res.status(500).json({ error: 'Failed to submit feedback' }); return }
+  res.json({ submitted: true, introId: String(req.params.introId), rating })
+})
+
+// ══════════════════════════════════════
+// GET /api/trust/:agentId — Trust signals
+// ══════════════════════════════════════
+
+router.get('/trust/:agentId', (req, res) => {
+  const trust = db.getTrustSignals(String(req.params.agentId))
+  res.json({ agentId: String(req.params.agentId), ...trust })
 })
 
 export default router
