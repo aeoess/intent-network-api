@@ -230,6 +230,45 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
 })
 
 // ══════════════════════════════════════
+// POST /api/matches/ghost — Ghost mode: search without a published card
+// ══════════════════════════════════════
+
+router.post('/matches/ghost', rateLimit('search', LIMITS.search), async (req, res) => {
+  const { needs, offers } = req.body || {}
+  if ((!needs || needs.length === 0) && (!offers || offers.length === 0)) {
+    res.status(400).json({ error: 'Provide at least one need or offer to search' })
+    return
+  }
+
+  const maxResults = Math.min(parseInt(String(req.query?.max || '15')), 50)
+  const needTexts = (needs || []).map((n: any) => typeof n === 'string' ? n : n.description || '')
+  const offerTexts = (offers || []).map((o: any) => typeof o === 'string' ? o : o.description || '')
+
+  try {
+    const needVecs = await embedBatch(needTexts.filter((t: string) => t))
+    const offerVecs = await embedBatch(offerTexts.filter((t: string) => t))
+
+    const matches = db.semanticSearch(needVecs, offerVecs, '__ghost__', maxResults)
+      .map(m => {
+        const card = db.getCard(m.agentId)
+        return {
+          agentId: m.agentId,
+          name: card?.principalAlias || m.agentId,
+          score: Math.round(m.score * 100) / 100,
+          mutual: m.mutual,
+          needMatch: m.needMatch,
+          offerMatch: m.offerMatch,
+          source: (card as any)?.source || 'organic',
+        }
+      })
+
+    res.json({ ghost: true, matchCount: matches.length, totalCandidates: db.getCardCount(), matches })
+  } catch (e) {
+    res.status(500).json({ error: 'Matching failed: ' + (e as Error).message })
+  }
+})
+
+// ══════════════════════════════════════
 // POST /api/intros — Request introduction
 // ══════════════════════════════════════
 
