@@ -1,0 +1,616 @@
+# Mingle v2 — Final Build Plan (Consensus)
+
+**Author:** Tima (via Claude, Operator)
+**Date:** March 15, 2026
+**Status:** FINAL — reviewed by Claude, Gemini, GPT. Consensus reached. Ready to build.
+
+---
+
+## Non-Negotiable Principles
+
+1. Never auto-publish silently. AI drafts locally, user approves before network.
+2. Persistent APS identity stored locally, reused across sessions.
+3. Hybrid matching: server embeddings for recall (top 15), client LLM for precision (top 5).
+4. Event-driven digests. No polling. No timers.
+5. High confidence threshold. Few valuable matches > many mediocre ones.
+6. Private inference ≠ public presence. Raw context never disclosed. Ever.
+7. Behavioral logic in code, not just SKILL.md prompts. Cooldowns, queuing, interruption policy enforced by MCP server.
+
+---
+
+## Architecture
+
+```
+USER'S AI CLIENT (Claude, GPT, Cursor)
+│
+├── LOCAL INFERENCE (AI reasoning, never leaves device)
+│   - Understands work context, infers needs/offers
+│   - Classifies sensitivity, detects context shifts
+│   - This is native AI reasoning via SKILL.md, NOT a tool
+│
+├── CONSENT GATE (inline in chat)
+│   - AI shows sanitized draft: "Publish this? [preview]"
+│   - User approves / edits / skips
+│   - Subsequent updates: silent within approved scope
+│
+├── CLIENT RERANK (AI reasoning on small candidate set)
+│   - Receives top 15 candidates from server
+│   - Reranks to top 5 using full conversation context
+│   - Generates one-line rationale per match
+│   - NOT a tool — SKILL.md behavior
+│
+↓ MCP protocol (6 tools)
+
+MINGLE MCP SERVER (local npm package, 6 tools)
+│
+├── publish_intent_card — publish approved card, returns top 3 matches inline
+├── update_presence — update card within approved scope, returns fresh matches
+├── get_digest — check matches + pending intros (called at session start)
+├── request_intro — send intro to matched user
+├── respond_to_intro — approve/decline incoming intro
+├── remove_intent_card — pull card from network
+│
+├── LOCAL STATE:
+│   ~/.mingle/identity.json — persistent APS keypair
+│   ~/.mingle/last-card.json — cached card for offline resilience
+│   ~/.mingle/preferences.json — mode, privacy, cooldowns
+│
+├── ENFORCED POLICY (in code, not prompts):
+│   - Rate limit: max 1 digest check per hour unless user forces
+│   - Cooldown: don't suggest same person within 48h
+│   - Interruption: queue mid-session matches for next pause
+│   - _digest injected into ALL tool responses as side-channel
+│
+↓ HTTPS + Ed25519 signatures
+
+NETWORK API (api.aeoess.com → managed hosting in Phase 4)
+│
+├── RETRIEVAL (one pipeline, not separate layers):
+│   - Hard filters (TTL, blocklist, open-to compat, identity age)
+│   - Embedding search: cross-vector (query needs vs DB offers, query offers vs DB needs)
+│   - Lexical/keyword backup (catches exact terms embeddings miss)
+│   - Simple scoring: cosine sim × freshness decay × trust minimum
+│   - Returns top 15 candidates
+│
+├── Card store + Intro store + Identity store
+├── _digest side-channel on all responses
+├── /api/health endpoint (stats, uptime, active users)
+│
+↓ SQLite (Mac Mini phases 1-3, Fly.io/Turso phase 4)
+```
+
+---
+
+## Card Schema (v2)
+
+```json
+{
+  "cardId": "card-tima-2026031512",
+  "agentId": "tima",
+  "publicKey": "persistent-aps-key...",
+  "principalAlias": "Tima",
+  "topic": "AI agent identity protocol",
+  "needs": ["Protocol collaborators", "Security auditor for Ed25519 delegation chains"],
+  "offers": ["Open source agent identity SDK (534 tests)", "MCP server with 61 tools"],
+  "openTo": ["collaboration", "research", "freelance"],
+  "privacyLevel": "standard",
+  "context": "PRIVATE — embedded for matching, stripped from all API responses",
+  "provenance": "explicit",
+  "confidence": 0.9,
+  "source": "organic",
+  "expiresAt": "2026-03-17T12:00:00Z",
+  "createdAt": "2026-03-15T12:00:00Z",
+  "signature": "aps-persistent-key-signature..."
+}
+```
+
+Key decisions:
+- **1 card per session** (default). Multi-facet support deferred to Phase 3+ based on user feedback.
+- **`context`** field: rich text, embedded server-side, NEVER returned to other clients.
+- **`provenance`**: "explicit" (user stated) or "inferred" (AI derived). Helps gating.
+- **`confidence`**: 0.0-1.0. Low-confidence inferences require user confirmation before publish.
+- **`source`**: "organic" or "seed". Seed cards get honest UX treatment.
+- Needs/offers are **plain strings**. No categories. No tags. Matching is semantic.
+- **No "open" privacy level.** Options: "minimal" (topic + generic needs) / "standard" (topic + needs + offers) / "expanded" (richer descriptions + optional proof links). Raw context is never disclosed.
+
+---
+
+## Identity Model
+
+```
+~/.mingle/identity.json (generated once at setup, reused forever)
+{
+  "principalId": "tima",
+  "publicKey": "3602ca09...",
+  "privateKey": "encrypted-or-plaintext...",
+  "registeredAt": "2026-03-12T00:00:00Z"
+}
+```
+
+- Generated by `npx mingle-mcp setup`
+- APS-compatible Ed25519 keypair
+- Same key signs all cards across all sessions
+- Server tracks: identity age, response rate, intro acceptance rate
+- Sybil resistance: new identities rank lower, warm-up period before bulk intros
+- Migration from v1: let old throwaway-key cards expire naturally. Clean break.
+
+---
+
+## Matching Pipeline (3 Layers)
+
+**Layer 1: Server Retrieve** (fast, generous)
+- Hard filters: TTL, blocklist, open-to compatibility, identity age > 0
+- Cross-vector embedding search: user's needs vs DB offers, user's offers vs DB needs
+- Model: all-MiniLM-L6-v2 via @xenova/transformers (~80MB, CPU, local)
+- Lexical/keyword backup retrieval (merged with embeddings)
+- Simple composite: cosine_sim × freshness_decay × trust_minimum
+- Cosine threshold > 0.3 (generous recall, not precision)
+- Returns top 15 candidates
+
+**Layer 2: Client Rank** (smart, expensive)
+- User's AI receives 15 candidates
+- SKILL.md instructs: "Given your user's context and these 15 cards, rank the top 5 most valuable connections. For each, explain in one sentence why this person and why now."
+- AI uses full conversation understanding for deep semantic matching
+- "AI safety researcher" ↔ "agent identity protocol builder" scores high here
+
+**Layer 3: Client Gate** (strict)
+- Only surface matches the AI is genuinely confident about
+- Start conservative: top 1-2 matches only (calibrate threshold from engagement data)
+- Respect notification mode: quiet / balanced / active
+- Cooldown: same person not suggested twice within 48 hours
+- Never interrupt focused work. Queue for next natural pause or session start.
+
+---
+
+## Event Model (When Things Happen)
+
+| Event | Action |
+|-------|--------|
+| Session start | Silent `get_digest`. Surface pending intros immediately. Queue high-confidence matches for natural moment. |
+| User approves card publish | Server returns top 3 matches inline. No separate call. |
+| Card updated (within scope) | Server returns fresh matches inline with update response. |
+| User expresses need/blocker | AI checks if card should be updated or if network has a match. |
+| Major context shift | AI shows new draft, asks consent to update/replace card. |
+| Focused coding/writing flow | NEVER interrupt. Queue everything for next pause. |
+| Any Mingle tool called | `_digest` injected in response (pending intros, new match count). |
+
+"Major context shift" defined as: primary topic changes, need type changes, or user explicitly says they switched projects. Passing mentions don't trigger. Requires sustained evidence across multiple turns or explicit confirmation.
+
+---
+
+## Consent Flow
+
+**Install/setup:**
+```
+"Mingle can keep a lightweight networking presence on your behalf
+and surface relevant people when useful. You control what gets
+shared. Nothing private is published. Turn this on?"
+→ [Yes / Not now]
+Default: off (or draft mode)
+```
+
+**First publish per session:**
+```
+"Based on what you're working on, here's what I'd publish:
+
+  Topic: AI agent identity protocol
+  Looking for: Protocol collaborators, security auditor
+  Offering: Open source identity SDK (534 tests)
+
+Publish this? You can edit anything."
+→ [Publish / Edit / Skip]
+```
+
+**Returning user (card still active from previous session):**
+```
+"Your Mingle card from yesterday is still active:
+  [card preview]
+Still accurate, or should I update it?"
+→ [Keep / Update / Remove]
+```
+
+**Within-session updates:**
+- Silent. AI refines descriptions within approved topic scope.
+- Cannot pivot topic without new consent.
+- Cannot change from "standard" to "expanded" privacy without consent.
+
+**What constitutes "within scope" vs "needs new consent":**
+- Within scope: refining description ("React performance" → "React virtualization for large tables")
+- Needs consent: changing topic entirely ("React performance" → "hiring a lawyer")
+- Needs consent: adding sensitive terms, company names, financial details
+
+---
+
+## Seed Card Honesty
+
+All 90 existing seed cards tagged with `"source": "seed"`.
+
+When a real user matches against a seed card, the AI says:
+```
+"There's demand on the network for [your skill area] — this is an
+open signal, not a specific person yet. Want me to publish your
+card so you're visible when someone with this need joins?"
+```
+
+Seed cards are demand signals, not fake people. The framing matters for trust.
+
+---
+
+## Phased Build
+
+### Phase 0: Definitions (before any code)
+
+Write a one-page DEFINITIONS.md that locks down:
+
+1. **Evaluation metrics per phase** (see below)
+2. **Sanitization rules**: what gets stripped from cards before publish (company names, financial terms, credentials, anything marked confidential)
+3. **Context shift definition**: operational triggers for when AI should ask for new consent
+4. **"Approved scope" semantics**: exactly what the AI can change silently vs what needs consent
+5. **Deletion policy**: what's deleted on card removal (card, embeddings, intro history? anonymized analytics?)
+6. **Anti-abuse basics**: new identity warm-up period, rate limits, card text length limits
+
+**Output:** `DEFINITIONS.md` in mingle-mcp repo
+**Estimate:** 0.5 session
+
+---
+
+### Phase 1A: Identity + Plumbing (no new model dependencies)
+
+**Goal:** Fix the foundation without touching matching. Current Mingle keeps working, just better.
+
+1. **Persistent identity**
+   - `npx mingle-mcp setup` generates APS keypair → `~/.mingle/identity.json`
+   - All publishes use same key. Server registers identity on first publish.
+   - Server tracks `registeredAt` per public key.
+   - v1 throwaway-key cards: let expire naturally. No migration.
+   - Upsert by agentId (not publicKey) so same user updates their card.
+
+2. **Simplified card format**
+   - Accept plain string arrays for needs/offers
+   - Add `context` field (stored, embedded later in 1B, never returned)
+   - Add `provenance`, `confidence`, `source` fields
+   - Keep backward compat: old structured cards still accepted
+
+3. **Seed card honesty**
+   - Tag all 90 seed cards with `"source": "seed"`
+   - Update MCP/SKILL.md to handle seed matches with honest framing
+
+4. **Publish returns matches inline**
+   - `POST /api/cards` response includes `topMatches: [...]`
+   - `_digest` side-channel on all tool responses: `{pendingIntros, newMatches, lastChecked}`
+
+5. **Health endpoint**
+   - `GET /api/health` returns: active cards, active users (unique identities), uptime, last match timestamp
+
+6. **Text sanitization**
+   - Strip prompt-injection patterns from card text before indexing
+   - Separate matching text from display text
+   - Card text length limits (needs: max 200 chars each, offers: max 200 chars each, context: max 1000 chars)
+
+**Evaluation metrics (Phase 1A):**
+- Setup completes without errors on fresh machine
+- Persistent identity survives across sessions (publish → restart → publish uses same key)
+- v1 cards coexist without crashes
+- Publish latency < 500ms
+- Health endpoint returns accurate data
+
+**Output:** Updated `mingle-mcp` + `intent-network-api` packages
+**Estimate:** 2 sessions
+
+---
+
+### Phase 1B: Semantic Matching
+
+**Goal:** Cards actually match each other. The network produces real connections.
+
+1. **Server-side embeddings**
+   - Add `@xenova/transformers` with `all-MiniLM-L6-v2` to intent-network-api
+   - On card publish: embed each need and offer as vectors, store in SQLite
+   - Cross-vector search: query needs against DB offers, query offers against DB needs
+   - Cosine threshold > 0.3 for candidate generation
+   - Add lexical/keyword search as backup (exact term matching)
+
+2. **v1 card migration script**
+   - One-off script: take existing 120 cards, concatenate categories+tags into plain strings
+   - Run through embedding model, store vectors
+   - So existing network isn't invisible to new matching
+
+3. **Matching endpoint update**
+   - `/api/matches/:agentId` uses new embedding-based retrieval
+   - Returns top 15 (not 50 — protects client context windows)
+   - Simple composite score: cosine_sim × freshness_decay × trust_floor
+   - Publish response includes `topMatches` from new engine
+
+**Evaluation metrics (Phase 1B):**
+- % of publishes yielding ≥1 plausible match (target: >50%)
+- Median publish+match latency (target: <2s including embedding)
+- Embedding model memory footprint on Mac Mini
+- Manual spot-check: 10 random cards, are top 3 matches sensible?
+- Seed vs organic match separation correct (seed cards labeled)
+
+**Output:** Updated `intent-network-api` with embedding pipeline
+**Estimate:** 2 sessions
+
+---
+
+### Phase 2: Consent Flow + Ghost Mode
+
+**Goal:** AI drafts cards from context. User approves. Ghost mode for browsing without publishing.
+
+1. **SKILL.md rewrite (the real product brain)**
+   - Instructions tell AI: at session start, consider user's work context
+   - If Mingle connected, mentally draft a card (topic/needs/offers)
+   - Show draft inline, ask user to publish/edit/skip
+   - If card already active, show it and ask "still accurate?"
+   - After approval, auto-refresh within scope (silent)
+   - On context shift (sustained, not passing), show new draft with consent
+   - NOT a tool. Pure AI reasoning guided by SKILL.md.
+
+2. **Ghost mode**
+   - User can call `get_digest` and `search_matches` WITHOUT having a published card
+   - They see the network, see what matches they'd get, but aren't visible
+   - Great for: first-time users, sensitive work, stealth founders, exploring value before committing
+   - Implementation: server allows digest/search for any identity, published or not
+   - For search without a card: user provides needs/offers as query params, server embeds on-the-fly
+
+3. **Privacy controls**
+   - `privacyLevel` in `~/.mingle/preferences.json`
+   - "minimal": topic + generic needs only
+   - "standard": topic + needs + offers
+   - "expanded": richer descriptions + optional proof links (GitHub, website)
+   - No "open" level. Raw context never disclosed. Hard rule.
+
+4. **Scoped auto-refresh**
+   - After consent, AI can update card silently within approved topic
+   - Card TTL: 48 hours (refreshed on update)
+   - If user goes 48h without session, card expires. Next session = fresh consent.
+
+5. **Returning user flow**
+   - Session start with active card: "Your card from yesterday is still active: [preview]. Still accurate?"
+   - This is SKILL.md behavior, not a tool.
+
+**Evaluation metrics (Phase 2):**
+- % of drafts users approve without editing (target: >70%)
+- % of drafts users edit heavily (ideally <15%)
+- Ghost mode usage (how many browse before publishing)
+- Privacy/sanitization error rate (target: 0 — context never leaked)
+
+**Output:** Updated SKILL.md + MCP server ghost mode support
+**Estimate:** 3 sessions
+
+---
+
+### Phase 3: Ambient Surfacing + Multi-Facet
+
+**Goal:** AI proactively surfaces matches. Connections happen naturally. Multi-facet if needed.
+
+1. **Ambient digest at session start**
+   - SKILL.md: silently call `get_digest`. Surface pending intros immediately.
+   - Queue high-confidence matches for natural conversation moment.
+   - If nothing relevant, absolute silence.
+   - MCP server enforces: max 1 auto-digest per hour (code, not prompt)
+
+2. **Client-side LLM rerank**
+   - SKILL.md behavior: receives 15 candidates, ranks top 5 with rationale
+   - Uses constrained context bundle (approved facets + inferred needs + recent summary), NOT full raw conversation
+   - One-line explanation per match: "Security researcher working on agent delegation — strong overlap with your monotonic narrowing paper"
+   - Only surfaces top 1-2 initially. Calibrate threshold from engagement data.
+
+3. **Confidence-gated surfacing**
+   - Start conservative. Top 1-2 matches only until calibrated.
+   - Notification modes enforced in MCP code: quiet / balanced / active
+   - Cooldown enforced in code: 48h per person, novelty scoring
+   - `_digest` response includes metadata: `{surface_now, queue, silent}` per match
+
+4. **Natural intro flow**
+   - User says "yes, reach out" → AI generates personalized intro from context
+   - `request_intro` sends it. Target's AI surfaces at their next session start.
+   - Target approves → both get disclosed fields in-chat. Connected.
+
+5. **Multi-facet support (if user demand proves it)**
+   - Up to 3 facets per card. User approves each.
+   - AI suggests adding facet when sustained context shift detected.
+   - Matching happens per-facet. Each facet embedded separately.
+   - Only ship this if Phase 2 feedback shows users need it.
+
+**Evaluation metrics (Phase 3):**
+- % surfaced suggestions acted on (target: >30%)
+- % surfaced suggestions ignored (calibration signal)
+- Intro acceptance rate from ambient suggestions
+- Annoyance/interruption complaints (target: 0)
+- Time from ambient suggestion to connection (speed of value)
+
+**Output:** Updated SKILL.md + MCP server policy enforcement
+**Estimate:** 3 sessions
+
+---
+
+### Phase 4: Trust, Learning, Infrastructure
+
+**Goal:** Network gets smarter. Trust is real. Infrastructure is production-grade.
+
+1. **Outcome learning loop**
+   - After every intro: lightweight feedback (useful / neutral / not useful)
+   - Track: shown / acted on / ignored for every surfaced match
+   - Feed signals into matching weights (response rate, acceptance rate, outcome quality)
+   - Calibrate confidence threshold from real engagement data
+
+2. **Trust signals**
+   - Identity age (days since registration)
+   - Response rate, acceptance rate (internal ranking features)
+   - Optional linked proofs: GitHub URL, website, domain email
+   - Seed card labeling enforced in matching
+   - Public display: minimal (e.g. "responds reliably" / "new user"), not raw numbers
+   - New identities: warm-up period, rank lower until first successful intro
+
+3. **Infrastructure migration**
+   - Move API to Fly.io or Railway ($5-10/month, auto-restart, no tunnel)
+   - Database: Turso (edge SQLite) or keep SQLite on persistent volume
+   - Eliminate Mac Mini SPOF
+   - Global distribution if Turso/D1
+
+4. **Local resilience**
+   - MCP caches last successful card in `~/.mingle/last-card.json`
+   - If API unreachable: card preserved, re-published on reconnect
+   - AI tells user: "Network temporarily unreachable, your card is cached"
+
+5. **Adversarial hardening**
+   - Card text sanitization (strip instruction-like patterns)
+   - Display text separated from matching text
+   - Community reporting mechanism
+   - Penalties for low-response or deceptive patterns
+
+**Evaluation metrics (Phase 4):**
+- Intro acceptance quality (% rated "useful")
+- Repeat engagement (users who publish more than once)
+- False-positive trust incidents (target: 0)
+- API uptime on managed hosting (target: 99.9%)
+- Feedback loop impact: does matching measurably improve over time?
+
+**Output:** Production infrastructure + learning system
+**Estimate:** 4 sessions
+
+---
+
+## Timeline Summary
+
+| Phase | Sessions | Ships |
+|-------|----------|-------|
+| 0 | 0.5 | DEFINITIONS.md — metrics, sanitization, scope rules, deletion policy |
+| 1A | 2 | Persistent identity, simplified schema, seed honesty, publish+match inline, health endpoint, sanitization |
+| 1B | 2 | Server embeddings, v1 card migration, semantic matching returning real results |
+| 2 | 3 | SKILL.md consent flow, ghost mode, scoped auto-refresh, privacy controls |
+| 3 | 3 | Ambient surfacing, client LLM rerank, confidence gating, multi-facet (if needed) |
+| 4 | 4 | Learning loop, trust signals, managed hosting, local resilience, adversarial hardening |
+| **Total** | **~14.5** | **Full ambient networking with trust and learning** |
+
+Each phase ships independently. Phase 1A alone makes the product materially better.
+
+---
+
+## What We Keep
+
+- Ed25519 signing on all cards and intros
+- Double opt-in for all connections
+- MCP protocol for AI client integration
+- 6 MCP tools (publish, update, digest, request intro, respond, remove)
+- `npx mingle-mcp setup` installation
+- npm distribution
+- API endpoint structure (extended, not replaced)
+- Rate limiting
+
+## What We Kill
+
+- Throwaway keypairs per publish → persistent APS identity
+- Category/tag-based matching → semantic embeddings
+- `computeRelevance` in SDK (replaced by server embedding pipeline)
+- Manual-only card creation → AI-drafted, user-approved
+- 50 candidates to client → 15 max
+- "Open" privacy level → never expose raw context
+- `draft_presence` tool (was proposed) → SKILL.md behavior instead
+- `rerank_matches` tool (was proposed) → SKILL.md behavior instead
+- Unlabeled seed cards → tagged with source, honest UX
+- Silent failures when API is down → local cache + user notification
+- Timer-based polling → event-driven only
+
+---
+
+## Build Questions — Pointed at Specific Outputs
+
+These are the concrete questions to resolve during build, organized by what they produce.
+
+### For Phase 0 → Output: DEFINITIONS.md
+
+**Q1. Sanitization rules — what exactly gets stripped?**
+Write the list. Examples: company names, dollar amounts, credentials, "confidential", "NDA", API keys, email addresses, phone numbers. What else? Is this a blocklist or a pattern matcher? Does the AI do the sanitization (SKILL.md) or does the server do it (on publish)?
+→ Answer goes in: `DEFINITIONS.md` section "Sanitization Rules"
+
+**Q2. What constitutes "approved scope" for silent updates?**
+If the user approves "AI agent identity protocol" as their topic, can the AI silently add "Ed25519 delegation chains" to needs? Can it change "protocol collaborators" to "TypeScript protocol collaborators"? Where is the boundary?
+→ Answer goes in: `DEFINITIONS.md` section "Scope Semantics"
+
+**Q3. Deletion policy — what survives card removal?**
+User calls `remove_intent_card`. What's deleted: card JSON, embedding vectors, intro history, analytics? Is anything anonymized and kept?
+→ Answer goes in: `DEFINITIONS.md` section "Deletion Policy"
+
+**Q4. New identity warm-up — how long, what's restricted?**
+New identity registers. Before they can send 10 intros/hr, what's the warm-up? First 24 hours limited to 2 intros? First week? What about search and digest?
+→ Answer goes in: `DEFINITIONS.md` section "Anti-Abuse"
+
+---
+
+### For Phase 1A → Output: mingle-mcp + intent-network-api code
+
+**Q5. Identity storage — encryption or plaintext?**
+`~/.mingle/identity.json` stores the private key. Encrypt it (with what? user password? OS keychain?) or store plaintext (simpler, less secure)? What does the threat model say?
+→ Answer goes in: `mingle-mcp/src/identity.ts` implementation
+
+**Q6. Upsert key — agentId or publicKey?**
+When publishing a card, what's the unique key for upsert? If agentId, a user can claim any agentId. If publicKey, identity is truly cryptographic. But then the user needs to know their publicKey.
+→ Answer goes in: `intent-network-api/src/routes.ts` publish logic
+
+**Q7. _digest side-channel — what fields exactly?**
+Every Mingle tool response includes `_digest`. What's in it? Proposed: `{pendingIntros: number, highConfidenceMatches: number, networkSize: number, lastChecked: ISO}`. Anything else?
+→ Answer goes in: `intent-network-api/src/routes.ts` middleware
+
+**Q8. Health endpoint — what's public?**
+`/api/health` returns stats. What's safe to expose? Active cards yes. Active users (unique identities) yes. Uptime yes. Individual card data no. Intro details no.
+→ Answer goes in: `intent-network-api/src/routes.ts` health route
+
+---
+
+### For Phase 1B → Output: embedding pipeline in intent-network-api
+
+**Q9. Embedding storage — where in SQLite?**
+Options: (a) separate `embeddings` table with card_id + vector blob, (b) JSON column on the cards table, (c) separate vector file on disk. SQLite doesn't have native vector search, so we need to load vectors into memory for cosine comparison. What's the right structure for 120 cards? For 10,000?
+→ Answer goes in: `intent-network-api/src/db.ts` schema
+
+**Q10. Embedding update strategy — on every publish or batch?**
+Generate embedding immediately on publish (adds latency) or queue for background processing? At 120 cards, immediate is fine. At 10,000, might need a queue.
+→ Answer goes in: `intent-network-api/src/routes.ts` publish handler
+
+**Q11. Cross-vector search — implementation detail.**
+We need: "find offers that are semantically similar to my needs." That means embedding each need separately, each offer separately, then cosine between every (need, offer) pair. With 15 cards × 3 needs × 3 offers = 135 comparisons. At 10,000 cards = 90,000 comparisons. Is brute-force OK or do we need approximate nearest neighbor?
+→ Answer goes in: `intent-network-api/src/matching.ts` (new file)
+
+---
+
+### For Phase 2 → Output: SKILL.md + ghost mode
+
+**Q12. SKILL.md consent language — exact wording.**
+The AI needs to show draft cards in a way that's inviting, not clinical. What's the exact prompt template? Too formal = annoying. Too casual = user doesn't read it.
+→ Answer goes in: `mingle-mcp/skills/mingle/SKILL.md`
+
+**Q13. Ghost mode — query format for users without cards.**
+If a user hasn't published a card but wants to search, what do they provide? Raw text needs/offers? The AI formats it? Server embeds on the fly?
+→ Answer goes in: `intent-network-api/src/routes.ts` matches endpoint
+
+---
+
+### For Phase 3 → Output: ambient behavior + rerank
+
+**Q14. Context bundle for reranking — what's included?**
+The AI reranks 15 candidates. What context does it use? Full conversation is too much (and a privacy risk if rerank ever moves server-side). Proposed: approved card + inferred needs/offers + last 3 user messages summarized.
+→ Answer goes in: SKILL.md rerank instructions
+
+**Q15. When exactly does the AI surface a match?**
+"Natural conversation moment" is vague. Define it: (a) after user finishes a thought/question, (b) when user explicitly asks for help, (c) at session start only, (d) when there's a lull in back-and-forth?
+→ Answer goes in: SKILL.md surfacing policy
+
+---
+
+## For Reviewers (Final Round)
+
+This is the consensus plan. If you see something that will cause a build failure, flag it now. Otherwise, we start Phase 0 next session.
+
+Specific questions:
+1. Is the Phase 1A/1B split clean enough? Any hidden dependency between identity and embeddings?
+2. Is 6 tools the right count? Did we cut too much by killing draft_presence and rerank_matches?
+3. Is the _digest side-channel the right pattern for ambient reliability, or is there a better way?
+4. Any showstoppers in the embedding approach (MiniLM on Mac Mini, brute-force cosine at scale)?
+5. Is ghost mode in Phase 2 too early or exactly right?
+
+---
+*Built by Tymofii Pidlisnyi | aeoess.com | github.com/aeoess*
+*Reviewed by: Claude (Anthropic), Gemini (Google), GPT (OpenAI)*
+*Consensus reached March 15, 2026*

@@ -80,6 +80,10 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), (r
         res.status(400).json({ error: 'Card is already expired' });
         return;
     }
+    // Default principalAlias to agentId if not provided
+    if (!card.principalAlias) {
+        card.principalAlias = card.agentId;
+    }
     const result = db.publishCard(card);
     if (!result.published) {
         res.status(500).json({ error: result.error });
@@ -128,12 +132,20 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
     }
     const allCards = db.getAllActiveCards();
     const matches = [];
+    // Ensure cards have all fields computeRelevance expects
+    const normalize = (c) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] });
+    const myNorm = normalize(myCard);
     for (const other of allCards) {
         if (other.agentId === agentId)
             continue;
-        const match = computeRelevance(myCard, other);
-        if (match && match.score > 0) {
-            matches.push(match);
+        try {
+            const match = computeRelevance(myNorm, normalize(other));
+            if (match && match.score > 0) {
+                matches.push(match);
+            }
+        }
+        catch (e) {
+            // Skip cards that fail matching
         }
     }
     // Sort by score descending
@@ -220,12 +232,17 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
     let matches = [];
     if (myCard) {
         const allCards = db.getAllActiveCards();
+        const normalize = (c) => ({ ...c, notOpenTo: c.notOpenTo || [], needs: c.needs || [], offers: c.offers || [], openTo: c.openTo || [], tags: c.tags || [] });
+        const myNorm = normalize(myCard);
         for (const other of allCards) {
             if (other.agentId === agentId)
                 continue;
-            const match = computeRelevance(myCard, other);
-            if (match && match.score > 0)
-                matches.push(match);
+            try {
+                const match = computeRelevance(myNorm, normalize(other));
+                if (match && match.score > 0)
+                    matches.push(match);
+            }
+            catch (e) { }
         }
         matches.sort((a, b) => b.score - a.score);
         matches = matches.slice(0, 10);
@@ -351,6 +368,26 @@ router.get('/stats', (_req, res) => {
         version: '0.1.0',
         protocol: 'agent-passport-system',
         uptime: process.uptime(),
+    });
+});
+// ══════════════════════════════════════
+// GET /api/health — Detailed health check
+// ══════════════════════════════════════
+router.get('/health', (_req, res) => {
+    const stats = db.getNetworkStats();
+    const d = db.getDb();
+    const uniqueKeys = d.prepare('SELECT COUNT(DISTINCT public_key) as cnt FROM cards WHERE expires_at > datetime(\'now\')').get()?.cnt || 0;
+    const lastCard = d.prepare('SELECT created_at FROM cards ORDER BY created_at DESC LIMIT 1').get()?.created_at || null;
+    res.json({
+        status: 'ok',
+        activeCards: stats.active_cards,
+        activeUsers: uniqueKeys,
+        totalPublished: stats.total_cards_published,
+        totalIntrosApproved: stats.total_intros_approved,
+        pendingIntros: stats.pending_intros,
+        lastCardPublished: lastCard,
+        uptime: Math.round(process.uptime()),
+        version: '0.2.0',
     });
 });
 export default router;
