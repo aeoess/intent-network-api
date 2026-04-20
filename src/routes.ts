@@ -523,7 +523,7 @@ router.get('/stats', (_req, res) => {
   const stats = db.getNetworkStats()
   res.json({
     ...stats,
-    version: '0.1.0',
+    version: '0.4.0',
     protocol: 'agent-passport-system',
     uptime: process.uptime(),
   })

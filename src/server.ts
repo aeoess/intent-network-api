@@ -33,14 +33,14 @@ app.use('/api', routes)
 
 // ── Health check ──
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', version: '0.1.0', uptime: process.uptime() })
+  res.json({ status: 'ok', version: '0.4.0', uptime: process.uptime() })
 })
 
 // ── Root ──
 app.get('/', (_req, res) => {
   res.json({
     name: 'AEOESS Intent Network API',
-    version: '0.1.0',
+    version: '0.4.0',
     docs: 'https://aeoess.com/llms-full.txt',
     endpoints: {
       'POST /api/cards': 'Publish an IntentCard (signature verified)',

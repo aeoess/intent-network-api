@@ -2,3 +2,14 @@ node_modules/
 data/
 *.db
 .env
+
+# dev seed scripts — synthetic, never commit
+seed.mjs
+seed-demand.mjs
+seed-*.mjs
+
+# stray file from terminal redirection accidents
+/0
+
+# misplaced doc (belongs in mingle-mcp)
+MINGLE-V2-BUILD-PLAN.md
