@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import type { IntentCard, IntroRequest } from 'agent-passport-system';
+export declare const SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 export declare function getDb(): Database.Database;
 export declare function publishCard(card: IntentCard): {
     published: boolean;
