@@ -6,11 +6,23 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { join } from 'node:path';
-const DB_PATH = process.env.DB_PATH || join(process.cwd(), 'data', 'intent-network.db');
+// DB_PATH is resolved lazily (inside getDb) rather than at module load,
+// so tests can point DB_PATH at a temp file before the first connection
+// is opened. Production behavior unchanged: env read once, on first use.
+function resolveDbPath() {
+    return process.env.DB_PATH || join(process.cwd(), 'data', 'intent-network.db');
+}
+// SQL expression for "now" in the same ISO-8601 format the app stores
+// (new Date().toISOString() → 'YYYY-MM-DDTHH:MM:SS.sssZ').
+// Comparing ISO strings against SQLite's datetime('now')
+// ('YYYY-MM-DD HH:MM:SS') is lexically broken: 'T' > ' ', so
+// "expires_at > datetime('now')" was ALWAYS true and expired rows were
+// never filtered or purged. All expiry comparisons must use this.
+export const SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 let db;
 export function getDb() {
     if (!db) {
-        db = new Database(DB_PATH);
+        db = new Database(resolveDbPath());
         sqliteVec.load(db);
         db.pragma('journal_mode = WAL');
         db.pragma('busy_timeout = 5000');
@@ -151,7 +163,7 @@ export function publishCard(card) {
 export function getCard(agentId) {
     const d = getDb();
     purgeExpired();
-    const row = d.prepare('SELECT card_json FROM cards WHERE agent_id = ? AND expires_at > datetime(\'now\')').get(agentId);
+    const row = d.prepare(`SELECT card_json FROM cards WHERE agent_id = ? AND expires_at > ${SQL_NOW_ISO}`).get(agentId);
     return row ? JSON.parse(row.card_json) : null;
 }
 export function removeCard(cardId, publicKey) {
@@ -163,12 +175,12 @@ export function removeCard(cardId, publicKey) {
 export function getAllActiveCards() {
     const d = getDb();
     purgeExpired();
-    const rows = d.prepare('SELECT card_json FROM cards WHERE expires_at > datetime(\'now\')').all();
+    const rows = d.prepare(`SELECT card_json FROM cards WHERE expires_at > ${SQL_NOW_ISO}`).all();
     return rows.map(r => JSON.parse(r.card_json));
 }
 export function getCardCount() {
     const d = getDb();
-    return d.prepare('SELECT COUNT(*) as count FROM cards WHERE expires_at > datetime(\'now\')').get().count;
+    return d.prepare(`SELECT COUNT(*) as count FROM cards WHERE expires_at > ${SQL_NOW_ISO}`).get().count;
 }
 // ══════════════════════════════════════
 // Intro Operations
@@ -262,8 +274,8 @@ export function checkRateLimit(publicKey, action, maxPerHour) {
 // ══════════════════════════════════════
 export function purgeExpired() {
     const d = getDb();
-    const cards = d.prepare('DELETE FROM cards WHERE expires_at <= datetime(\'now\')').run();
-    const intros = d.prepare('UPDATE intros SET status = \'expired\' WHERE status = \'pending\' AND expires_at <= datetime(\'now\')').run();
+    const cards = d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run();
+    const intros = d.prepare(`UPDATE intros SET status = 'expired' WHERE status = 'pending' AND expires_at <= ${SQL_NOW_ISO}`).run();
     // Clean old rate limit windows (older than 2 hours)
     const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
     d.prepare('DELETE FROM rate_limits WHERE window_start < ?').run(cutoff);
@@ -318,7 +330,7 @@ export function searchOffersForNeeds(needVectors, excludeAgentId, limit = 15) {
     FROM card_embeddings ce
     JOIN cards c ON ce.agent_id = c.agent_id
     WHERE ce.item_type = 'offer'
-    AND c.expires_at > datetime('now')
+    AND c.expires_at > ${SQL_NOW_ISO}
     AND ce.agent_id != ?
   `).all(excludeAgentId);
     const matches = [];
@@ -354,7 +366,7 @@ export function searchNeedsForOffers(offerVectors, excludeAgentId, limit = 15) {
     FROM card_embeddings ce
     JOIN cards c ON ce.agent_id = c.agent_id
     WHERE ce.item_type = 'need'
-    AND c.expires_at > datetime('now')
+    AND c.expires_at > ${SQL_NOW_ISO}
     AND ce.agent_id != ?
   `).all(excludeAgentId);
     const matches = [];

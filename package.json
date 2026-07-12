@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
+    "pretest": "node scripts/check-tests-exist.mjs",
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {

@@ -9,13 +9,26 @@ import * as sqliteVec from 'sqlite-vec'
 import { join } from 'node:path'
 import type { IntentCard, IntroRequest, IntroResponse, RelevanceMatch } from 'agent-passport-system'
 
-const DB_PATH = process.env.DB_PATH || join(process.cwd(), 'data', 'intent-network.db')
+// DB_PATH is resolved lazily (inside getDb) rather than at module load,
+// so tests can point DB_PATH at a temp file before the first connection
+// is opened. Production behavior unchanged: env read once, on first use.
+function resolveDbPath(): string {
+  return process.env.DB_PATH || join(process.cwd(), 'data', 'intent-network.db')
+}
+
+// SQL expression for "now" in the same ISO-8601 format the app stores
+// (new Date().toISOString() → 'YYYY-MM-DDTHH:MM:SS.sssZ').
+// Comparing ISO strings against SQLite's datetime('now')
+// ('YYYY-MM-DD HH:MM:SS') is lexically broken: 'T' > ' ', so
+// "expires_at > datetime('now')" was ALWAYS true and expired rows were
+// never filtered or purged. All expiry comparisons must use this.
+export const SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 let db: Database.Database
 
 export function getDb(): Database.Database {
   if (!db) {
-    db = new Database(DB_PATH)
+    db = new Database(resolveDbPath())
     sqliteVec.load(db)
     db.pragma('journal_mode = WAL')
     db.pragma('busy_timeout = 5000')
@@ -166,7 +179,7 @@ export function publishCard(card: IntentCard): { published: boolean; error?: str
 export function getCard(agentId: string): IntentCard | null {
   const d = getDb()
   purgeExpired()
-  const row = d.prepare('SELECT card_json FROM cards WHERE agent_id = ? AND expires_at > datetime(\'now\')').get(agentId) as any
+  const row = d.prepare(`SELECT card_json FROM cards WHERE agent_id = ? AND expires_at > ${SQL_NOW_ISO}`).get(agentId) as any
   return row ? JSON.parse(row.card_json) : null
 }
 
@@ -180,13 +193,13 @@ export function removeCard(cardId: string, publicKey: string): boolean {
 export function getAllActiveCards(): IntentCard[] {
   const d = getDb()
   purgeExpired()
-  const rows = d.prepare('SELECT card_json FROM cards WHERE expires_at > datetime(\'now\')').all() as any[]
+  const rows = d.prepare(`SELECT card_json FROM cards WHERE expires_at > ${SQL_NOW_ISO}`).all() as any[]
   return rows.map(r => JSON.parse(r.card_json))
 }
 
 export function getCardCount(): number {
   const d = getDb()
-  return (d.prepare('SELECT COUNT(*) as count FROM cards WHERE expires_at > datetime(\'now\')').get() as any).count
+  return (d.prepare(`SELECT COUNT(*) as count FROM cards WHERE expires_at > ${SQL_NOW_ISO}`).get() as any).count
 }
 
 // ══════════════════════════════════════
@@ -293,8 +306,8 @@ export function checkRateLimit(publicKey: string, action: string, maxPerHour: nu
 
 export function purgeExpired(): number {
   const d = getDb()
-  const cards = d.prepare('DELETE FROM cards WHERE expires_at <= datetime(\'now\')').run()
-  const intros = d.prepare('UPDATE intros SET status = \'expired\' WHERE status = \'pending\' AND expires_at <= datetime(\'now\')').run()
+  const cards = d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run()
+  const intros = d.prepare(`UPDATE intros SET status = 'expired' WHERE status = 'pending' AND expires_at <= ${SQL_NOW_ISO}`).run()
   // Clean old rate limit windows (older than 2 hours)
   const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
   d.prepare('DELETE FROM rate_limits WHERE window_start < ?').run(cutoff)
@@ -354,7 +367,7 @@ export function searchOffersForNeeds(needVectors: Float32Array[], excludeAgentId
     FROM card_embeddings ce
     JOIN cards c ON ce.agent_id = c.agent_id
     WHERE ce.item_type = 'offer'
-    AND c.expires_at > datetime('now')
+    AND c.expires_at > ${SQL_NOW_ISO}
     AND ce.agent_id != ?
   `).all(excludeAgentId) as { agent_id: string, item_text: string, embedding: Buffer }[]
 
@@ -393,7 +406,7 @@ export function searchNeedsForOffers(offerVectors: Float32Array[], excludeAgentI
     FROM card_embeddings ce
     JOIN cards c ON ce.agent_id = c.agent_id
     WHERE ce.item_type = 'need'
-    AND c.expires_at > datetime('now')
+    AND c.expires_at > ${SQL_NOW_ISO}
     AND ce.agent_id != ?
   `).all(excludeAgentId) as { agent_id: string, item_text: string, embedding: Buffer }[]
 

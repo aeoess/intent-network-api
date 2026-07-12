@@ -484,7 +484,7 @@ router.get('/stats', (_req, res) => {
 router.get('/health', (_req, res) => {
     const stats = db.getNetworkStats();
     const d = db.getDb();
-    const uniqueKeys = d.prepare('SELECT COUNT(DISTINCT public_key) as cnt FROM cards WHERE expires_at > datetime(\'now\')').get()?.cnt || 0;
+    const uniqueKeys = d.prepare(`SELECT COUNT(DISTINCT public_key) as cnt FROM cards WHERE expires_at > ${db.SQL_NOW_ISO}`).get()?.cnt || 0;
     const lastCard = d.prepare('SELECT created_at FROM cards ORDER BY created_at DESC LIMIT 1').get()?.created_at || null;
     const embCount = db.getEmbeddingCount();
     res.json({
