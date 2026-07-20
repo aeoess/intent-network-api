@@ -13,6 +13,7 @@ import { verify, canonicalize } from 'agent-passport-system'
 import { cardContentHash, canonicalCardContent, validateV3Card } from './v3-cards.js'
 import type { RevocationStatus } from './v3-cards.js'
 import * as v3db from './v3-db.js'
+import * as notifyDb from './notify-db.js'
 import { embed } from './embeddings.js'
 import { networkVisibleText } from './v3-cards.js'
 import { checkRateLimit } from './db.js'
@@ -156,6 +157,8 @@ router.post('/cards/:cardId/delete-server-copy', rateLimited('verb', req => Stri
   const key = requireVerbSignature(req, res, cardId, 'delete-server-copy')
   if (!key) return
   v3db.deleteV3Card(cardId, key)
+  // Deleting the server copy also removes the principal's notification email.
+  notifyDb.deleteSubscription(key)
   res.json({ card_id: cardId, revocation_status: 'deleted' })
 })
 

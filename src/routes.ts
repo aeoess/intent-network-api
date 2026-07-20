@@ -7,9 +7,20 @@ import { requireSignature, identifyAgent } from './auth.js'
 import type { AuthenticatedRequest } from './auth.js'
 import * as db from './db.js'
 import { embed, embedBatch } from './embeddings.js'
+import * as notify from './notifications.js'
 import {
   computeRelevance, verifyIntentCard, isCardExpired,
 } from 'agent-passport-system'
+
+// Network-visible headline for a 48h card (public by design): alias, then
+// topic, then the agent id. Never any private field (48h cards have none).
+function cardHeadline(card: any): string {
+  return card?.principalAlias || card?.topic || card?.agentId || ''
+}
+// The recipient opens Mingle in their own assistant; the email links to the
+// public entry point, which is something they can already reach. When v3
+// mutual intros land, this becomes the recipient's own /c status page.
+const openMingleUrl = (): string => `${(process.env.MINGLE_PUBLIC_URL || 'https://api.aeoess.com').replace(/\/$/, '')}/join`
 import type { IntentCard, RelevanceMatch } from 'agent-passport-system'
 
 const router = Router()
@@ -278,7 +289,7 @@ router.post('/matches/ghost', rateLimit('search', LIMITS.search), async (req, re
 // POST /api/intros — Request introduction
 // ══════════════════════════════════════
 
-router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), (req: AuthenticatedRequest, res) => {
+router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), async (req: AuthenticatedRequest, res) => {
   const { matchId, targetAgentId, message, fieldsToDisclose } = req.body
   const requestedBy = req.verifiedAgentId
 
@@ -320,6 +331,18 @@ router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), (req:
   const targetProfile = db.getCard(targetAgentId)
   if (targetProfile?.publicKey) db.incrementProfile(targetProfile.publicKey, 'total_intros_received')
 
+  // Email notification to the target, if they subscribed and verified. Dark and
+  // instant when unconfigured; never breaks the intro on any email failure.
+  try {
+    if (targetProfile?.publicKey) {
+      const requesterCard = db.getCard(requestedBy)
+      await notify.notifyIntroRequest({
+        recipientKey: targetProfile.publicKey, introId,
+        requesterHeadline: cardHeadline(requesterCard), purpose: message, statusUrl: openMingleUrl(),
+      })
+    }
+  } catch { /* notification failure never affects the intro */ }
+
   res.status(201).json({ introId, status: 'pending', targetAgentId })
 })
 
@@ -327,7 +350,7 @@ router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), (req:
 // PUT /api/intros/:introId — Respond to intro
 // ══════════════════════════════════════
 
-router.put('/intros/:introId', requireSignature, (req: AuthenticatedRequest, res) => {
+router.put('/intros/:introId', requireSignature, async (req: AuthenticatedRequest, res) => {
   const intro = db.getIntro(String(req.params.introId))
   if (!intro) {
     res.status(404).json({ error: 'Intro not found' })
@@ -359,6 +382,22 @@ router.put('/intros/:introId', requireSignature, (req: AuthenticatedRequest, res
     const requesterCard = db.getCard(introRecord.requested_by)
     if (requesterCard?.publicKey) {
       db.incrementProfile(requesterCard.publicKey, verdict === 'approve' ? 'total_intros_accepted' : 'total_intros_declined')
+    }
+
+    // On acceptance, notify BOTH sides (intro_accepted). Dark and instant when
+    // unconfigured; never breaks the response on any email failure.
+    if (verdict === 'approve') {
+      try {
+        const requesterCard2 = db.getCard(introRecord.requested_by)
+        const targetCard = db.getCard(intro.targetAgentId)
+        const introId = String(req.params.introId)
+        if (requesterCard2?.publicKey) {
+          await notify.notifyIntroAccepted({ recipientKey: requesterCard2.publicKey, introId, counterpartyHeadline: cardHeadline(targetCard) })
+        }
+        if (targetCard?.publicKey) {
+          await notify.notifyIntroAccepted({ recipientKey: targetCard.publicKey, introId, counterpartyHeadline: cardHeadline(requesterCard2) })
+        }
+      } catch { /* notification failure never affects the response */ }
     }
   }
 
