@@ -12,6 +12,7 @@ import cors from 'cors'
 import helmet from 'helmet'
 import routes from './routes.js'
 import v3Routes from './v3-routes.js'
+import v3Pages from './v3-pages.js'
 
 export function createApp() {
   const app = express()
@@ -29,6 +30,8 @@ export function createApp() {
   app.use('/api', routes)
   // Mingle v3 (additive; the 48h IntentCard routes above are untouched)
   app.use('/api/v3', v3Routes)
+  // Mingle v3 P1.5 read surfaces: /c/:cardId, /e/:eventRef, /join
+  app.use('/', v3Pages)
 
   // ── Health check ──
   app.get('/health', (_req, res) => {
