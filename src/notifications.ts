@@ -6,7 +6,7 @@
 // purpose), never anything from a card's private fields.
 //
 // Sending goes through Resend's HTTP API. If RESEND_API_KEY or
-// MINGLE_FROM_EMAIL is unset the module no-ops silently, so the feature stays
+// unset the module no-ops silently, so the feature stays
 // dark with zero errors until an operator configures it. Tests inject a mock
 // transport so the real API is never called.
 
@@ -25,14 +25,18 @@ export function setTransport(t: Transport): void { transport = t }
 export function resetTransport(): void { transport = null }
 
 /** True when the feature is configured to actually send. */
+// Sender defaults to mingle@aeoess.com (domain already verified in Resend);
+// MINGLE_FROM_EMAIL overrides it. Only RESEND_API_KEY is required to go live.
+const FROM_EMAIL = process.env.MINGLE_FROM_EMAIL || 'Mingle <mingle@aeoess.com>'
+
 export function isEmailEnabled(): boolean {
-  return transport !== null || (!!process.env.RESEND_API_KEY && !!process.env.MINGLE_FROM_EMAIL)
+  return transport !== null || !!process.env.RESEND_API_KEY
 }
 
 async function resendTransport(email: OutgoingEmail): Promise<{ ok: boolean; id?: string; error?: string }> {
   const key = process.env.RESEND_API_KEY
-  const from = process.env.MINGLE_FROM_EMAIL
-  if (!key || !from) return { ok: false, error: 'not_configured' }
+  const from = FROM_EMAIL
+  if (!key) return { ok: false, error: 'not_configured' }
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -48,7 +52,7 @@ async function resendTransport(email: OutgoingEmail): Promise<{ ok: boolean; id?
 }
 
 async function send(email: OutgoingEmail): Promise<{ ok: boolean; id?: string; error?: string }> {
-  const t = transport ?? (process.env.RESEND_API_KEY && process.env.MINGLE_FROM_EMAIL ? resendTransport : null)
+  const t = transport ?? (process.env.RESEND_API_KEY ? resendTransport : null)
   if (!t) return { ok: false, error: 'disabled' }
   return t(email)
 }
