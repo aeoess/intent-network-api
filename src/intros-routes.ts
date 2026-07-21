@@ -15,6 +15,7 @@ import * as v3db from './v3-db.js'
 import { networkVisibleView } from './v3-cards.js'
 import * as email from './notifications.js'
 import { createFitExchangeForIntro } from './fit-routes.js'
+import { openV4HandshakeForIntro } from './fit-v4-routes.js'
 
 const router = Router()
 const MAX_NOTE = 200
@@ -102,9 +103,22 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
     // If both cards share a banked intent, open a structured fit exchange and
     // return the accepter's consent sheet; otherwise the intro proceeds straight
     // to the existing contact-completion flow, unchanged.
+    // Prefer the v4 predicate handshake when both cards carry a Fit Policy for
+    // the shared intent; otherwise fall back to the v3 question-bank exchange,
+    // unchanged. Work never opens either (it is not a policy intent).
+    let handshake: { id: string; mode: 'v4' } | null = null
     let fit: { id: string; consent_sheet: Record<string, unknown> } | null = null
-    try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
-    res.json({ id, status: 'accepted', awaiting: 'requester_contact', fit_exchange: fit?.id ?? null, consent_sheet: fit?.consent_sheet ?? null })
+    try { handshake = openV4HandshakeForIntro(intro) } catch { /* never blocks accept */ }
+    if (!handshake) {
+      try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
+    }
+    res.json({
+      id, status: 'accepted', awaiting: 'requester_contact',
+      fit_handshake: handshake?.id ?? null,
+      fit_mode: handshake ? 'v4' : (fit ? 'v3' : null),
+      fit_exchange: fit?.id ?? null,
+      consent_sheet: fit?.consent_sheet ?? null,
+    })
     return
   }
   if (action === 'decline_and_block') {

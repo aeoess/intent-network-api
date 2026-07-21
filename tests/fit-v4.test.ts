@@ -23,6 +23,8 @@ const db = await import('../src/db.js')
 const { cardContentHash } = await import('../src/v3-cards.js')
 const { policyHash } = await import('../src/fit-policy-db.js')
 const airlock = await import('../src/fit-airlock.js')
+const handshakeDb = await import('../src/fit-handshake-db.js')
+const serverKey = await import('../src/server-key.js')
 
 let server: Server
 let base: string
@@ -196,4 +198,264 @@ test('the planner takes only the extraction and forces human review when not cle
   // A high-sensitivity dimension escalates even on a clean answer.
   const highSens = airlock.plan({ dimension: 'decision_model', status: 'answered', conditions: [] }, { disclosure_state: 'reveal_overlap', importance: 'essential', sensitivity: 'high' })
   assert.equal(highSens.requires_human, true)
+})
+
+// ══════════════════════════════════════════════════════════════
+// Stage 3: bilateral predicate handshake
+// ══════════════════════════════════════════════════════════════
+
+const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')
+const rid = () => Math.random().toString(16).slice(2)
+
+async function requestIntro(from: any, fromCard: string, toCard: string, purpose: string): Promise<string> {
+  const nonce = 'ri' + rid()
+  const body = { from_card: fromCard, to_card: toCard, purpose, note: '', public_key: from.keys.publicKey, nonce, signature: sign(`intro-request:${fromCard}:${toCard}:${purpose}:${nonce}`, from.keys.privateKey) }
+  return (await (await fetch(`${base}/api/v3/intros/request`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json()).id
+}
+async function acceptIntro(to: any, introId: string): Promise<any> {
+  const nonce = 'ai' + rid()
+  const body = { action: 'accept', contact: 'x@e.example', public_key: to.keys.publicKey, nonce, signature: sign(`intro-respond:${introId}:accept:${nonce}`, to.keys.privateKey) }
+  return (await fetch(`${base}/api/v3/intros/${introId}/respond`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json()
+}
+async function openHandshake(intent: string, aliceDims: any[] | null, bobDims: any[] | null): Promise<any> {
+  const alice = makeCard('Alice', [intent, 'collaborate']); const bob = makeCard('Bob', [intent])
+  const aliceCard = await publish(alice); const bobCard = await publish(bob)
+  if (aliceDims) await setPolicy(alice, aliceCard, aliceDims)
+  if (bobDims) await setPolicy(bob, bobCard, bobDims)
+  const introId = await requestIntro(alice, aliceCard, bobCard, intent)
+  const acc = await acceptIntro(bob, introId)
+  return { introId, alice, bob, aliceCard, bobCard, acc }
+}
+async function hsRequest(who: any, introId: string, requested: string[], reciprocal: string[], dims: any[]): Promise<{ status: number; body: any }> {
+  const policy_hash = policyHash(dims); const nonce = 'hq' + rid()
+  const body = { requested_dimensions: requested, reciprocal_offer: reciprocal, predicate_version: 1, policy_hash, query_budget: 5, public_key: who.keys.publicKey, nonce, signature: sign(`fit-request:${introId}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/request`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function hsCommit(who: any, introId: string, accept: string[], reciprocal: string[], dims: any[]): Promise<{ status: number; body: any }> {
+  const policy_hash = policyHash(dims); const nonce = 'hc' + rid()
+  const body = { accept_dimensions: accept, reciprocal_offer: reciprocal, policy_hash, public_key: who.keys.publicKey, nonce, signature: sign(`fit-commit:${introId}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function hsGet(who: any, introId: string): Promise<any> {
+  const nonce = 'hg' + rid()
+  const qs = new URLSearchParams({ public_key: who.keys.publicKey, nonce, signature: sign(`fit-hs-get:${introId}:${nonce}`, who.keys.privateKey) })
+  return (await fetch(`${base}/api/v4/fit/${introId}?${qs}`)).json()
+}
+async function hsReveal(who: any, introId: string, dimension: string): Promise<{ status: number; body: any }> {
+  const nonce = 'hr' + rid()
+  const body = { dimension, public_key: who.keys.publicKey, nonce, signature: sign(`fit-reveal:${introId}:${dimension}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+const factFor = (map: any[], d: string) => map.find((e: any) => e.dimension === d)
+
+// ── RECIPROCITY (must-not-cut) ──
+
+test('no predicate is evaluated until BOTH sides commit (one-sided probe yields nothing)', async () => {
+  const aDims = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_overlap', 'essential')]
+  const bDims = [dim('weekly_commitment', { min: 30, max: 50 }, 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', aDims, bDims)
+  assert.equal(hs.acc.fit_mode, 'v4', JSON.stringify(hs.acc))
+  assert.ok(hs.acc.fit_handshake)
+
+  const rq = await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], aDims)
+  assert.equal(rq.status, 201, JSON.stringify(rq.body))
+  const g1 = await hsGet(hs.alice, hs.introId)
+  assert.equal(g1.state, 'requested')
+  assert.equal(g1.overlap_map, undefined, 'nothing is evaluated before the counterparty commits')
+
+  const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], bDims)
+  assert.equal(cm.status, 200, JSON.stringify(cm.body))
+  assert.ok(Array.isArray(cm.body.overlap_map))
+  assert.equal(factFor(cm.body.overlap_map, 'weekly_commitment').overlap, true)  // 20-40 vs 30-50 overlap
+})
+
+test('the requester cannot also commit; only the counterparty can', async () => {
+  const aDims = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', aDims, aDims)
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], aDims)
+  const self = await hsCommit(hs.alice, hs.introId, ['cadence'], ['cadence'], aDims)
+  assert.equal(self.status, 403)
+})
+
+test('the evaluable set is only the mutual intersection', async () => {
+  const aDims = [dim('weekly_commitment', { min: 10, max: 20 }, 'reveal_overlap', 'essential'), dim('cadence', 'mixed', 'reveal_overlap', 'useful')]
+  const bDims = [dim('weekly_commitment', { min: 10, max: 20 }, 'reveal_overlap', 'essential'), dim('cadence', 'async_first', 'reveal_overlap', 'useful')]
+  const hs = await openHandshake('cofound', aDims, bDims)
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment', 'cadence'], ['weekly_commitment'], aDims)  // only reciprocates commitment
+  const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment', 'cadence'], ['weekly_commitment'], bDims)
+  const dims = cm.body.overlap_map.map((e: any) => e.dimension)
+  assert.ok(dims.includes('weekly_commitment'))
+  assert.equal(dims.includes('cadence'), false, 'cadence was not reciprocally offered by both, so it is not evaluated')
+})
+
+// ── DISCLOSURE STATES ──
+
+test('disclosure states: overlap reveals only yes/no, bucket reveals a bucket, exact needs a human reveal, testable reveals nothing', async () => {
+  // reveal_overlap: overlap only, no bucket
+  {
+    const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_overlap', 'essential')]
+    const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_overlap', 'essential')]
+    const hs = await openHandshake('cofound', a, b)
+    await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+    const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+    const f = factFor(cm.body.overlap_map, 'weekly_commitment')
+    assert.equal(f.result, 'overlap')
+    assert.equal(f.bucket_a, undefined)
+  }
+  // reveal_bucket: buckets present
+  {
+    const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_bucket', 'essential')]
+    const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_bucket', 'essential')]
+    const hs = await openHandshake('cofound', a, b)
+    await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+    const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+    const f = factFor(cm.body.overlap_map, 'weekly_commitment')
+    assert.equal(f.result, 'bucket')
+    assert.ok(f.bucket_a && f.bucket_b)
+  }
+  // testable: predicate may run but reveals nothing
+  {
+    const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'testable', 'essential')]
+    const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'testable', 'essential')]
+    const hs = await openHandshake('cofound', a, b)
+    await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+    const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+    const f = factFor(cm.body.overlap_map, 'weekly_commitment')
+    assert.equal(f.result, 'not_disclosed')
+    assert.equal(f.overlap, undefined)
+  }
+  // local_only: never participates
+  {
+    const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'local_only', 'essential')]
+    const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_overlap', 'essential')]
+    const hs = await openHandshake('cofound', a, b)
+    await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+    const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+    const f = factFor(cm.body.overlap_map, 'weekly_commitment')
+    assert.equal(f.result, 'not_checked')
+  }
+})
+
+test('reveal_exact keeps the exact private until a human-tap reveal by the owner', async () => {
+  const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_exact', 'essential')]
+  const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_exact', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+  const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+  const f = factFor(cm.body.overlap_map, 'weekly_commitment')
+  assert.equal(f.result, 'exact_available')
+  // Before any reveal, GET carries no exact value.
+  const g1 = await hsGet(hs.alice, hs.introId)
+  assert.equal(factFor(g1.overlap_map, 'weekly_commitment').exact_a, undefined)
+  // Alice taps reveal for her own dimension; now GET carries the exact values.
+  const rv = await hsReveal(hs.alice, hs.introId, 'weekly_commitment')
+  assert.equal(rv.status, 200)
+  const g2 = await hsGet(hs.bob, hs.introId)
+  assert.ok(factFor(g2.overlap_map, 'weekly_commitment').exact_a !== undefined)
+})
+
+// ── ANTI-NARROWING (must-not-cut) ──
+
+test('the per-principal-pair query budget caps repeats (unit)', () => {
+  const pk = handshakeDb.principalPairKey('KA', 'KB')
+  for (let i = 0; i < handshakeDb.QUERY_BUDGET_MAX; i++) assert.equal(handshakeDb.budgetConsume(pk, 'weekly_commitment').allowed, true)
+  assert.equal(handshakeDb.budgetConsume(pk, 'weekly_commitment').allowed, false, 'over the lifetime cap the dimension is refused')
+})
+
+test('a budget-exhausted dimension is refused, not re-evaluated, across threads', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  // Exhaust the (pair, cadence) budget out of band, as if it had been tested on
+  // other cards/threads between the same two principals.
+  const pk = handshakeDb.principalPairKey(hs.alice.keys.publicKey, hs.bob.keys.publicKey)
+  for (let i = 0; i < handshakeDb.QUERY_BUDGET_MAX; i++) handshakeDb.budgetConsume(pk, 'cadence')
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
+  const cm = await hsCommit(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
+  assert.equal(factFor(cm.body.overlap_map, 'cadence').result, 'budget_exhausted')
+})
+
+// ── NO-SCORE / NO-ACCUMULATION ──
+
+test('the overlap map is capped, carries no score/count, and only essential+useful dims', async () => {
+  const many = [
+    dim('weekly_commitment', { min: 10, max: 20 }, 'reveal_overlap', 'essential'),
+    dim('start_window', 'now', 'reveal_overlap', 'essential'),
+    dim('time_horizon', 'months', 'reveal_overlap', 'essential'),
+    dim('cadence', 'mixed', 'reveal_overlap', 'essential'),
+    dim('project_stage', 'building', 'reveal_overlap', 'essential'),
+    dim('relationship_shape', 'co_owner', 'reveal_overlap', 'essential'),
+    dim('decision_model', 'consensus', 'reveal_overlap', 'essential'),
+    dim('timezone', { zone: 'UTC', sync_overlap_needed: false }, 'reveal_overlap', 'optional'),  // optional: excluded
+  ]
+  const all = many.map((m: any) => m.dimension)
+  const hs = await openHandshake('cofound', many, many)
+  await hsRequest(hs.alice, hs.introId, all, all, many)
+  const cm = await hsCommit(hs.bob, hs.introId, all, all, many)
+  const dimFacts = cm.body.overlap_map.filter((e: any) => e.dimension !== 'complementarity')
+  assert.ok(dimFacts.length <= 6, `capped at 6, got ${dimFacts.length}`)
+  assert.equal(dimFacts.some((e: any) => e.dimension === 'timezone'), false, 'optional dimension excluded from the map')
+  const banned = new Set(['score', 'rank', 'rating', 'count', 'overlap_count', 'strength'])
+  const walk = (v: unknown): void => { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object') for (const [k, val] of Object.entries(v)) { assert.ok(!banned.has(k.toLowerCase()), `no ${k}`); walk(val) } }
+  walk(cm.body.overlap_map)
+})
+
+test('complementarity appears as a distinct fact, not a score', async () => {
+  const a = [dim('role_spike', ['product', 'fundraising'], 'reveal_overlap', 'essential'), dim('role_antiportfolio', ['backend', 'infra'], 'reveal_overlap', 'essential')]
+  const b = [dim('role_spike', ['backend', 'infra'], 'reveal_overlap', 'essential'), dim('role_antiportfolio', ['product', 'fundraising'], 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await hsRequest(hs.alice, hs.introId, ['role_spike', 'role_antiportfolio'], ['role_spike', 'role_antiportfolio'], a)
+  const cm = await hsCommit(hs.bob, hs.introId, ['role_spike', 'role_antiportfolio'], ['role_spike', 'role_antiportfolio'], b)
+  const compl = factFor(cm.body.overlap_map, 'complementarity')
+  assert.ok(compl, 'complementarity fact present')
+  assert.equal(compl.overlap, true, 'they are strong in what the other listed as anti-portfolio, both directions')
+})
+
+// ── WORK excluded + FALLBACK ──
+
+test('a work intro opens neither a v4 handshake nor a v3 exchange', async () => {
+  const alice = makeCard('Alice', ['work']); const bob = makeCard('Bob', ['work'])
+  const aliceCard = await publish(alice); const bobCard = await publish(bob)
+  const introId = await requestIntro(alice, aliceCard, bobCard, 'work')
+  const acc = await acceptIntro(bob, introId)
+  assert.equal(acc.fit_handshake, null)
+  assert.equal(acc.fit_exchange, null)
+})
+
+test('a pair without policies falls back to the v3 fit exchange, unchanged', async () => {
+  const hs = await openHandshake('cofound', null, null)  // no policies set
+  assert.equal(hs.acc.fit_handshake, null)
+  assert.equal(hs.acc.fit_mode, 'v3')
+  assert.ok(hs.acc.fit_exchange, 'the v3 question-bank exchange opened')
+})
+
+// ── RECEIPTS ──
+
+test('the receipt verifies and binds both policy hashes, predicates, purpose, and expiry', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
+  const cm = await hsCommit(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
+  const rc = cm.body.receipt_content
+  assert.equal(rc.policy_hash_a, policyHash(a))
+  assert.equal(rc.policy_hash_b, policyHash(b))
+  assert.equal(rc.purpose, 'cofound')
+  assert.ok(rc.requested_predicates.includes('cadence'))
+  assert.ok(typeof rc.expiry === 'string')
+  // The digest binds the content, and the server receipt verifies over it.
+  assert.equal(sha(canonicalize(rc)), cm.body.receipt_digest)
+  assert.equal(serverKey.verifyReceipt(cm.body.receipt_digest, cm.body.receipt), true)
+  assert.equal(serverKey.verifyReceipt('f'.repeat(64), cm.body.receipt), false)
+})
+
+test('a non-party cannot read a handshake', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  const stranger = { keys: generateKeyPair() }
+  const g = await hsGet(stranger, hs.introId)
+  assert.equal(g.error ?? 'blocked', g.error)
 })
