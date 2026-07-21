@@ -19,6 +19,8 @@ import { signReceipt, serverPublicKey, verifyReceipt } from './server-key.js'
 import type { IntroRow } from './intros-db.js'
 import * as qaDb from './fit-qa-db.js'
 import * as autonomyDb from './fit-autonomy-db.js'
+import * as firstStepDb from './fit-firststep-db.js'
+import * as email from './notifications.js'
 import { questionFor } from './fit-questions.js'
 import { ledgerItemLive } from './fit-db.js'
 import { postGateDrafted, type PostGateInput } from './fit-gate.js'
@@ -481,6 +483,80 @@ router.get('/:introId/qa', rateLimited('fitv4_get', 60), (req, res) => {
     intro_id: introId,
     record: [...byDimension.values()],
     note: 'raw_text is for the human to read; only the extraction (never raw_text) is used by any planner. Refusal or silence is never negative.',
+  })
+})
+
+// ══════════════════════════════════════════════════════════════
+// Stage 7: First Step artifact (mutual exact-approval)
+// ══════════════════════════════════════════════════════════════
+
+// ── POST /:introId/first-step - propose your own half ─────────────────────
+
+router.post('/:introId/first-step', rateLimited('fitv4_hs', 30), async (req, res) => {
+  const introId = String(req.params.introId)
+  const { half, public_key, nonce, signature } = req.body ?? {}
+  if (typeof nonce !== 'string') { res.status(400).json({ error: 'nonce required' }); return }
+  if (!checkSig(`fit-firststep:${introId}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+
+  const v = firstStepDb.validateHalf(half)
+  if (!v.ok || !v.half) { res.status(400).json({ error: v.error }); return }
+  const gate = postGateDrafted((v.texts ?? []).map((t, i) => ({ question_id: String(i), text: t })))
+  if (!gate.ok) { res.status(400).json({ error: `first-step content refused: ${gate.reason}` }); return }
+
+  const isA = public_key === hs.key_a
+  firstStepDb.proposeHalf(introId, isA, public_key, v.half)
+  try { await email.notifyFirstStepProposed(otherKey(hs, public_key), introId) } catch { /* email never blocks proposal */ }
+
+  const row = firstStepDb.getFirstStep(introId)!
+  res.status(201).json({ proposed: true, both_proposed: !!row.half_a_json && !!row.half_b_json, shared_digest: firstStepDb.sharedDigest(row) })
+})
+
+// ── POST /:introId/first-step/approve - approve the merged shared artifact ─
+
+router.post('/:introId/first-step/approve', rateLimited('fitv4_hs', 30), (req, res) => {
+  const introId = String(req.params.introId)
+  const { approved_digest, public_key, nonce, signature } = req.body ?? {}
+  if (typeof approved_digest !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'approved_digest and nonce required' }); return }
+  if (!checkSig(`fit-firststep-approve:${introId}:${approved_digest}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+
+  const row = firstStepDb.getFirstStep(introId)
+  if (!row || !row.half_a_json || !row.half_b_json) { res.status(409).json({ error: 'both sides must propose a half before either can approve the shared artifact' }); return }
+  const digest = firstStepDb.sharedDigest(row)
+  if (digest !== approved_digest) { res.status(400).json({ error: 'approved_digest does not match the current shared artifact; re-read and re-approve' }); return }
+
+  firstStepDb.approve(introId, public_key === hs.key_a)
+  const fresh = firstStepDb.getFirstStep(introId)!
+  res.json({ approved: true, finalized: firstStepDb.isFinalized(fresh) })
+})
+
+// ── GET /:introId/first-step (parties only) ───────────────────────────────
+
+router.get('/:introId/first-step', rateLimited('fitv4_get', 60), (req, res) => {
+  const introId = String(req.params.introId)
+  const public_key = String(req.query.public_key ?? '')
+  const nonce = String(req.query.nonce ?? '')
+  const signature = String(req.query.signature ?? '')
+  if (!public_key || !nonce) { res.status(400).json({ error: 'public_key and nonce required' }); return }
+  if (!checkSig(`fit-firststep-get:${introId}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  const row = firstStepDb.getFirstStep(introId)
+  if (!row) { res.json({ intro_id: introId, proposed: false }); return }
+  res.json({
+    intro_id: introId,
+    half_a: row.half_a_json ? JSON.parse(row.half_a_json) : null,
+    half_b: row.half_b_json ? JSON.parse(row.half_b_json) : null,
+    a_approved: row.a_approved === 1,
+    b_approved: row.b_approved === 1,
+    finalized: firstStepDb.isFinalized(row),
+    shared_digest: firstStepDb.sharedDigest(row),
   })
 })
 

@@ -120,6 +120,14 @@ export function fitRecordReadyEmail(to: string, unsubToken: string): OutgoingEma
   }
 }
 
+export function firstStepEmail(to: string, unsubToken: string): OutgoingEmail {
+  return {
+    to,
+    subject: 'A Mingle first-step plan is ready',
+    text: `The other side proposed a first-step plan for a connection you are part of.\n\nOpen your assistant and say: show my Mingle first step.${FOOTER(unsubToken)}`,
+  }
+}
+
 // ── High-level send helpers, verified + prefs + dedupe + cap gated ────────
 
 interface IntroRequestArgs { recipientKey: string; introId: string; requesterHeadline: string; purpose: string; statusUrl: string }
@@ -147,6 +155,13 @@ export async function notifyFitStarted(recipientKey: string, exchangeId: string,
 export async function notifyFitRecordReady(recipientKey: string, exchangeId: string): Promise<{ sent: boolean; reason?: string }> {
   return dispatch(recipientKey, `fit-record:${exchangeId}`, 'fit_record', 'intro_accepted', sub =>
     fitRecordReadyEmail(sub.email, sub.unsub_token), true)
+}
+
+/** First-step proposal notice. Content-free, and NON-direct: it counts toward
+ *  the one-per-day cap (not an urgent action, just a nudge). */
+export async function notifyFirstStepProposed(recipientKey: string, introId: string): Promise<{ sent: boolean; reason?: string }> {
+  return dispatch(recipientKey, `first-step:${introId}`, 'first_step', 'intro_accepted', sub =>
+    firstStepEmail(sub.email, sub.unsub_token), false)
 }
 
 async function dispatch(

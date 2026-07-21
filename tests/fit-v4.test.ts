@@ -640,3 +640,94 @@ test('AUTONOMY: a scope may never include the work intent', async () => {
   const s = await setAutonomy(alice, cardId, { intents: ['cofound', 'work'], dimensions: ['cadence'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
   assert.equal(s.status, 400)
 })
+
+// ══════════════════════════════════════════════════════════════
+// Stage 7: First Step artifact (mutual exact-approval)
+// ══════════════════════════════════════════════════════════════
+
+const sampleHalf = () => ({ purpose: 'explore cofounding', next_action: 'a short intro call', meeting_length: '30 min', agenda: ['backgrounds', 'the idea'], each_wants: 'to see if we click on the problem', boundaries: ['no NDAs yet'], expiry: future() })
+
+async function proposeFirstStep(who: any, introId: string, half: any): Promise<{ status: number; body: any }> {
+  const nonce = 'fs' + rid()
+  const body = { half, public_key: who.keys.publicKey, nonce, signature: sign(`fit-firststep:${introId}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/first-step`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function approveFirstStep(who: any, introId: string, digest: string): Promise<{ status: number; body: any }> {
+  const nonce = 'fa' + rid()
+  const body = { approved_digest: digest, public_key: who.keys.publicKey, nonce, signature: sign(`fit-firststep-approve:${introId}:${digest}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/first-step/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function getFirstStep(who: any, introId: string): Promise<any> {
+  const nonce = 'fg' + rid()
+  const qs = new URLSearchParams({ public_key: who.keys.publicKey, nonce, signature: sign(`fit-firststep-get:${introId}:${nonce}`, who.keys.privateKey) })
+  return (await fetch(`${base}/api/v4/fit/${introId}/first-step?${qs}`)).json()
+}
+
+test('FIRST STEP: the shared artifact is final only when BOTH sides approve', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+
+  // Only one half proposed: not final, and approving is refused.
+  assert.equal((await proposeFirstStep(hs.alice, hs.introId, sampleHalf())).status, 201)
+  const g1 = await getFirstStep(hs.alice, hs.introId)
+  assert.equal(g1.finalized, false)
+  assert.equal(g1.half_b, null)
+  const earlyApprove = await approveFirstStep(hs.alice, hs.introId, 'x'.repeat(64))
+  assert.equal(earlyApprove.status, 409, 'cannot approve before both halves exist')
+
+  // Both halves proposed: now a shared digest exists.
+  assert.equal((await proposeFirstStep(hs.bob, hs.introId, sampleHalf())).status, 201)
+  const g2 = await getFirstStep(hs.alice, hs.introId)
+  assert.ok(g2.shared_digest)
+  assert.equal(g2.finalized, false)
+
+  // One approval is not enough.
+  assert.equal((await approveFirstStep(hs.alice, hs.introId, g2.shared_digest)).body.finalized, false)
+  // Both approvals finalize it.
+  const both = await approveFirstStep(hs.bob, hs.introId, g2.shared_digest)
+  assert.equal(both.body.finalized, true)
+})
+
+test('FIRST STEP: re-proposing a half resets both approvals', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  await proposeFirstStep(hs.alice, hs.introId, sampleHalf())
+  await proposeFirstStep(hs.bob, hs.introId, sampleHalf())
+  let g = await getFirstStep(hs.alice, hs.introId)
+  await approveFirstStep(hs.alice, hs.introId, g.shared_digest)
+  await approveFirstStep(hs.bob, hs.introId, g.shared_digest)
+  assert.equal((await getFirstStep(hs.alice, hs.introId)).finalized, true)
+  // Alice changes her half: approvals reset, digest changes.
+  await proposeFirstStep(hs.alice, hs.introId, { ...sampleHalf(), purpose: 'explore a short collaboration' })
+  g = await getFirstStep(hs.alice, hs.introId)
+  assert.equal(g.finalized, false)
+  assert.equal(g.a_approved, false)
+  assert.equal(g.b_approved, false)
+})
+
+test('FIRST STEP: an approval must match the exact current shared artifact', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  await proposeFirstStep(hs.alice, hs.introId, sampleHalf())
+  await proposeFirstStep(hs.bob, hs.introId, sampleHalf())
+  const stale = await approveFirstStep(hs.alice, hs.introId, 'f'.repeat(64))
+  assert.equal(stale.status, 400)
+})
+
+test('FIRST STEP: consequential-eligibility language is refused', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  const r = await proposeFirstStep(hs.alice, hs.introId, { ...sampleHalf(), purpose: 'a candidate fit screening call' })
+  assert.equal(r.status, 400)
+})
+
+test('FIRST STEP: only the two parties can read it', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  await proposeFirstStep(hs.alice, hs.introId, sampleHalf())
+  const stranger = { keys: generateKeyPair() }
+  const g = await getFirstStep(stranger, hs.introId)
+  assert.equal(g.error ?? 'blocked', g.error)
+})
