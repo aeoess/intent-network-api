@@ -459,3 +459,79 @@ test('a non-party cannot read a handshake', async () => {
   const g = await hsGet(stranger, hs.introId)
   assert.equal(g.error ?? 'blocked', g.error)
 })
+
+// ══════════════════════════════════════════════════════════════
+// Stage 5: adaptive questions through the airlock
+// ══════════════════════════════════════════════════════════════
+
+async function hsQuestions(who: any, introId: string): Promise<any> {
+  const nonce = 'qq' + rid()
+  const body = { public_key: who.keys.publicKey, nonce, signature: sign(`fit-questions:${introId}:${nonce}`, who.keys.privateKey) }
+  return (await fetch(`${base}/api/v4/fit/${introId}/questions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json()
+}
+async function hsAnswers(who: any, introId: string, answers: any[]): Promise<{ status: number; body: any }> {
+  const nonce = 'qa' + rid()
+  const hash = sha(canonicalize({ intro_id: introId, nonce, answers }))
+  const body = { answers, public_key: who.keys.publicKey, nonce, signature: sign(hash, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/answers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function hsQa(who: any, introId: string): Promise<any> {
+  const nonce = 'qg' + rid()
+  const qs = new URLSearchParams({ public_key: who.keys.publicKey, nonce, signature: sign(`fit-qa-get:${introId}:${nonce}`, who.keys.privateKey) })
+  return (await fetch(`${base}/api/v4/fit/${introId}/qa?${qs}`)).json()
+}
+
+test('AIRLOCK-IN-QUESTIONS: a marker in a drafted answer never enters the extraction, only the human view', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  const marker = 'AIRLOCK5_SECRET'
+  const r = await hsAnswers(hs.bob, hs.introId, [{ dimension: 'cadence', mode: 'drafted', text: `I like a daily_sync rhythm. ${marker}` }])
+  assert.equal(r.status, 200, JSON.stringify(r.body))
+  const qa = await hsQa(hs.alice, hs.introId)
+  const entry = qa.record.find((e: any) => e.dimension === 'cadence')
+  const bobAnswer = entry.answers.find((x: any) => x.answerer_key === hs.bob.keys.publicKey)
+  assert.equal(bobAnswer.raw_text.includes(marker), true, 'the human view keeps the raw answer')
+  assert.equal(JSON.stringify(bobAnswer.extraction).includes(marker), false, 'the extraction never carries the raw text')
+  // The planner hint (alice viewing bob's answer) is computed from the extraction only.
+  assert.ok(bobAnswer.plan_hint)
+})
+
+test('UNRESOLVED-ONLY: /questions returns only unsettled essential/useful dims, capped at 4', async () => {
+  const dims = [
+    dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_overlap', 'essential'),
+    dim('cadence', 'mixed', 'reveal_overlap', 'essential'),
+    dim('start_window', 'now', 'reveal_overlap', 'essential'),
+    dim('time_horizon', 'months', 'reveal_overlap', 'essential'),
+    dim('project_stage', 'building', 'reveal_overlap', 'essential'),
+  ]
+  const hs = await openHandshake('cofound', dims, dims)
+  // Settle only weekly_commitment through the handshake.
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], dims)
+  await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], dims)
+  const q = await hsQuestions(hs.alice, hs.introId)
+  const asked = q.questions.map((x: any) => x.dimension)
+  assert.ok(q.questions.length <= 4, `capped at 4, got ${q.questions.length}`)
+  assert.equal(asked.includes('weekly_commitment'), false, 'a handshake-settled dimension is not re-asked')
+  for (const d of asked) assert.ok(['cadence', 'start_window', 'time_horizon', 'project_stage'].includes(d))
+})
+
+test('DRAFTED answers are still post-gated (contact data refused)', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  const r = await hsAnswers(hs.bob, hs.introId, [{ dimension: 'cadence', mode: 'drafted', text: 'reach me at bob at example dot com' }])
+  assert.equal(r.status, 400)
+})
+
+test('a skip is not_answered and never negative; a round2 request marks it partially', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, a)
+  await hsAnswers(hs.bob, hs.introId, [{ dimension: 'cadence', mode: 'skip' }])
+  // alice asks for more on cadence
+  const nonce = 'r2' + rid()
+  await fetch(`${base}/api/v4/fit/${hs.introId}/round2`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dimension_ids: ['cadence'], public_key: hs.alice.keys.publicKey, nonce, signature: sign(`fit-qa-round2:${hs.introId}:${nonce}`, hs.alice.keys.privateKey) }) })
+  const qa = await hsQa(hs.alice, hs.introId)
+  const bobAns = qa.record.find((e: any) => e.dimension === 'cadence').answers.find((x: any) => x.answerer_key === hs.bob.keys.publicKey)
+  assert.equal(bobAns.classification, 'partially_answered')
+})

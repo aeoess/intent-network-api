@@ -17,6 +17,11 @@ import { selectEvaluableDimensions, evaluateHandshake, complementarityEntry, typ
 import { POLICY_INTENTS, PREDICATE_VERSION, DISCLOSURE_RANK } from './fit-schema.js'
 import { signReceipt, serverPublicKey, verifyReceipt } from './server-key.js'
 import type { IntroRow } from './intros-db.js'
+import * as qaDb from './fit-qa-db.js'
+import { questionFor } from './fit-questions.js'
+import { ledgerItemLive } from './fit-db.js'
+import { postGateDrafted, type PostGateInput } from './fit-gate.js'
+import { extract as airlockExtract, plan as airlockPlan } from './fit-airlock.js'
 
 const router = Router()
 
@@ -261,6 +266,152 @@ router.post('/:introId/reveal', rateLimited('fitv4_hs', 30), (req, res) => {
   if (!own || own.disclosure_state !== 'reveal_exact') { res.status(403).json({ error: 'this dimension is not authorized for exact release by you' }); return }
   handshakeDb.releaseExact(introId, dimension, public_key)
   res.json({ revealed: dimension })
+})
+
+// ══════════════════════════════════════════════════════════════
+// Stage 5: adaptive question selection, routed through the airlock
+// ══════════════════════════════════════════════════════════════
+
+/** Unresolved = union of both sides' essential/useful dimensions for the intent,
+ *  minus dimensions the handshake overlap map already settled and minus any
+ *  already answered. Capped to 4, only dimensions with a canonical question. */
+function unresolvedQuestions(hs: handshakeDb.HandshakeRow): { dimension: string; question: string }[] {
+  const important = new Set<string>()
+  for (const cardId of [hs.card_a, hs.card_b]) {
+    const pol = policyDb.getCurrentPolicy(cardId)
+    if (!pol) continue
+    for (const dd of policyDb.dimensionsForIntent(pol, hs.intent)) {
+      if (dd.importance === 'essential' || dd.importance === 'useful') important.add(dd.dimension)
+    }
+  }
+  const settled = new Set<string>()
+  if (hs.result_json) {
+    for (const e of JSON.parse(hs.result_json) as OverlapEntry[]) {
+      if (e.result === 'overlap' || e.result === 'bucket' || e.result === 'exact_available') settled.add(e.dimension)
+    }
+  }
+  for (const dim of qaDb.settledDimensions(hs.intro_id)) settled.add(dim)
+  return [...important].filter(dim => !settled.has(dim) && questionFor(dim)).sort().slice(0, 4).map(dim => ({ dimension: dim, question: questionFor(dim)! }))
+}
+
+// ── POST /:introId/questions ──────────────────────────────────────────────
+
+router.post('/:introId/questions', rateLimited('fitv4_hs', 60), (req, res) => {
+  const introId = String(req.params.introId)
+  const { public_key, nonce, signature } = req.body ?? {}
+  if (typeof nonce !== 'string') { res.status(400).json({ error: 'nonce required' }); return }
+  if (!checkSig(`fit-questions:${introId}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  res.json({ questions: unresolvedQuestions(hs), note: 'These are the unresolved dimensions, capped at four. Questions are canonical renderings; the counterpart never authors them.' })
+})
+
+// ── POST /:introId/answers (signed ticket; drafted routes through the airlock) ─
+
+router.post('/:introId/answers', rateLimited('fitv4_hs', 60), (req, res) => {
+  const introId = String(req.params.introId)
+  const { answers, public_key, nonce, signature } = req.body ?? {}
+  if (!Array.isArray(answers) || answers.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'answers and nonce required' }); return }
+  const answersHash = createHash('sha256').update(canonicalize({ intro_id: introId, nonce, answers }), 'utf8').digest('hex')
+  if (!checkSig(answersHash, signature, public_key)) { res.status(403).json({ error: 'ticket signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  const ownCard = cardOfKey(hs, public_key)!
+  const pol = policyDb.getCurrentPolicy(ownCard)
+  const permitted = new Set((pol ? policyDb.dimensionsForIntent(pol, hs.intent) : []).map(x => x.dimension))
+
+  for (const a of answers) {
+    if (!['ledger', 'drafted', 'skip'].includes(a?.mode)) { res.status(400).json({ error: 'each answer mode must be ledger, drafted, or skip' }); return }
+    if (!questionFor(a.dimension) || !permitted.has(a.dimension)) { res.status(400).json({ error: `dimension "${a.dimension}" is not an askable dimension in your policy for this intent` }); return }
+  }
+  // Post-gate the drafted texts as a batch (same deterministic checks as v3).
+  const drafted: PostGateInput[] = answers.filter((a: any) => a.mode === 'drafted').map((a: any) => ({ question_id: a.dimension, text: String(a.text ?? '') }))
+  const cleaned = new Map<string, string>()
+  if (drafted.length > 0) {
+    const gate = postGateDrafted(drafted)
+    if (!gate.ok) { res.status(400).json({ error: gate.reason, dimension: gate.question_id }); return }
+    for (const c of gate.cleaned ?? []) cleaned.set(c.question_id, c.text)
+  }
+
+  for (const a of answers) {
+    if (a.mode === 'skip') { qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'skip', text: null }); continue }
+    if (a.mode === 'ledger') {
+      const item = ledgerItemLive(ownCard, String(a.ledger_id))
+      if (!item) { res.status(409).json({ error: `ledger item ${a.ledger_id} was superseded; re-approve and re-answer` }); return }
+      qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'ledger', text: `Their approved brief states: "${item.text}"` })
+      continue
+    }
+    // drafted: store the raw (human view) AND the airlock extraction (structured).
+    // The extractor sees ONLY {answer, question, schema}; its output carries no
+    // free text from the answer, so nothing crosses into a policy-bearing planner.
+    const raw = cleaned.get(a.dimension)!
+    const extraction = airlockExtract({ answer: raw, question: questionFor(a.dimension)!, schema: { dimension: a.dimension } })
+    qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'drafted', text: raw, extraction_json: JSON.stringify(extraction) })
+  }
+  res.json({ ok: true, answered: answers.length })
+})
+
+// ── POST /:introId/round2 ──────────────────────────────────────────────────
+
+router.post('/:introId/round2', rateLimited('fitv4_hs', 30), (req, res) => {
+  const introId = String(req.params.introId)
+  const { dimension_ids, public_key, nonce, signature } = req.body ?? {}
+  if (!Array.isArray(dimension_ids) || dimension_ids.length === 0 || dimension_ids.length > 3 || typeof nonce !== 'string') { res.status(400).json({ error: 'dimension_ids required (1..3)' }); return }
+  if (!checkSig(`fit-qa-round2:${introId}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  for (const dim of dimension_ids) { if (questionFor(dim)) qaDb.addRound2(introId, public_key, String(dim)) }
+  res.json({ ok: true, round2: dimension_ids })
+})
+
+// ── GET /:introId/qa - the extractive record (parties only) ───────────────
+
+router.get('/:introId/qa', rateLimited('fitv4_get', 60), (req, res) => {
+  const introId = String(req.params.introId)
+  const public_key = String(req.query.public_key ?? '')
+  const nonce = String(req.query.nonce ?? '')
+  const signature = String(req.query.signature ?? '')
+  if (!public_key || !nonce) { res.status(400).json({ error: 'public_key and nonce required' }); return }
+  if (!checkSig(`fit-qa-get:${introId}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
+  if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+
+  const rows = qaDb.qaForIntro(introId)
+  const round2 = qaDb.round2ForIntro(introId)
+  const viewerPol = policyDb.getCurrentPolicy(cardOfKey(hs, public_key)!)
+  const viewerDims = new Map((viewerPol ? policyDb.dimensionsForIntent(viewerPol, hs.intent) : []).map(x => [x.dimension, x]))
+
+  const byDimension = new Map<string, any>()
+  for (const r of rows) {
+    if (!byDimension.has(r.dimension)) byDimension.set(r.dimension, { dimension: r.dimension, question: questionFor(r.dimension), answers: [] })
+    const round2Pending = round2.some(x => x.dimension === r.dimension && x.requester_key !== r.answerer_key) && r.mode === 'skip'
+    const classification = r.mode === 'skip' ? (round2Pending ? 'partially_answered' : 'not_answered') : 'answered'
+    const extraction = r.extraction_json ? JSON.parse(r.extraction_json) : undefined
+    // A planner hint uses ONLY the extraction (never the raw text) plus the
+    // viewer's own policy for this dimension: this is where plan() runs.
+    let plan_hint
+    if (extraction && r.answerer_key !== public_key && viewerDims.has(r.dimension)) {
+      const vd = viewerDims.get(r.dimension)!
+      plan_hint = airlockPlan(extraction, { disclosure_state: vd.disclosure_state, importance: vd.importance, sensitivity: vd.sensitivity })
+    }
+    byDimension.get(r.dimension).answers.push({
+      answerer_key: r.answerer_key,
+      mode: r.mode,
+      raw_text: r.text,          // the human view; may contain the counterpart's own words
+      extraction,                // the structured, secretless signal
+      classification,
+      plan_hint,
+    })
+  }
+  res.json({
+    intro_id: introId,
+    record: [...byDimension.values()],
+    note: 'raw_text is for the human to read; only the extraction (never raw_text) is used by any planner. Refusal or silence is never negative.',
+  })
 })
 
 export { verifyReceipt }
