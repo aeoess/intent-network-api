@@ -449,6 +449,7 @@ router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest)
     introsReceived: intros.received,
     hasCard: !!myCard,
     networkSize: db.getCardCount(),
+    v3_invitation: 'Mingle v3 is live: republish via compose_connection_card for a persistent card with overlap-based matching and consented introductions.',
   })
 })
 
