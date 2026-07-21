@@ -164,6 +164,27 @@ test('the extractor is deterministic: hedges become conditions, empty is not_ans
   assert.equal(clean.value_bucket, 'daily_sync')
 })
 
+// ── NO server-side ordering / score (local-ordering boundary, server half) ──
+
+test('the v4 fit surface exposes no ordering or score endpoint, and the policy carries no score', async () => {
+  // No endpoint accepts or returns an ordering / sort / score of people.
+  for (const path of ['order', 'rank', 'sort', 'score', 'prioritize']) {
+    const res = await fetch(`${base}/api/v4/fit/${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    assert.equal(res.status, 404, `/api/v4/fit/${path} must not exist`)
+  }
+  // The stored policy is typed dimensions only; no score/rank field anywhere.
+  const alice = makeCard('Alice', ['cofound'])
+  const cardId = await publish(alice)
+  await setPolicy(alice, cardId, [dim('cadence', 'mixed'), dim('weekly_commitment', { min: 10, max: 20 })])
+  const got = await getPolicy(alice, cardId)
+  const banned = new Set(['score', 'rank', 'rating', 'order', 'overlap_count'])
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) { v.forEach(walk); return }
+    if (v && typeof v === 'object') for (const [k, val] of Object.entries(v)) { assert.ok(!banned.has(k.toLowerCase()), `policy must carry no ${k}`); walk(val) }
+  }
+  walk(got)
+})
+
 test('the planner takes only the extraction and forces human review when not clean', () => {
   // The planner signature has no raw-answer parameter (extraction + policy view).
   const clean = airlock.plan({ dimension: 'cadence', status: 'answered', conditions: [] }, { disclosure_state: 'reveal_overlap', importance: 'useful', sensitivity: 'low' })
