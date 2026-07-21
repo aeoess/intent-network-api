@@ -22,6 +22,7 @@ const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')
 const { cardContentHash } = await import('../src/v3-cards.js')
 const { policyHash } = await import('../src/fit-policy-db.js')
+const airlock = await import('../src/fit-airlock.js')
 
 let server: Server
 let base: string
@@ -130,4 +131,48 @@ test('only the card owner can set or read a policy', async () => {
   assert.equal(r.status, 403)
   const got = await getPolicy(bob, cardId)
   assert.equal(got.error ?? 'blocked', got.error)  // 403 body has error
+})
+
+// ── AIRLOCK (headline invariant) ──
+
+test('the airlock extractor input has exactly {answer, question, schema}', () => {
+  const input = { answer: 'about 20 hours, AIRLOCKMARKER', question: 'How many hours?', schema: { dimension: 'weekly_commitment' } }
+  assert.deepEqual(Object.keys(input).sort(), ['answer', 'question', 'schema'])
+  // The type of extract() accepts nothing else; there is no owner-data field.
+})
+
+test('a marker in a counterparty answer never crosses into the extraction', () => {
+  const marker = 'AIRLOCKMARKER_SECRET'
+  const out = airlock.extract({ answer: `I can do about 25 hours a week. ${marker}`, question: 'How many hours?', schema: { dimension: 'weekly_commitment' } })
+  const j = JSON.stringify(out)
+  assert.equal(j.includes(marker), false, 'the raw answer text must not appear in the extraction')
+  assert.equal(out.status, 'answered')
+  assert.equal(out.value_bucket, '21-40')
+  // The raw answer (the human view) DOES still contain the marker; the airlock
+  // never removes it from what the human sees, only from what the extractor emits.
+  assert.equal(`I can do about 25 hours a week. ${marker}`.includes(marker), true)
+})
+
+test('the extractor is deterministic: hedges become conditions, empty is not_answered', () => {
+  const hedged = airlock.extract({ answer: 'maybe async_first, depends on the project', question: 'What cadence?', schema: { dimension: 'cadence' } })
+  assert.ok(hedged.conditions.includes('conditional') || hedged.conditions.includes('uncertain'))
+  assert.notEqual(hedged.status, 'answered')
+  const empty = airlock.extract({ answer: '   ', question: 'What cadence?', schema: { dimension: 'cadence' } })
+  assert.equal(empty.status, 'not_answered')
+  const clean = airlock.extract({ answer: 'daily_sync works for me', question: 'What cadence?', schema: { dimension: 'cadence' } })
+  assert.equal(clean.status, 'answered')
+  assert.equal(clean.value_bucket, 'daily_sync')
+})
+
+test('the planner takes only the extraction and forces human review when not clean', () => {
+  // The planner signature has no raw-answer parameter (extraction + policy view).
+  const clean = airlock.plan({ dimension: 'cadence', status: 'answered', conditions: [] }, { disclosure_state: 'reveal_overlap', importance: 'useful', sensitivity: 'low' })
+  assert.equal(clean.requires_human, false)
+  const conditioned = airlock.plan({ dimension: 'cadence', status: 'answered', conditions: ['conditional'] }, { disclosure_state: 'reveal_overlap', importance: 'useful', sensitivity: 'low' })
+  assert.equal(conditioned.requires_human, true)
+  const unclear = airlock.plan({ dimension: 'cadence', status: 'unclear', conditions: [] }, { disclosure_state: 'reveal_overlap', importance: 'useful', sensitivity: 'low' })
+  assert.equal(unclear.requires_human, true)
+  // A high-sensitivity dimension escalates even on a clean answer.
+  const highSens = airlock.plan({ dimension: 'decision_model', status: 'answered', conditions: [] }, { disclosure_state: 'reveal_overlap', importance: 'essential', sensitivity: 'high' })
+  assert.equal(highSens.requires_human, true)
 })
