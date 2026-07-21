@@ -103,13 +103,17 @@ router.get('/c/:cardId', rateLimited('page_card', 120), (req, res) => {
     parts.push(`<h2>Event</h2><p>${esc(view.event_ref.event_id)}${view.event_ref.dates ? ` (${esc(view.event_ref.dates)})` : ''}</p>`)
   }
 
+  // Connect block: no form, no unauthenticated action, just the card id and how
+  // to ask your own assistant to request an intro.
+  parts.push(`<h2>Connect</h2><p class="cardid">${esc(view.card_id)}</p><p>Install Mingle, publish your card, then tell your assistant: request an intro to card ${esc(view.card_id)}.</p>`)
+
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(headline)} - Mingle</title>
 <meta property="og:title" content="${esc(headline)}">
 <meta property="og:description" content="${esc(ogDesc)}">
 <meta property="og:type" content="profile">
-${BASE_STYLE(nonce)}</head><body>${parts.join('\n')}${FOOTER}</body></html>`
+${BASE_STYLE(nonce, '.cardid { font-family: ui-monospace, monospace; background: #f7f8fa; padding: 0.4rem 0.7rem; border-radius: 8px; word-break: break-all; user-select: all; }')}</head><body>${parts.join('\n')}${FOOTER}</body></html>`
   secureHtml(res, html, nonce)
 })
 
@@ -178,6 +182,7 @@ ${BASE_STYLE(nonce, '.prompt { border: 1px solid #d7dae2; border-radius: 12px; p
 <p>Add the Mingle connector: <code>npx mingle-mcp setup</code></p>
 <h2>Then say</h2>
 <div class="prompt">Connect Mingle, then say: help me compose my Mingle card.</div>
+<p>Email addresses are stored only for notifications you opt into, are never shown on cards, and can be deleted anytime.</p>
 ${FOOTER}</body></html>`
   secureHtml(res, html, nonce)
 })

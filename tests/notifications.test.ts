@@ -37,6 +37,9 @@ after(() => { email.resetTransport(); server?.close(); db.closeDb(); rmSync(tmpD
 beforeEach(() => {
   sent.length = 0
   email.setTransport(async (e) => { sent.push(e); return { ok: true, id: 'mock' } })
+  // Notification routes rate-limit by client IP; every test shares 127.0.0.1,
+  // so clear the shared counter between tests (test-only, no production change).
+  db.getDb().prepare('DELETE FROM rate_limits').run()
 })
 
 // ── Subscribe / confirm ──
@@ -78,6 +81,35 @@ test('confirm flips verified', async () => {
   const res = await fetch(`${base}/api/v3/notifications/confirm/${token}`)
   assert.equal(res.status, 200)
   assert.equal(notifyDb.getSubscription(keys.publicKey)!.verified, true)
+})
+
+// ── Signed status read (for the assistant's confirmation nudge) ──
+
+async function status(keys: any, signer?: any): Promise<{ code: number; body: any }> {
+  const nonce = 's' + Math.random().toString(36).slice(2)
+  const qs = new URLSearchParams({ public_key: keys.publicKey, nonce, signature: sign(`notif-status:${nonce}`, (signer ?? keys).privateKey) })
+  const res = await fetch(`${base}/api/v3/notifications/status?${qs}`)
+  return { code: res.status, body: await res.json() }
+}
+
+test('status reports subscribed and verified, gated by a valid signature', async () => {
+  const keys = generateKeyPair()
+  // before subscribing: not subscribed
+  let s = await status(keys)
+  assert.equal(s.code, 200)
+  assert.deepEqual(s.body, { subscribed: false, verified: false })
+  // after subscribing, before confirming: subscribed but unverified
+  await subscribe(keys, 'status@example.com')
+  s = await status(keys)
+  assert.deepEqual(s.body, { subscribed: true, verified: false })
+  // after confirming: verified
+  await fetch(`${base}/api/v3/notifications/confirm/${notifyDb.getSubscription(keys.publicKey)!.verify_token}`)
+  s = await status(keys)
+  assert.deepEqual(s.body, { subscribed: true, verified: true })
+  // a signature from another key is refused (no one else learns your status)
+  const other = generateKeyPair()
+  const bad = await status(keys, other)
+  assert.equal(bad.code, 403)
 })
 
 // ── Intro event emails ──

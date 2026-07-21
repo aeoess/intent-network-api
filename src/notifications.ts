@@ -68,7 +68,7 @@ export function unsubUrl(token: string): string { return `${baseUrl()}/api/v3/no
 // ── Templates (plain text, no images, no tracking) ────────────────────────
 
 const FOOTER = (unsubToken: string): string =>
-  `\n\n---\nMingle notifications. This message contains only what you could already see. To stop these emails, open: ${unsubUrl(unsubToken)}`
+  `\n\n---\nMingle notifications. This message contains only what you could already see. Replies to this address are not monitored. To stop these emails, open: ${unsubUrl(unsubToken)}`
 
 export function confirmEmail(to: string, verifyToken: string, unsubToken: string): OutgoingEmail {
   return {
@@ -78,19 +78,25 @@ export function confirmEmail(to: string, verifyToken: string, unsubToken: string
   }
 }
 
-export function introRequestEmail(to: string, requesterHeadline: string, purpose: string, statusUrl: string, unsubToken: string): OutgoingEmail {
+export function introRequestEmail(to: string, requesterHeadline: string, purpose: string, _statusUrl: string, unsubToken: string): OutgoingEmail {
   return {
     to,
     subject: 'Someone wants to connect on Mingle',
-    text: `Someone on the Mingle network asked to connect with you.\n\nThey describe themselves as: ${requesterHeadline || '(no headline provided)'}\nWhy they reached out: ${purpose || '(no note provided)'}\n\nOpen Mingle in your assistant to review and decide: ${statusUrl}\nNothing about you is shared unless you approve.${FOOTER(unsubToken)}`,
+    text: `Someone on the Mingle network asked to connect with you.\n\nThey describe themselves as: ${requesterHeadline || '(no headline provided)'}\nWhy they reached out: ${purpose || '(no note provided)'}\n\nOpen your assistant and say: show my Mingle intros.\nNothing about you is shared unless you approve.${FOOTER(unsubToken)}`,
   }
 }
 
-export function introAcceptedEmail(to: string, counterpartyHeadline: string, unsubToken: string): OutgoingEmail {
+export function introAcceptedEmail(to: string, counterpartyHeadline: string, counterpartyContact: string, unsubToken: string): OutgoingEmail {
+  // With a contact line (v3 complete intro) the connection is ready to act on;
+  // without one (legacy 48h path) the wording stays as it was.
+  const lead = counterpartyContact
+    ? 'An introduction on Mingle is complete. Both sides shared a way to connect.'
+    : 'An introduction on Mingle was accepted.'
+  const contactLine = counterpartyContact ? `\nHow to reach them: ${counterpartyContact}` : ''
   return {
     to,
     subject: 'Your introduction was accepted on Mingle',
-    text: `An introduction on Mingle was accepted.\n\nThe other side: ${counterpartyHeadline || '(no headline provided)'}\n\nOpen Mingle in your assistant to continue from here.${FOOTER(unsubToken)}`,
+    text: `${lead}\n\nThe other side: ${counterpartyHeadline || '(no headline provided)'}${contactLine}\n\nOpen your assistant and say: show my Mingle intros.${FOOTER(unsubToken)}`,
   }
 }
 
@@ -103,11 +109,11 @@ export async function notifyIntroRequest(a: IntroRequestArgs): Promise<{ sent: b
     introRequestEmail(sub.email, a.requesterHeadline, a.purpose, a.statusUrl, sub.unsub_token))
 }
 
-interface IntroAcceptedArgs { recipientKey: string; introId: string; counterpartyHeadline: string }
+interface IntroAcceptedArgs { recipientKey: string; introId: string; counterpartyHeadline: string; counterpartyContact?: string }
 
 export async function notifyIntroAccepted(a: IntroAcceptedArgs): Promise<{ sent: boolean; reason?: string }> {
   return dispatch(a.recipientKey, a.introId, 'intro_accepted', 'intro_accepted', sub =>
-    introAcceptedEmail(sub.email, a.counterpartyHeadline, sub.unsub_token))
+    introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
 }
 
 async function dispatch(

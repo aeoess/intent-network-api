@@ -83,4 +83,24 @@ router.get('/unsubscribe/:token', rateLimited('notif_unsub', 60), (req, res) => 
   res.type('text/plain').send('You are unsubscribed from Mingle notification emails.')
 })
 
+// ── GET /status (signed) ──────────────────────────────────────────────────
+// Lets the principal's own assistant learn whether their address is subscribed
+// and confirmed, so it can nudge once if a confirmation link is still unclicked.
+// Signed by subject_key over `notif-status:${nonce}`; reveals nothing to anyone
+// who cannot sign for the key, and never returns the address itself.
+
+router.get('/status', rateLimited('notif_status', 60), (req, res) => {
+  const subject_key = String(req.query.public_key ?? '')
+  const nonce = String(req.query.nonce ?? '')
+  const signature = String(req.query.signature ?? '')
+  if (!subject_key || !nonce) { res.status(400).json({ error: 'public_key and nonce required' }); return }
+  try {
+    if (!verify(`notif-status:${nonce}`, signature, subject_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  } catch (e: any) {
+    res.status(403).json({ error: `signature verification failed: ${e.message}` }); return
+  }
+  const sub = notifyDb.getSubscription(subject_key)
+  res.json({ subscribed: !!sub, verified: !!sub?.verified })
+})
+
 export default router

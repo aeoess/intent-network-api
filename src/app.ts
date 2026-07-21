@@ -14,6 +14,7 @@ import routes from './routes.js'
 import v3Routes from './v3-routes.js'
 import v3Pages from './v3-pages.js'
 import notifyRoutes from './notify-routes.js'
+import introsRoutes from './intros-routes.js'
 
 export function createApp() {
   const app = express()
@@ -35,6 +36,8 @@ export function createApp() {
   app.use('/', v3Pages)
   // Mingle email notifications (consent + confirm + unsubscribe)
   app.use('/api/v3/notifications', notifyRoutes)
+  // Mingle v3 introductions (request, respond, complete, mine)
+  app.use('/api/v3/intros', introsRoutes)
 
   // ── Health check ──
   app.get('/health', (_req, res) => {
