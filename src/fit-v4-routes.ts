@@ -18,6 +18,7 @@ import { POLICY_INTENTS, PREDICATE_VERSION, DISCLOSURE_RANK } from './fit-schema
 import { signReceipt, serverPublicKey, verifyReceipt } from './server-key.js'
 import type { IntroRow } from './intros-db.js'
 import * as qaDb from './fit-qa-db.js'
+import * as autonomyDb from './fit-autonomy-db.js'
 import { questionFor } from './fit-questions.js'
 import { ledgerItemLive } from './fit-db.js'
 import { postGateDrafted, type PostGateInput } from './fit-gate.js'
@@ -191,9 +192,34 @@ router.post('/:introId/commit', rateLimited('fitv4_hs', 30), (req, res) => {
     if (!handshakeDb.budgetConsume(pairKey, dim).allowed) budgetBlocked.add(dim)
   }
 
+  // Graduated autonomy: when the committer commits autonomously (under a standing
+  // scope, no fresh human tap), every disclosed dimension must fall within the
+  // scope's tier. Anything above it, or high-sensitivity, or exact, is refused
+  // and must be committed by a human. A pause halts all autonomous commits.
+  const autonomous = req.body?.autonomous === true
+  if (autonomous) {
+    for (const dim of dims) {
+      const a = policyReq.get(dim), b = policyCom.get(dim)
+      if (!a || !b || budgetBlocked.has(dim)) continue
+      const eff = levelName(a, b) as any
+      if (!autonomyDb.autonomyPermitsDisclosure(committerCard, hs.intent, dim, eff, b.sensitivity)) {
+        res.status(403).json({ error: `dimension "${dim}" is outside your autonomy scope (or too sensitive, or exact); commit it without autonomous:true so the principal approves it` }); return
+      }
+    }
+  }
+
   const facts = evaluateHandshake(dims, policyReq, policyCom, budgetBlocked)
   const compl = complementarityEntry(dims, policyReq, policyCom)
   const overlap_map = compl ? [...facts, compl] : facts
+
+  // Legible activity: record what the committer's agent disclosed, so a truthful
+  // "while you were away" summary can be shown later.
+  autonomyDb.recordActivity(public_key, introId, 'evaluated', null, otherKey(hs, public_key), autonomous)
+  for (const e of overlap_map) {
+    if (e.dimension === 'complementarity') continue
+    if (e.result === 'overlap') autonomyDb.recordActivity(public_key, introId, 'overlap_disclosed', e.dimension, otherKey(hs, public_key), autonomous)
+    else if (e.result === 'bucket' || e.result === 'exact_available') autonomyDb.recordActivity(public_key, introId, 'bucket_disclosed', e.dimension, otherKey(hs, public_key), autonomous)
+  }
 
   // Receipt: binds both policy hashes, requested predicates, purpose, each
   // authorized disclosure level, outcome, expiry. Attests authorization only.
@@ -265,7 +291,51 @@ router.post('/:introId/reveal', rateLimited('fitv4_hs', 30), (req, res) => {
   const own = ownMap.get(dimension)
   if (!own || own.disclosure_state !== 'reveal_exact') { res.status(403).json({ error: 'this dimension is not authorized for exact release by you' }); return }
   handshakeDb.releaseExact(introId, dimension, public_key)
+  autonomyDb.recordActivity(public_key, introId, 'exact_released', dimension, otherKey(hs, public_key), false)
   res.json({ revealed: dimension })
+})
+
+// ══════════════════════════════════════════════════════════════
+// Stage 6: graduated autonomy scopes + legible "while away" activity
+// ══════════════════════════════════════════════════════════════
+
+// ── POST /autonomy - set a scoped standing authorization (exact-approved) ──
+
+router.post('/autonomy', rateLimited('fitv4_policy', 20), (req, res) => {
+  const { card_id, scope, approved_hash, public_key, nonce, signature } = req.body ?? {}
+  if (typeof card_id !== 'string' || typeof approved_hash !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'card_id, scope, approved_hash, nonce required' }); return }
+  if (!checkSig(`set-fit-autonomy:${card_id}:${approved_hash}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  if (!ownsCard(card_id, public_key)) { res.status(403).json({ error: 'not the card subject' }); return }
+  const v = autonomyDb.validateScope(scope)
+  if (!v.ok || !v.scope) { res.status(400).json({ error: v.error }); return }
+  if (autonomyDb.scopeHash(v.scope) !== approved_hash) { res.status(400).json({ error: 'approved_hash does not match the scope; re-approve the exact scope' }); return }
+  const result = autonomyDb.setScope(card_id, public_key, v.scope)
+  res.status(201).json({ card_id, version: result.version, scope_hash: result.scope_hash, forbidden_categories: v.scope.forbidden_categories })
+})
+
+// ── POST /autonomy/pause - halt (or resume) all autonomous disclosure ─────
+
+router.post('/autonomy/pause', rateLimited('fitv4_policy', 30), (req, res) => {
+  const { card_id, paused, public_key, nonce, signature } = req.body ?? {}
+  if (typeof card_id !== 'string' || typeof paused !== 'boolean' || typeof nonce !== 'string') { res.status(400).json({ error: 'card_id, paused, nonce required' }); return }
+  if (!checkSig(`fit-autonomy-pause:${card_id}:${paused}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  if (!ownsCard(card_id, public_key)) { res.status(403).json({ error: 'not the card subject' }); return }
+  autonomyDb.setPaused(card_id, paused)
+  res.json({ card_id, paused })
+})
+
+// ── GET /autonomy/activity - the "while you were away" summary (signed) ────
+
+router.get('/autonomy/activity', rateLimited('fitv4_get', 60), (req, res) => {
+  const card_id = String(req.query.card_id ?? '')
+  const public_key = String(req.query.public_key ?? '')
+  const nonce = String(req.query.nonce ?? '')
+  const signature = String(req.query.signature ?? '')
+  const since = typeof req.query.since === 'string' ? req.query.since : undefined
+  if (!card_id || !nonce) { res.status(400).json({ error: 'card_id and nonce required' }); return }
+  if (!checkSig(`fit-autonomy-activity:${card_id}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+  if (!ownsCard(card_id, public_key)) { res.status(403).json({ error: 'not the card subject' }); return }
+  res.json({ card_id, summary: autonomyDb.whileAwaySummary(public_key, since), activity: autonomyDb.activityFor(public_key, since) })
 })
 
 // ══════════════════════════════════════════════════════════════

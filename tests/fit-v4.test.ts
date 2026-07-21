@@ -25,6 +25,7 @@ const { policyHash } = await import('../src/fit-policy-db.js')
 const airlock = await import('../src/fit-airlock.js')
 const handshakeDb = await import('../src/fit-handshake-db.js')
 const serverKey = await import('../src/server-key.js')
+const autonomyDb = await import('../src/fit-autonomy-db.js')
 
 let server: Server
 let base: string
@@ -534,4 +535,108 @@ test('a skip is not_answered and never negative; a round2 request marks it parti
   const qa = await hsQa(hs.alice, hs.introId)
   const bobAns = qa.record.find((e: any) => e.dimension === 'cadence').answers.find((x: any) => x.answerer_key === hs.bob.keys.publicKey)
   assert.equal(bobAns.classification, 'partially_answered')
+})
+
+// ══════════════════════════════════════════════════════════════
+// Stage 6: graduated autonomy + while-away receipts
+// ══════════════════════════════════════════════════════════════
+
+async function setAutonomy(who: any, cardId: string, scope: any): Promise<{ status: number; body: any }> {
+  const v = autonomyDb.validateScope(scope)
+  const approved_hash = v.scope ? autonomyDb.scopeHash(v.scope) : '0'.repeat(64)
+  const nonce = 'sa' + rid()
+  const body = { card_id: cardId, scope, approved_hash, public_key: who.keys.publicKey, nonce, signature: sign(`set-fit-autonomy:${cardId}:${approved_hash}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/autonomy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+async function pauseAutonomy(who: any, cardId: string, paused: boolean): Promise<any> {
+  const nonce = 'pa' + rid()
+  const body = { card_id: cardId, paused, public_key: who.keys.publicKey, nonce, signature: sign(`fit-autonomy-pause:${cardId}:${paused}:${nonce}`, who.keys.privateKey) }
+  return (await fetch(`${base}/api/v4/fit/autonomy/pause`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json()
+}
+async function getActivity(who: any, cardId: string): Promise<any> {
+  const nonce = 'ga' + rid()
+  const qs = new URLSearchParams({ card_id: cardId, public_key: who.keys.publicKey, nonce, signature: sign(`fit-autonomy-activity:${cardId}:${nonce}`, who.keys.privateKey) })
+  return (await fetch(`${base}/api/v4/fit/autonomy/activity?${qs}`)).json()
+}
+async function hsCommitAuto(who: any, introId: string, accept: string[], reciprocal: string[], dims: any[]): Promise<{ status: number; body: any }> {
+  const policy_hash = policyHash(dims); const nonce = 'hca' + rid()
+  const body = { accept_dimensions: accept, reciprocal_offer: reciprocal, policy_hash, autonomous: true, public_key: who.keys.publicKey, nonce, signature: sign(`fit-commit:${introId}:${nonce}`, who.keys.privateKey) }
+  const res = await fetch(`${base}/api/v4/fit/${introId}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  return { status: res.status, body: await res.json() }
+}
+const hiSens = (dimension: string, value: any, disclosure_state = 'reveal_overlap') => ({ dimension, value, sensitivity: 'high', disclosure_state, allowed_intents: ['cofound'], expires_at: future(), importance: 'essential' })
+
+test('AUTONOMY: a T2 (overlap) scope permits an autonomous overlap commit', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  const s = await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['cadence'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
+  assert.equal(s.status, 201, JSON.stringify(s.body))
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
+  const cm = await hsCommitAuto(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
+  assert.equal(cm.status, 200, JSON.stringify(cm.body))
+  assert.equal(factFor(cm.body.overlap_map, 'cadence').result, 'overlap')
+})
+
+test('AUTONOMY: a bucket disclosure is NOT autonomous under an overlap-only scope', async () => {
+  const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_bucket', 'essential')]
+  const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_bucket', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['weekly_commitment'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+  const cm = await hsCommitAuto(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+  assert.equal(cm.status, 403, 'bucket disclosure needs a human tap under an overlap-only scope')
+})
+
+test('AUTONOMY: reveal_exact is never autonomous, even inside a bucket-enabled scope', async () => {
+  const a = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_exact', 'essential')]
+  const b = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_exact', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['weekly_commitment'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: true, expiry: future() })
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+  const cm = await hsCommitAuto(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+  assert.equal(cm.status, 403)
+})
+
+test('AUTONOMY: a high-sensitivity dimension always prompts, despite the scope', async () => {
+  const a = [hiSens('decision_model', 'consensus')]
+  const b = [hiSens('decision_model', 'consensus')]
+  const hs = await openHandshake('cofound', a, b)
+  await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['decision_model'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: true, expiry: future() })
+  await hsRequest(hs.alice, hs.introId, ['decision_model'], ['decision_model'], a)
+  const cm = await hsCommitAuto(hs.bob, hs.introId, ['decision_model'], ['decision_model'], b)
+  assert.equal(cm.status, 403)
+})
+
+test('AUTONOMY: pause halts autonomous commits; the always-forbidden categories are merged in', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  const s = await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['cadence'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
+  assert.ok(['health', 'family', 'politics', 'finance', 'third_party'].every(c => s.body.forbidden_categories.includes(c)))
+  await pauseAutonomy(hs.bob, hs.bobCard, true)
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
+  const cm = await hsCommitAuto(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
+  assert.equal(cm.status, 403, 'a paused scope authorizes nothing autonomously')
+})
+
+test('AUTONOMY: the while-away summary reflects what was disclosed, with zero exacts', async () => {
+  const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await setAutonomy(hs.bob, hs.bobCard, { intents: ['cofound'], dimensions: ['cadence'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
+  await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
+  await hsCommitAuto(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
+  const act = await getActivity(hs.bob, hs.bobCard)
+  assert.ok(act.summary.cards_evaluated >= 1)
+  assert.ok(act.summary.overlaps_disclosed_to >= 1)
+  assert.ok(act.summary.overlap_dimensions.includes('cadence'))
+  assert.equal(act.summary.exact_values_released, 0)
+})
+
+test('AUTONOMY: a scope may never include the work intent', async () => {
+  const alice = makeCard('Alice', ['cofound', 'work']); const cardId = await publish(alice)
+  const s = await setAutonomy(alice, cardId, { intents: ['cofound', 'work'], dimensions: ['cadence'], auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false, expiry: future() })
+  assert.equal(s.status, 400)
 })
