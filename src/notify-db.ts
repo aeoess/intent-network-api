@@ -104,12 +104,16 @@ export function deleteByUnsubToken(token: string): boolean {
 const DAILY_CAP = 10
 
 /** Reserve an email send. Returns false when this exact (recipient, intro_id,
- *  type) already went out (dedupe) or the recipient hit the daily cap. On true
- *  the row is recorded, so callers should only send after a true. */
-export function reserveSend(subjectKey: string, introId: string, type: string): { ok: boolean; reason?: string } {
-  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
-  const count = (d().prepare('SELECT COUNT(*) AS n FROM email_log WHERE subject_key = ? AND sent_at > ?').get(subjectKey, since) as any).n
-  if (count >= DAILY_CAP) return { ok: false, reason: 'daily_cap' }
+ *  type) already went out (dedupe) or, for non-direct mail, the recipient hit
+ *  the daily cap. Direct-action mail (a person acted on something they joined)
+ *  skips the cap but still dedupes. On true the row is recorded, so callers
+ *  should only send after a true. */
+export function reserveSend(subjectKey: string, introId: string, type: string, direct = false): { ok: boolean; reason?: string } {
+  if (!direct) {
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+    const count = (d().prepare('SELECT COUNT(*) AS n FROM email_log WHERE subject_key = ? AND sent_at > ?').get(subjectKey, since) as any).n
+    if (count >= DAILY_CAP) return { ok: false, reason: 'daily_cap' }
+  }
   try {
     d().prepare('INSERT INTO email_log (subject_key, intro_id, type) VALUES (?, ?, ?)').run(subjectKey, introId, type)
     return { ok: true }

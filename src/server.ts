@@ -16,6 +16,7 @@
 import { createApp } from './app.js'
 import { getDb, purgeExpired, closeDb } from './db.js'
 import { warmupModel } from './embeddings.js'
+import { sweepExpiredFitExchanges } from './fit-routes.js'
 
 const PORT = parseInt(process.env.PORT || '3100')
 const app = createApp()
@@ -25,6 +26,11 @@ getDb() // Ensures schema is created
 
 // Purge expired cards every 5 minutes
 setInterval(() => { purgeExpired() }, 5 * 60 * 1000)
+
+// Close fit exchanges past their 72h window (assembles and signs the record).
+setInterval(() => {
+  try { sweepExpiredFitExchanges() } catch (e) { console.error('[fit sweep]', (e as Error).message) }
+}, 30 * 60 * 1000)
 
 app.listen(PORT, () => {
   console.log(`Intent Network API running on port ${PORT}`)

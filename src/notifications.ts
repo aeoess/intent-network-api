@@ -100,6 +100,26 @@ export function introAcceptedEmail(to: string, counterpartyHeadline: string, cou
   }
 }
 
+// ── Fit exchange templates (v3.6) ─────────────────────────────────────────
+// Content-free by design: the started email names only the counterpart's public
+// headline and the purpose; the record-ready email carries nothing at all.
+
+export function fitStartedEmail(to: string, counterpartHeadline: string, purpose: string, unsubToken: string): OutgoingEmail {
+  return {
+    to,
+    subject: 'Someone\'s agent wants to talk to yours on Mingle',
+    text: `An introduction you are part of opened a structured fit exchange about: ${purpose}.\n\nThe other side: ${counterpartHeadline || '(no headline provided)'}\n\nOpen your assistant and say: show my Mingle fit exchanges. Your assistant drafts each answer from your own words and approved notes; you approve before anything is shared.${FOOTER(unsubToken)}`,
+  }
+}
+
+export function fitRecordReadyEmail(to: string, unsubToken: string): OutgoingEmail {
+  return {
+    to,
+    subject: 'Your Mingle fit record is ready',
+    text: `A fit exchange you were part of has closed and its record is ready.\n\nOpen your assistant and say: show my Mingle fit record.${FOOTER(unsubToken)}`,
+  }
+}
+
 // ── High-level send helpers, verified + prefs + dedupe + cap gated ────────
 
 interface IntroRequestArgs { recipientKey: string; introId: string; requesterHeadline: string; purpose: string; statusUrl: string }
@@ -116,19 +136,33 @@ export async function notifyIntroAccepted(a: IntroAcceptedArgs): Promise<{ sent:
     introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
 }
 
+/** Fit-started and record-ready are direct-action emails (a person acted in an
+ *  exchange they joined), so they are not held back by the non-direct daily cap.
+ *  They still require verification, a live pref, and dedupe. */
+export async function notifyFitStarted(recipientKey: string, exchangeId: string, counterpartHeadline: string, purpose: string): Promise<{ sent: boolean; reason?: string }> {
+  return dispatch(recipientKey, `fit-start:${exchangeId}`, 'fit_started', 'intro_request', sub =>
+    fitStartedEmail(sub.email, counterpartHeadline, purpose, sub.unsub_token), true)
+}
+
+export async function notifyFitRecordReady(recipientKey: string, exchangeId: string): Promise<{ sent: boolean; reason?: string }> {
+  return dispatch(recipientKey, `fit-record:${exchangeId}`, 'fit_record', 'intro_accepted', sub =>
+    fitRecordReadyEmail(sub.email, sub.unsub_token), true)
+}
+
 async function dispatch(
   recipientKey: string,
   introId: string,
   type: string,
   prefKey: keyof notifyDb.NotifPrefs,
   build: (sub: notifyDb.Subscription) => OutgoingEmail,
+  direct = false,
 ): Promise<{ sent: boolean; reason?: string }> {
   if (!isEmailEnabled()) return { sent: false, reason: 'disabled' }
   const sub = notifyDb.getSubscription(recipientKey)
   if (!sub) return { sent: false, reason: 'not_subscribed' }
   if (!sub.verified) return { sent: false, reason: 'unverified' }
   if (!sub.prefs[prefKey]) return { sent: false, reason: 'pref_off' }
-  const reserve = notifyDb.reserveSend(recipientKey, introId, type)
+  const reserve = notifyDb.reserveSend(recipientKey, introId, type, direct)
   if (!reserve.ok) return { sent: false, reason: reserve.reason }
   const result = await send(build(sub))
   return { sent: result.ok, reason: result.ok ? undefined : result.error }

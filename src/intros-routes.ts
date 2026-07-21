@@ -14,6 +14,7 @@ import * as introsDb from './intros-db.js'
 import * as v3db from './v3-db.js'
 import { networkVisibleView } from './v3-cards.js'
 import * as email from './notifications.js'
+import { createFitExchangeForIntro } from './fit-routes.js'
 
 const router = Router()
 const MAX_NOTE = 200
@@ -83,7 +84,7 @@ router.post('/request', rateLimited('intro_request', 20), async (req, res) => {
 
 // ── POST /:id/respond {action, contact?} ──────────────────────────────────
 
-router.post('/:id/respond', rateLimited('intro_respond', 30), (req, res) => {
+router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) => {
   const id = String(req.params.id)
   const { action, contact, public_key, nonce, signature } = req.body ?? {}
   if (!['accept', 'decline', 'decline_and_block'].includes(action)) { res.status(400).json({ error: 'action must be accept, decline, or decline_and_block' }); return }
@@ -98,7 +99,12 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), (req, res) => {
     if (typeof contact !== 'string' || contact.trim().length === 0) { res.status(400).json({ error: 'accept requires a contact line' }); return }
     if (contact.length > MAX_CONTACT) { res.status(400).json({ error: `contact too long (max ${MAX_CONTACT})` }); return }
     introsDb.respondIntro(id, 'accepted', contact.trim())
-    res.json({ id, status: 'accepted', awaiting: 'requester_contact' })
+    // If both cards share a banked intent, open a structured fit exchange and
+    // return the accepter's consent sheet; otherwise the intro proceeds straight
+    // to the existing contact-completion flow, unchanged.
+    let fit: { id: string; consent_sheet: Record<string, unknown> } | null = null
+    try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
+    res.json({ id, status: 'accepted', awaiting: 'requester_contact', fit_exchange: fit?.id ?? null, consent_sheet: fit?.consent_sheet ?? null })
     return
   }
   if (action === 'decline_and_block') {
