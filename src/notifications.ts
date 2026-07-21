@@ -100,6 +100,27 @@ export function introAcceptedEmail(to: string, counterpartyHeadline: string, cou
   }
 }
 
+export interface WeeklyDigestPayload { matchLines: string[]; newMatchCount: number; expiringCardCount: number }
+
+export function weeklyDigestEmail(to: string, payload: WeeklyDigestPayload, unsubToken: string): OutgoingEmail {
+  const lines: string[] = []
+  lines.push('Here is your weekly Mingle summary.')
+  lines.push('')
+  if (payload.newMatchCount > 0) {
+    lines.push(`New cards relevant to what yours is seeking: ${payload.newMatchCount}.`)
+    for (const l of payload.matchLines.slice(0, 3)) lines.push(`- ${l}`)
+  } else {
+    lines.push('No new relevant cards this week.')
+  }
+  if (payload.expiringCardCount > 0) {
+    lines.push('')
+    lines.push(`Heads up: ${payload.expiringCardCount} of your cards expire within a few days. Renew if you still want to appear.`)
+  }
+  lines.push('')
+  lines.push('Open your assistant and say: show my Mingle digest.')
+  return { to, subject: 'Your weekly Mingle summary', text: lines.join('\n') + FOOTER(unsubToken) }
+}
+
 // ── High-level send helpers, verified + prefs + dedupe + cap gated ────────
 
 interface IntroRequestArgs { recipientKey: string; introId: string; requesterHeadline: string; purpose: string; statusUrl: string }
@@ -114,6 +135,25 @@ interface IntroAcceptedArgs { recipientKey: string; introId: string; counterpart
 export async function notifyIntroAccepted(a: IntroAcceptedArgs): Promise<{ sent: boolean; reason?: string }> {
   return dispatch(a.recipientKey, a.introId, 'intro_accepted', 'intro_accepted', sub =>
     introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
+}
+
+interface WeeklyDigestArgs { recipientKey: string; weekKey: string; payload: WeeklyDigestPayload }
+
+export async function notifyWeeklyDigest(a: WeeklyDigestArgs): Promise<{ sent: boolean; reason?: string }> {
+  // weekKey doubles as the dedupe id, so a subscriber gets at most one weekly
+  // email per week even if the job runs more than once.
+  return dispatch(a.recipientKey, a.weekKey, 'weekly_digest', 'weekly_digest', sub =>
+    weeklyDigestEmail(sub.email, a.payload, sub.unsub_token))
+}
+
+/** Operator ping to ADMIN_NOTIFY_EMAIL. Not a subscriber flow: no verification,
+ *  no prefs, no dedupe. Dark and silent when the env var is unset. */
+export async function notifyAdmin(subject: string, text: string): Promise<{ sent: boolean; reason?: string }> {
+  const to = process.env.ADMIN_NOTIFY_EMAIL
+  if (!to) return { sent: false, reason: 'no_admin' }
+  if (!isEmailEnabled()) return { sent: false, reason: 'disabled' }
+  const result = await send({ to, subject, text })
+  return { sent: result.ok, reason: result.ok ? undefined : result.error }
 }
 
 async function dispatch(

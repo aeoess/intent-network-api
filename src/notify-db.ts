@@ -21,7 +21,7 @@ export function initNotifySchema(): void {
       verified INTEGER NOT NULL DEFAULT 0,
       verify_token TEXT NOT NULL,
       unsub_token TEXT NOT NULL,
-      prefs_json TEXT NOT NULL DEFAULT '{"intro_request":true,"intro_accepted":true}',
+      prefs_json TEXT NOT NULL DEFAULT '{"intro_request":true,"intro_accepted":true,"weekly_digest":false}',
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
@@ -46,7 +46,7 @@ function d(): Database {
   return getDb()
 }
 
-export interface NotifPrefs { intro_request: boolean; intro_accepted: boolean }
+export interface NotifPrefs { intro_request: boolean; intro_accepted: boolean; weekly_digest: boolean }
 export interface Subscription {
   subject_key: string
   email: string
@@ -57,11 +57,24 @@ export interface Subscription {
 }
 
 function rowToSub(row: any): Subscription {
+  const parsed = JSON.parse(row.prefs_json) as Partial<NotifPrefs>
   return {
     subject_key: row.subject_key, email: row.email, verified: !!row.verified,
     verify_token: row.verify_token, unsub_token: row.unsub_token,
-    prefs: JSON.parse(row.prefs_json),
+    // weekly_digest defaults off for any row stored before the pref existed.
+    prefs: {
+      intro_request: parsed.intro_request !== false,
+      intro_accepted: parsed.intro_accepted !== false,
+      weekly_digest: parsed.weekly_digest === true,
+    },
   }
+}
+
+/** Verified subscribers who opted into the weekly digest. Emails live only in
+ *  this table; this is the sole reader for the weekly job. */
+export function weeklyDigestSubscribers(): Subscription[] {
+  const rows = d().prepare("SELECT * FROM notifications WHERE verified = 1 AND json_extract(prefs_json, '$.weekly_digest') = 1").all() as any[]
+  return rows.map(rowToSub)
 }
 
 /** Upsert a subscription as UNVERIFIED with fresh tokens. Changing the email

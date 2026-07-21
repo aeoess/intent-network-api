@@ -15,6 +15,7 @@ import v3Routes from './v3-routes.js'
 import v3Pages from './v3-pages.js'
 import notifyRoutes from './notify-routes.js'
 import introsRoutes from './intros-routes.js'
+import matchRoutes, { v3RateHeaders } from './match-routes.js'
 
 export function createApp() {
   const app = express()
@@ -30,8 +31,12 @@ export function createApp() {
 
   // ── Routes ──
   app.use('/api', routes)
+  // Informational X-RateLimit-* headers on every v3 response (never blocks).
+  app.use('/api/v3', v3RateHeaders)
   // Mingle v3 (additive; the 48h IntentCard routes above are untouched)
   app.use('/api/v3', v3Routes)
+  // Mingle v3 match engine surfaces: index, digest, dismiss, report
+  app.use('/api/v3', matchRoutes)
   // Mingle v3 P1.5 read surfaces: /c/:cardId, /e/:eventRef, /join
   app.use('/', v3Pages)
   // Mingle email notifications (consent + confirm + unsubscribe)

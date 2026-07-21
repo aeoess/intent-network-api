@@ -135,41 +135,82 @@ export interface V3SearchFilters {
 }
 
 const SEARCH_CAP = 50
+const MAX_SCAN = 2000
+
+/** The JS-side filter predicate (intents, topics, engagement, location) shared
+ *  by the wall search and the paginated agent search. */
+function passesJsFilters(card: V3Card, filters: V3SearchFilters): boolean {
+  if (filters.intents?.length && !filters.intents.some(i => card.intents.includes(i))) return false
+  if (filters.topics?.length) {
+    const cardTopics = [...card.seeking, ...card.offering].flatMap(e => e.topics ?? [])
+    if (!filters.topics.some(t => cardTopics.some(ct => ct.toLowerCase().includes(t.toLowerCase())))) return false
+  }
+  if (filters.engagement) {
+    const engagements = card.seeking.map(s => s.engagement).filter(Boolean) as string[]
+    const prefEngagement = card.preferences.filter(p => p.key === 'engagement').map(p => p.value)
+    if (![...engagements, ...prefEngagement].some(e => e.toLowerCase().includes(filters.engagement!.toLowerCase()))) return false
+  }
+  if (filters.location) {
+    const locPrefs = card.preferences.filter(p => p.key === 'location').map(p => p.value)
+    if (!locPrefs.some(l => l.toLowerCase().includes(filters.location!.toLowerCase()))) return false
+  }
+  return true
+}
 
 export function searchV3Cards(filters: V3SearchFilters, semanticIds?: string[], limit = 20): Record<string, unknown>[] {
   const cap = Math.min(limit, SEARCH_CAP)
-  const where: string[] = [
-    `expires_at > ${SQL_NOW_ISO}`,
-    `revocation_status IN ('active')`,
-  ]
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
-  const rows = d().prepare(`SELECT card_id, card_json, revocation_status FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 500`).all(...params) as any[]
+  const rows = d().prepare(`SELECT card_id, card_json FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 500`).all(...params) as any[]
 
   const results: Record<string, unknown>[] = []
   for (const row of rows) {
     const card = JSON.parse(row.card_json) as V3Card
-    card.revocation_status = row.revocation_status
+    card.revocation_status = 'active'
     if (semanticIds && !semanticIds.includes(row.card_id)) continue
-    if (filters.intents?.length && !filters.intents.some(i => card.intents.includes(i))) continue
-    if (filters.topics?.length) {
-      const cardTopics = [...card.seeking, ...card.offering].flatMap(e => e.topics ?? [])
-      if (!filters.topics.some(t => cardTopics.some(ct => ct.toLowerCase().includes(t.toLowerCase())))) continue
-    }
-    if (filters.engagement) {
-      const engagements = card.seeking.map(s => s.engagement).filter(Boolean) as string[]
-      const prefEngagement = card.preferences.filter(p => p.key === 'engagement').map(p => p.value)
-      if (![...engagements, ...prefEngagement].some(e => e.toLowerCase().includes(filters.engagement!.toLowerCase()))) continue
-    }
-    if (filters.location) {
-      const locPrefs = card.preferences.filter(p => p.key === 'location').map(p => p.value)
-      if (!locPrefs.some(l => l.toLowerCase().includes(filters.location!.toLowerCase()))) continue
-    }
+    if (!passesJsFilters(card, filters)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     if (results.length >= cap) break
   }
   return results
+}
+
+export interface PageCursor { created_at: string; card_id: string }
+export interface PageOpts { semanticIds?: string[]; limit?: number; createdAfter?: string; cursor?: PageCursor }
+
+/** Stable keyset pagination for third-party agents. Orders by (created_at,
+ *  card_id) DESC; the cursor is the last returned item, so pages never skip or
+ *  repeat. next_cursor is null when the page did not fill (no more results
+ *  within the scan window). */
+export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}): { results: Record<string, unknown>[]; next_cursor: PageCursor | null } {
+  const limit = Math.min(Math.max(1, opts.limit ?? 20), SEARCH_CAP)
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
+  const params: unknown[] = []
+  if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
+  if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
+  if (opts.createdAfter) { where.push('created_at > ?'); params.push(opts.createdAfter) }
+  if (opts.cursor) {
+    where.push('(created_at < ? OR (created_at = ? AND card_id < ?))')
+    params.push(opts.cursor.created_at, opts.cursor.created_at, opts.cursor.card_id)
+  }
+  const rows = d().prepare(
+    `SELECT card_id, card_json, created_at FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC, card_id DESC LIMIT ?`,
+  ).all(...params, MAX_SCAN) as any[]
+
+  const results: Record<string, unknown>[] = []
+  let last: PageCursor | null = null
+  for (const row of rows) {
+    const card = JSON.parse(row.card_json) as V3Card
+    card.revocation_status = 'active'
+    if (opts.semanticIds && !opts.semanticIds.includes(row.card_id)) continue
+    if (!passesJsFilters(card, filters)) continue
+    results.push(networkVisibleView({ ...card, card_id: row.card_id }))
+    last = { created_at: row.created_at, card_id: row.card_id }
+    if (results.length >= limit) break
+  }
+  return { results, next_cursor: results.length >= limit ? last : null }
 }
 
 // ── Expiry sweep with index removal ──────────────────────────────────────
@@ -187,4 +228,75 @@ export function sweepExpiredV3Cards(): { swept: number } {
 
 export function v3CardCount(): number {
   return (d().prepare(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`).get() as any).n
+}
+
+// ── Helpers for the match engine, digest, idempotency, and renew ──────────
+
+/** Active, unexpired cards for pairwise match computation. Only 'active'
+ *  status participates; 'stopped_new_matches' and every terminal status do not. */
+export function listActiveCardsForMatching(cap = 500): { card_id: string; card: V3Card }[] {
+  const rows = d().prepare(
+    `SELECT card_id, card_json FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' ORDER BY created_at DESC LIMIT ?`,
+  ).all(cap) as any[]
+  return rows.map(r => ({ card_id: r.card_id, card: JSON.parse(r.card_json) as V3Card }))
+}
+
+/** The active, unexpired card_ids a subject owns (a subject may hold several). */
+export function activeCardIdsForSubject(subjectKey: string): string[] {
+  const rows = d().prepare(
+    `SELECT card_id FROM v3_cards WHERE subject_key = ? AND expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' ORDER BY created_at DESC`,
+  ).all(subjectKey) as any[]
+  return rows.map(r => r.card_id)
+}
+
+/** True when a card is currently matchable (active and unexpired). Used as the
+ *  read-time safety filter so a withdrawn or expired counterpart never leaks
+ *  through a stale match row. */
+export function isCardMatchable(cardId: string): boolean {
+  return !!d().prepare(
+    `SELECT 1 FROM v3_cards WHERE card_id = ? AND expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`,
+  ).get(cardId)
+}
+
+/** For idempotency: an existing live card of this subject carrying this exact
+ *  content hash, if any. */
+export function findActiveCardByHash(subjectKey: string, cardHash: string): { card_id: string; expires_at: string; revocation_status: string } | null {
+  const row = d().prepare(
+    `SELECT card_id, expires_at, revocation_status FROM v3_cards WHERE subject_key = ? AND card_hash = ? AND expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' ORDER BY created_at DESC LIMIT 1`,
+  ).get(subjectKey, cardHash) as any
+  return row ?? null
+}
+
+/** The card's stored content (for renew's identical-content check). */
+export function getV3CardContent(cardId: string): V3Card | null {
+  const row = d().prepare('SELECT card_json FROM v3_cards WHERE card_id = ?').get(cardId) as any
+  return row ? (JSON.parse(row.card_json) as V3Card) : null
+}
+
+// ── Supersession links (renew), additive table ───────────────────────────
+
+let supersedeInit = false
+function ensureSupersede(): Database {
+  const dd = d()
+  if (!supersedeInit) {
+    dd.exec(`CREATE TABLE IF NOT EXISTS v3_supersessions (
+      old_card_id TEXT PRIMARY KEY,
+      new_card_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_v3_superseded_by ON v3_supersessions(new_card_id);`)
+    supersedeInit = true
+  }
+  return dd
+}
+export function recordSupersession(oldCardId: string, newCardId: string): void {
+  ensureSupersede().prepare('INSERT OR REPLACE INTO v3_supersessions (old_card_id, new_card_id) VALUES (?, ?)').run(oldCardId, newCardId)
+}
+export function getSupersededBy(oldCardId: string): string | null {
+  const row = ensureSupersede().prepare('SELECT new_card_id FROM v3_supersessions WHERE old_card_id = ?').get(oldCardId) as any
+  return row?.new_card_id ?? null
+}
+export function getSupersedes(newCardId: string): string | null {
+  const row = ensureSupersede().prepare('SELECT old_card_id FROM v3_supersessions WHERE new_card_id = ?').get(newCardId) as any
+  return row?.old_card_id ?? null
 }

@@ -62,6 +62,25 @@ const BASE_STYLE = (nonce: string, extra = '') => `<style nonce="${nonce}">
 
 const FOOTER = `<div class="foot">Mingle transports; it never evaluates. Signatures prove authorization and integrity, not the truth of subjective claims. Powered by Agent Passport System.</div>`
 
+// A no-JS report affordance: a mailto to the operator's configured address with
+// the card id prefilled. Rendered only when ADMIN_NOTIFY_EMAIL is set; agents
+// use POST /api/v3/report instead. Returns empty string when unconfigured.
+function reportLink(subjectText: string): string {
+  const addr = process.env.ADMIN_NOTIFY_EMAIL
+  if (!addr) return ''
+  return `<p class="report"><a href="mailto:${esc(addr)}?subject=${encodeURIComponent(subjectText)}">Report</a></p>`
+}
+
+// Static sample cards for the demo wall only. Clearly badged and never linked,
+// so they cannot be mistaken for real published cards.
+const SAMPLE_WALL_CARDS = [
+  { h: 'Building an open protocol for agent identity', intents: ['collaborate', 'cofound'], seek: 'Cryptography reviewers, protocol designers' },
+  { h: 'Frontend engineer who loves data-heavy UIs', intents: ['team_up', 'work'], seek: 'A hackathon team for this weekend' },
+  { h: 'Researcher on consent and delegation', intents: ['meet', 'advise'], seek: 'People working on agent authorization' },
+].map(s =>
+  `<div class="sample"><article class="card"><h2 class="ch">${s.h}</h2><p class="tags"><span class="tag sample">SAMPLE</span>${s.intents.map(i => `<span class="tag">${i}</span>`).join('')}</p><p class="seek">Seeking: ${s.seek}</p></article></div>`,
+).join('\n')
+
 // ── GET /c/:cardId - public card page ─────────────────────────────────────
 
 router.get('/c/:cardId', rateLimited('page_card', 120), (req, res) => {
@@ -106,6 +125,7 @@ router.get('/c/:cardId', rateLimited('page_card', 120), (req, res) => {
   // Connect block: no form, no unauthenticated action, just the card id and how
   // to ask your own assistant to request an intro.
   parts.push(`<h2>Connect</h2><p class="cardid">${esc(view.card_id)}</p><p>Install Mingle, publish your card, then tell your assistant: request an intro to card ${esc(view.card_id)}.</p>`)
+  parts.push(reportLink(`Mingle report: ${view.card_id}`))
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -113,7 +133,7 @@ router.get('/c/:cardId', rateLimited('page_card', 120), (req, res) => {
 <meta property="og:title" content="${esc(headline)}">
 <meta property="og:description" content="${esc(ogDesc)}">
 <meta property="og:type" content="profile">
-${BASE_STYLE(nonce, '.cardid { font-family: ui-monospace, monospace; background: #f7f8fa; padding: 0.4rem 0.7rem; border-radius: 8px; word-break: break-all; user-select: all; }')}</head><body>${parts.join('\n')}${FOOTER}</body></html>`
+${BASE_STYLE(nonce, '.cardid { font-family: ui-monospace, monospace; background: #f7f8fa; padding: 0.4rem 0.7rem; border-radius: 8px; word-break: break-all; user-select: all; } .report { margin-top: 1.5rem; } .report a { font-size: 0.8rem; color: #8a8f9c; }')}</head><body>${parts.join('\n')}${FOOTER}</body></html>`
   secureHtml(res, html, nonce)
 })
 
@@ -133,10 +153,23 @@ router.get('/e/:eventRef', rateLimited('page_event', 120), (req, res) => {
   const joinUrl = `${esc(proto)}://${host}/join`
   const qr = qrSvg(`${proto}://${req.get('host') || 'api.aeoess.com'}/join`, { moduleSize: 4 })
 
+  // Each real wall card links to its own /c/:cardId page.
   const cards = results.map((v: any) => {
     const seeking = Array.isArray(v.seeking) ? v.seeking.slice(0, 2).map((s: any) => esc(s.description)).join(' · ') : ''
-    return `<article class="card"><h2 class="ch">${esc(v.headline ?? 'Mingle card')}</h2>${Array.isArray(v.intents) ? `<p class="tags">${v.intents.map((i: string) => `<span class="tag">${esc(i)}</span>`).join('')}</p>` : ''}${seeking ? `<p class="seek">Seeking: ${seeking}</p>` : ''}</article>`
+    const inner = `<article class="card"><h2 class="ch">${esc(v.headline ?? 'Mingle card')}</h2>${Array.isArray(v.intents) ? `<p class="tags">${v.intents.map((i: string) => `<span class="tag">${esc(i)}</span>`).join('')}</p>` : ''}${seeking ? `<p class="seek">Seeking: ${seeking}</p>` : ''}</article>`
+    return `<a class="cardlink" href="/c/${esc(v.card_id)}">${inner}</a>`
   }).join('\n')
+
+  // The demo wall (and ONLY event_ref 'demo') shows sample cards when empty, so
+  // a first-time visitor sees what a wall looks like. The badge is gated on the
+  // exact literal 'demo', so no real event can ever render a sample.
+  const showSamples = eventRef === 'demo' && results.length === 0
+  const sampleCards = showSamples ? SAMPLE_WALL_CARDS : ''
+
+  const bodyCards = showSamples ? sampleCards : cards
+  const countText = showSamples
+    ? '3 sample cards (this event has none yet)'
+    : (cards ? `${results.length} card${results.length === 1 ? '' : 's'} here now` : '')
 
   const extra = `
   body { max-width: 72rem; }
@@ -144,10 +177,15 @@ router.get('/e/:eventRef', rateLimited('page_event', 120), (req, res) => {
   .join { text-align: center; }
   .join .u { font-size: 1.3rem; font-weight: 600; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); gap: 1rem; margin-top: 1.5rem; }
-  .card { border: 1px solid #d7dae2; border-radius: 14px; padding: 1.25rem; }
+  .cardlink { text-decoration: none; color: inherit; display: block; }
+  .card { border: 1px solid #d7dae2; border-radius: 14px; padding: 1.25rem; height: 100%; }
+  .cardlink:hover .card { border-color: #1a56db; }
+  .sample .card, .card.sample { border-style: dashed; opacity: 0.9; }
+  .tag.sample { background: #fff3cd; border-color: #ffe08a; color: #7a5b00; font-weight: 600; }
   .ch { font-size: 1.4rem; text-transform: none; letter-spacing: 0; color: #14161d; margin: 0 0 0.5rem; }
   .seek { color: #4c4f57; margin: 0.4rem 0 0; }
   .empty { color: #6a6f7e; padding: 2rem 0; }
+  .report a { font-size: 0.8rem; color: #8a8f9c; }
   @media (min-width: 60rem) { .ch { font-size: 1.7rem; } }`
 
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -156,10 +194,11 @@ router.get('/e/:eventRef', rateLimited('page_event', 120), (req, res) => {
 <title>Mingle wall - ${esc(eventRef)}</title>
 ${BASE_STYLE(nonce, extra)}</head><body>
 <div class="wallhead">
-  <div><p class="kicker">Mingle event wall</p><h1>${esc(eventRef)}</h1><p>${cards ? `${results.length} card${results.length === 1 ? '' : 's'} here now` : ''}</p></div>
+  <div><p class="kicker">Mingle event wall</p><h1>${esc(eventRef)}</h1><p>${countText}</p></div>
   <div class="join">${qr ?? ''}<p class="u">Join: ${esc(joinUrl)}</p></div>
 </div>
-${cards ? `<div class="grid">${cards}</div>` : '<p class="empty">No cards on this wall yet. Publish a card with this event to appear here.</p>'}
+${bodyCards ? `<div class="grid">${bodyCards}</div>` : '<p class="empty">No cards on this wall yet. Publish a card with this event to appear here.</p>'}
+${reportLink(`Mingle abuse report: wall ${eventRef}`)}
 ${FOOTER}</body></html>`
   secureHtml(res, html, nonce)
 })
