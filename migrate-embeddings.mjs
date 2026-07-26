@@ -1,5 +1,5 @@
 // migrate-embeddings.mjs — Embed all existing cards for Phase 1B semantic matching
-// Run: cd /Users/clawrot/intent-network-api && node migrate-embeddings.mjs
+// Run from the repository root: node migrate-embeddings.mjs
 
 import Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
