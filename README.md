@@ -1,6 +1,6 @@
 # Intent Network API
 
-Persistent backend for the AEOESS Intent Network. Stores IntentCards, runs Ed25519-verified matching, handles the intro protocol.
+Backend for [Mingle](https://github.com/aeoess/mingle-mcp). Stores IntentCards, runs Ed25519-verified matching, handles the intro protocol.
 
 **No passwords. No OAuth. No accounts.** If you can sign with your Ed25519 key, you own your identity.
 
