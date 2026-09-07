@@ -12,34 +12,30 @@
 // trace. Do not cite it as proof of what happened; cite it as the server's own
 // account of what it did.
 //
-// TRANSACTIONALITY. Event insertion is NOT transactional with every state
-// change it records. Two shapes exist and the difference matters when reading
-// a count:
+// TRANSACTIONALITY. Event insertion is NOT transactional with ANY state change
+// it records. Every site listed below writes its event outside the transaction
+// that made the change, through recordCardEvent, which swallows its own failure
+// and logs to the console:
 //
-//   In-transaction (event and state change commit or roll back together):
-//     - legacy card expiry in db.ts purgeExpired, via recordCardEventStrict
-//       inside the same better-sqlite3 transaction as the DELETE.
+//   - legacy card expiry (db.ts purgeExpired) - the facts are captured before
+//     the DELETE, the DELETE commits, and the events are written afterwards
+//   - card_published, card_renewed, card_server_copy_deleted and the four
+//     revocation verbs (v3-routes.ts)
+//   - card_expired from the v3 sweep (v3-db.ts) - written after the UPDATE
+//   - embedding_stored / embedding_failed, match_notified /
+//     match_notify_skipped (v3-routes.ts)
+//   - matching_started, match_created, match_removed, match_dismissed
+//     (matches-db.ts)
+//   - digest_read (match-routes.ts)
+//   - intro_requested / intro_accepted / intro_declined (intros-routes.ts)
+//   - handshake_requested / handshake_committed, first_step_proposed /
+//     first_step_approved (fit-v4-routes.ts)
+//   - handshake_closed (fit-routes.ts)
 //
-//   Best-effort, NOT in a transaction with the change (every other site):
-//     - card_published, card_renewed, card_server_copy_deleted and the four
-//       revocation verbs (v3-routes.ts)
-//     - card_expired from the v3 sweep (v3-db.ts) - the events are written
-//       after the UPDATE commits
-//     - embedding_stored / embedding_failed, match_notified /
-//       match_notify_skipped (v3-routes.ts)
-//     - matching_started, match_created, match_removed, match_dismissed
-//       (matches-db.ts)
-//     - digest_read (match-routes.ts)
-//     - intro_requested / intro_accepted / intro_declined (intros-routes.ts)
-//     - handshake_requested / handshake_committed, first_step_proposed /
-//       first_step_approved (fit-v4-routes.ts)
-//     - handshake_closed (fit-routes.ts)
-//
-// At those sites recordCardEvent swallows its own failure, so a lost event
-// leaves the state change standing. That is deliberate - a publish must not
-// fail because a log line could not be written - but it means an event count
-// is a floor, not a guarantee. recordCardEventStrict is the opposite: it
-// throws, so a caller inside a transaction rolls the state change back with it.
+// So AN EVENT COUNT IS A FLOOR, NOT A GUARANTEE. That is the deliberate trade:
+// a publish must not fail because a log line could not be written, and - the
+// sharper case - a broken log must never keep an expired card body alive. When
+// logging and the change it records cannot both succeed, the change wins.
 //
 // There is deliberately no update or delete statement in this module, and a
 // test greps src/ to keep it that way.
@@ -102,13 +98,6 @@ export const CARD_EVENTS = [
 
 export type CardEvent = typeof CARD_EVENTS[number]
 
-/** Create the table if it does not exist yet. Callers that need to write an
- *  event inside their own transaction must call this first: the lazy creation
- *  in d() would otherwise run DDL from inside that transaction. */
-export function ensureCardEventsSchema(): void {
-  if (!initialized) initCardEventsSchema()
-}
-
 /** Append one event. Insert-only, and never throws into the caller's response.
  *  Use this everywhere except inside a transaction the event must share. */
 export function recordCardEvent(
@@ -123,22 +112,6 @@ export function recordCardEvent(
   } catch (e) {
     console.error('[card-events] failed to record', event, (e as Error).message)
   }
-}
-
-/** Append one event on an explicit connection and THROW on failure, so a caller
- *  running inside a transaction rolls its own state change back rather than
- *  committing a change the log does not record. The connection is passed in
- *  rather than fetched, so this module never reaches back into db.ts on the
- *  transactional path. */
-export function recordCardEventStrict(
-  conn: Database,
-  event: CardEvent,
-  cardId: string | null,
-  subjectKey: string | null,
-  detail?: Record<string, unknown>,
-): void {
-  conn.prepare('INSERT INTO card_events (card_id, subject_key, event, detail_json) VALUES (?, ?, ?, ?)')
-    .run(cardId, subjectKey, event, detail ? JSON.stringify(detail) : null)
 }
 
 // ── Read helpers (stats, tests, review) ────────────────────────────────────

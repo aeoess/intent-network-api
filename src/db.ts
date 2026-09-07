@@ -8,7 +8,7 @@ import Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
 import { join } from 'node:path'
 import type { IntentCard, IntroRequest, IntroResponse, RelevanceMatch } from 'agent-passport-system'
-import { ensureCardEventsSchema, recordCardEventStrict } from './card-events.js'
+import { recordCardEvent } from './card-events.js'
 
 // DB_PATH is resolved lazily (inside getDb) rather than at module load,
 // so tests can point DB_PATH at a temp file before the first connection
@@ -306,34 +306,38 @@ export function checkRateLimit(publicKey: string, action: string, maxPerHour: nu
 // Utilities
 // ══════════════════════════════════════
 
-/** Delete what has lapsed, after recording that it lapsed.
+/** Delete what has lapsed. Record it afterwards, if the log will have it.
  *
  *  A legacy 48h IntentCard is published under an ephemeral promise: the body
- *  goes away when the card runs out. Keeping the row past expiry would quietly
- *  change that promise for cards whose principals accepted the old one, so the
- *  DELETE stays exactly as it was on main.
+ *  goes away when the card runs out. The DELETE stays exactly as it was on main.
  *
- *  What is new is that the disappearance is no longer silent. One card_expired
- *  event per row is written FIRST, carrying the card_id, the agent_id as the
- *  subject, and the expiry timestamp - and nothing from the card body. Event
- *  and delete run in one transaction through recordCardEventStrict, which
- *  throws rather than swallowing, so a row can never be destroyed without the
- *  event that says it was. This is the one site in the codebase where an event
- *  and the change it records commit together; card-events.ts lists the rest. */
+ *  ORDER MATTERS AND IT IS DELIBERATE. The expiry facts (card_id, agent_id,
+ *  expires_at - never any card content) are read first, the rows are deleted and
+ *  the delete COMMITS, and only then are the card_expired events written,
+ *  best-effort, from the facts captured before the delete.
+ *
+ *  Writing the event inside the delete's transaction would mean a broken event
+ *  log keeps expired card bodies alive: an insert failure rolls the delete back
+ *  and the content the principal was promised would disappear stays on disk
+ *  until someone notices. Retention is the more serious failure, so the log
+ *  never gets a vote on it. A lost event leaves a card deleted and unrecorded,
+ *  which is the correct direction to fail in. */
 export function purgeExpired(): number {
   const d = getDb()
-  ensureCardEventsSchema()   // DDL must not run inside the transaction below
-  const purgeCards = d.transaction((): number => {
-    const expiring = d.prepare(
-      `SELECT card_id, agent_id, expires_at FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`,
-    ).all() as any[]
-    for (const row of expiring) {
-      // detail carries no card body: the promise was that the content goes.
-      recordCardEventStrict(d, 'card_expired', row.card_id, row.agent_id, { expires_at: row.expires_at })
-    }
-    return d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run().changes
-  })
-  const cards = purgeCards()
+  // Captured BEFORE the delete, because after it these rows no longer exist.
+  // Nothing here is card content: the promise was that the content goes.
+  const expiring = d.prepare(
+    `SELECT card_id, agent_id, expires_at FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`,
+  ).all() as { card_id: string; agent_id: string; expires_at: string }[]
+
+  const cards = d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run().changes
+
+  // Committed. From here nothing can bring the deleted content back, so the
+  // event log is free to fail without consequence for the principal.
+  for (const row of expiring) {
+    recordCardEvent('card_expired', row.card_id, row.agent_id, { expires_at: row.expires_at })
+  }
+
   const intros = d.prepare(`UPDATE intros SET status = 'expired' WHERE status = 'pending' AND expires_at <= ${SQL_NOW_ISO}`).run()
   // Clean old rate limit windows (older than 2 hours)
   const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString()

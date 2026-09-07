@@ -131,6 +131,11 @@ Individual write endpoints enforce their own stricter per-hour caps and return
 - v3 expiry never reports itself as a withdrawal. Legacy 48h IntentCards are
   still deleted on expiry, as they always were: their body was published under
   an ephemeral promise and that promise is kept.
+- Deleting an expired legacy card never depends on the event log. The delete
+  commits first and the record is written afterwards, best-effort, so a broken
+  log can lose an event but can never keep an expired card body alive.
 - The card event log is append-only: nothing in the server updates or deletes
   a recorded event. It is a log, not a tamper-evident ledger - it carries no
   hash chain and no signature, and is the server's own account of what it did.
+  No event is written in the same transaction as the change it records, so an
+  event count is a floor, not a guarantee.

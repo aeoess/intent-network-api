@@ -109,6 +109,42 @@ test('expired cards are deleted, and their disappearance is recorded', () => {
   }
 })
 
+test('a broken event log cannot keep an expired card body alive', () => {
+  const stale = makeCard('doomed-agent', { expiresInMs: -60_000 })
+  db.getDb().prepare(`
+    INSERT INTO cards (card_id, agent_id, public_key, principal_alias, card_json, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(stale.cardId, stale.agentId, stale.publicKey, stale.principalAlias, JSON.stringify(stale), stale.createdAt, stale.expiresAt)
+
+  // Break the event log the way a real breakage behaves: every insert into
+  // card_events aborts. A trigger is used rather than dropping the table so the
+  // failure cannot be routed around by a CREATE TABLE IF NOT EXISTS on the way
+  // in - the table is present and writing to it still fails.
+  db.getDb().exec('CREATE TABLE IF NOT EXISTS card_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, card_id TEXT, subject_key TEXT, event TEXT, detail_json TEXT)')
+  db.getDb().exec("CREATE TRIGGER card_events_broken BEFORE INSERT ON card_events BEGIN SELECT RAISE(ABORT, 'event log is down'); END")
+  let threw: unknown = null
+  try {
+    db.purgeExpired()
+  } catch (e) {
+    threw = e
+  } finally {
+    db.getDb().exec('DROP TRIGGER IF EXISTS card_events_broken')
+  }
+
+  // The invariant that matters most, asserted first: a broken log must never
+  // be able to retain content the principal was promised would disappear.
+  const remaining = db.getDb().prepare('SELECT COUNT(*) as c FROM cards WHERE agent_id = ?').get('doomed-agent') as any
+  assert.equal(remaining.c, 0, 'a broken event log must NOT retain the expired card body')
+  assert.equal(db.getCard('doomed-agent'), null)
+  assert.equal(threw, null, 'purgeExpired must not throw when the event log is broken')
+
+  // And the body is gone from the database entirely, not merely hidden.
+  const anywhere = db.getDb().prepare("SELECT COUNT(*) as c FROM cards WHERE card_json LIKE ?").get(`%${stale.needs[0].description}%`) as any
+  assert.equal(anywhere.c, 0, 'no card body may survive a logging failure')
+  const inLog = db.getDb().prepare('SELECT COUNT(*) as c FROM card_events WHERE card_id = ?').get(stale.cardId) as any
+  assert.equal(inLog.c, 0, 'the event genuinely did not get written, so this is the failure path')
+})
+
 test('the purge deletes only what has lapsed, once, and leaves live cards alone', () => {
   const live = makeCard('kept-agent')
   db.publishCard(live)
