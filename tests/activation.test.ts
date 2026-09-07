@@ -259,6 +259,8 @@ test('cards_legacy_status_ambiguous counts pre-marker withdrawals only', async (
   const marker = v3db.v32DeployMarker()!
   const before = new Date(Date.parse(marker) - 864e5).toISOString()
   const after = new Date(Date.parse(marker) + 864e5).toISOString()
+  // Between `before` and now: already in the past, but later than the withdrawal.
+  const midway = new Date(Date.parse(marker) - 432e5).toISOString()
   const ins = db.getDb().prepare(`INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, created_at, expires_at, revocation_status, updated_at)
     VALUES (?, 'connection', ?, 'h', '{}', 'a', '[]', ?, ?, ?, ?)`)
   // Written before 3.2.0 existed: the sweep of the day and a real withdrawal
@@ -272,20 +274,26 @@ test('cards_legacy_status_ambiguous counts pre-marker withdrawals only', async (
   // Withdrawn before the marker but never lapsed: the sweep only touches expired
   // rows, so this can only be the principal's own withdrawal. Not ambiguous.
   ins.run('mk-pre-live', 'kd', before, after, 'withdrawn', before)
+  // Withdrawn before the marker AND before its own expiry, on a card whose expiry
+  // has since passed. At the moment it became withdrawn it was not expired, so
+  // the sweep cannot have written it. Must stay excluded even though the clock
+  // is now past expires_at.
+  ins.run('mk-pre-early', 'ke', before, midway, 'withdrawn', before)
 
   const v3 = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
   const d = db.getDb()
   const counted = (id: string): number => (d.prepare(
-    "SELECT COUNT(*) AS n FROM v3_cards WHERE card_id = ? AND revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE card_id = ? AND revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= updated_at",
   ).get(id, marker) as any).n
 
   assert.equal(counted('mk-pre'), 1, 'a pre-marker withdrawn row is ambiguous')
   assert.equal(counted('mk-post'), 0, 'a post-marker withdrawal is the principal\'s own and is not counted')
   assert.equal(counted('mk-active'), 0, 'an active row is never counted')
   assert.equal(counted('mk-pre-live'), 0, 'a pre-marker withdrawal of a card that never lapsed is not ambiguous')
+  assert.equal(counted('mk-pre-early'), 0, 'a pre-marker withdrawal written before expiry stays excluded after the card lapses')
 
   assert.equal(v3.cards_legacy_status_ambiguous, (d.prepare(
-    "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= updated_at",
   ).get(marker) as any).n, 'the endpoint must match the query run directly')
   assert.ok(v3.cards_legacy_status_ambiguous >= 1, 'the seeded pre-marker row must be counted')
   assert.ok(v3.cards_legacy_status_ambiguous <= v3.cards_withdrawn,
