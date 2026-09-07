@@ -25,6 +25,7 @@ import { questionFor } from './fit-questions.js'
 import { ledgerItemLive } from './fit-db.js'
 import { postGateDrafted, type PostGateInput } from './fit-gate.js'
 import { extract as airlockExtract, plan as airlockPlan } from './fit-airlock.js'
+import { recordCardEvent } from './card-events.js'
 
 const router = Router()
 
@@ -152,6 +153,7 @@ router.post('/:introId/request', rateLimited('fitv4_hs', 30), (req, res) => {
   const reciprocal = Array.isArray(reciprocal_offer) ? reciprocal_offer : requested_dimensions
   const budget = Math.min(Math.max(1, Number(query_budget) || 3), MAX_QUERY_BUDGET)
   handshakeDb.setRequest(introId, public_key, requested_dimensions, reciprocal, policy_hash, budget)
+  recordCardEvent('handshake_requested', card, public_key, { intro_id: introId, intent: hs.intent, dimensions: requested_dimensions.length })
   res.status(201).json({ state: 'requested', requested_dimensions, note: 'Nothing is evaluated until the counterparty commits to the same dimensions with matching reciprocity.' })
 })
 
@@ -239,6 +241,7 @@ router.post('/:introId/commit', rateLimited('fitv4_hs', 30), (req, res) => {
   const receipt = signReceipt(receiptDigest)
 
   handshakeDb.setCommitResult(introId, public_key, accept_dimensions, comReciprocal, policy_hash, JSON.stringify(overlap_map), receipt, receiptDigest, JSON.stringify(receiptContent))
+  recordCardEvent('handshake_committed', cardOfKey(hs, public_key), public_key, { intro_id: introId, intent: hs.intent, dimensions: accept_dimensions.length, receipt_digest: receiptDigest })
   res.json({ state: 'committed', overlap_map, receipt, receipt_digest: receiptDigest, receipt_content: receiptContent, server_public_key: serverPublicKey() })
 })
 
@@ -508,6 +511,7 @@ router.post('/:introId/first-step', rateLimited('fitv4_hs', 30), async (req, res
 
   const isA = public_key === hs.key_a
   firstStepDb.proposeHalf(introId, isA, public_key, v.half)
+  recordCardEvent('first_step_proposed', cardOfKey(hs, public_key), public_key, { intro_id: introId })
   try { await email.notifyFirstStepProposed(otherKey(hs, public_key), introId) } catch { /* email never blocks proposal */ }
 
   const row = firstStepDb.getFirstStep(introId)!
@@ -532,7 +536,9 @@ router.post('/:introId/first-step/approve', rateLimited('fitv4_hs', 30), (req, r
 
   firstStepDb.approve(introId, public_key === hs.key_a)
   const fresh = firstStepDb.getFirstStep(introId)!
-  res.json({ approved: true, finalized: firstStepDb.isFinalized(fresh) })
+  const finalized = firstStepDb.isFinalized(fresh)
+  recordCardEvent('first_step_approved', cardOfKey(hs, public_key), public_key, { intro_id: introId, approved_digest, finalized })
+  res.json({ approved: true, finalized })
 })
 
 // ── GET /:introId/first-step (parties only) ───────────────────────────────

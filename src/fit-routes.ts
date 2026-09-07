@@ -25,6 +25,7 @@ import { assembleDraftingContext, renderQuestions, type RenderedQuestion } from 
 import { sealRecord } from './fit-record.js'
 import { verifyReceipt, serverPublicKey } from './server-key.js'
 import * as email from './notifications.js'
+import { recordCardEvent } from './card-events.js'
 
 const router = Router()
 
@@ -324,6 +325,9 @@ export function closeExchangeNow(ex: fitDb.ExchangeRow): { record: unknown; dige
   const customs = fitDb.customForExchange(fresh.id)
   const sealed = sealRecord(fresh, bank, answers, round2s, customs)
   fitDb.closeExchange(fresh.id, JSON.stringify(sealed.record), sealed.digest, sealed.receipt)
+  // Recorded against both cards: a closed exchange is a fact for each side.
+  recordCardEvent('handshake_closed', fresh.card_a, fresh.key_a, { exchange_id: fresh.id, intro_id: fresh.intro_id, intent: fresh.intent, record_digest: sealed.digest })
+  recordCardEvent('handshake_closed', fresh.card_b, fresh.key_b, { exchange_id: fresh.id, intro_id: fresh.intro_id, intent: fresh.intent, record_digest: sealed.digest })
   return { record: sealed.record, digest: sealed.digest, receipt: sealed.receipt }
 }
 

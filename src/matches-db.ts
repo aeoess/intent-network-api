@@ -16,6 +16,7 @@ import { getDb } from './db.js'
 import * as v3db from './v3-db.js'
 import { cosineSimilarity } from './embeddings.js'
 import { computeOverlap, overlapCount, type OverlapMap, type AgreedField } from './matches.js'
+import { recordCardEvent } from './card-events.js'
 
 let initialized = false
 
@@ -80,18 +81,25 @@ function cosOf(a: Float32Array | null, b: Float32Array | null): number | null {
 
 // ── Pair upsert / delete ──────────────────────────────────────────────────
 
-function upsertMatch(x: string, y: string, overlap: OverlapMap): void {
+type UpsertOutcome = 'inserted' | 'updated' | 'unchanged'
+
+/** Returns which of the three things happened, because only an INSERT is a
+ *  genuinely new pair. Push notification and the match_created event both hang
+ *  off that distinction: a recompute that re-derives the same pair must not
+ *  look like a new match to either side. */
+function upsertMatch(x: string, y: string, overlap: OverlapMap): UpsertOutcome {
   const [a, b] = order(x, y)
   const json = JSON.stringify(overlap)
   const existing = d().prepare('SELECT overlap_json FROM v3_matches WHERE card_a = ? AND card_b = ?').get(a, b) as any
   if (existing) {
     // An unchanged overlap keeps its original computed_at (first-seen), so a
     // re-sweep never re-dates a match and "new since last check" stays honest.
-    if (existing.overlap_json === json) return
+    if (existing.overlap_json === json) return 'unchanged'
     d().prepare(`UPDATE v3_matches SET overlap_json = ?, computed_at = ${nowExpr} WHERE card_a = ? AND card_b = ?`).run(json, a, b)
-    return
+    return 'updated'
   }
   d().prepare(`INSERT INTO v3_matches (card_a, card_b, overlap_json, computed_at) VALUES (?, ?, ?, ${nowExpr})`).run(a, b, json)
+  return 'inserted'
 }
 
 function deletePair(x: string, y: string): void {
@@ -114,13 +122,26 @@ export function deleteMatchArtifacts(cardId: string): void {
 /** Recompute every pair touching one card. Upserts pairs that clear the
  *  threshold, deletes pairs that no longer do. Returns the live match count. */
 export function recomputeMatchesForCard(cardId: string): number {
+  return recomputeMatchesForCardDetailed(cardId).live
+}
+
+/** The pairs this recompute newly created, alongside the live count. The caller
+ *  (publish, renew, the hourly sweep) uses `created` to decide who to tell. */
+export interface RecomputeResult {
+  live: number
+  created: { other_card_id: string; overlap_count: number; cosine: number | null }[]
+}
+
+export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult {
   const stored = v3db.getV3Card(cardId)
   if (!stored || stored.revocation_status !== 'active' || Date.parse(stored.expires_at) <= Date.now()) {
     deleteMatchRowsForCard(cardId)
-    return 0
+    return { live: 0, created: [] }
   }
   const myVec = getMatchVector(cardId)
   const candidates = v3db.listActiveCardsForMatching(500)
+  recordCardEvent('matching_started', cardId, stored.card.subject_key, { candidate_count: candidates.length })
+  const created: RecomputeResult['created'] = []
   let n = 0
   for (const cand of candidates) {
     if (cand.card_id === cardId) continue
@@ -129,10 +150,24 @@ export function recomputeMatchesForCard(cardId: string): number {
     const aCard = aId === cardId ? stored.card : cand.card
     const bCard = aId === cardId ? cand.card : stored.card
     const overlap = computeOverlap(aCard, bCard, cos)
-    if (overlap) { upsertMatch(cardId, cand.card_id, overlap); n++ }
-    else deletePair(cardId, cand.card_id)
+    if (overlap) {
+      const outcome = upsertMatch(cardId, cand.card_id, overlap)
+      if (outcome === 'inserted') {
+        const count = overlapCount(overlap)
+        created.push({ other_card_id: cand.card_id, overlap_count: count, cosine: cos })
+        recordCardEvent('match_created', cardId, stored.card.subject_key, {
+          other_card_id: cand.card_id, overlap_count: count, cosine: cos,
+        })
+      }
+      n++
+    } else {
+      const [a, b] = order(cardId, cand.card_id)
+      const had = d().prepare('SELECT 1 FROM v3_matches WHERE card_a = ? AND card_b = ?').get(a, b)
+      deletePair(cardId, cand.card_id)
+      if (had) recordCardEvent('match_removed', cardId, stored.card.subject_key, { other_card_id: cand.card_id, reason: 'overlap_lost' })
+    }
   }
-  return n
+  return { live: n, created }
 }
 
 /** Hourly sweep: recompute across the active set, then prune orphans. */
@@ -225,6 +260,10 @@ export function dismissMatch(ownerCardId: string, otherCardId: string): boolean 
   const [a, b] = order(ownerCardId, otherCardId)
   const col = ownerCardId === a ? 'dismissed_a' : 'dismissed_b'
   const res = d().prepare(`UPDATE v3_matches SET ${col} = 1 WHERE card_a = ? AND card_b = ?`).run(a, b)
+  if (res.changes > 0) {
+    const owner = v3db.getV3Card(ownerCardId)
+    recordCardEvent('match_dismissed', ownerCardId, owner?.card.subject_key ?? null, { other_card_id: otherCardId })
+  }
   return res.changes > 0
 }
 

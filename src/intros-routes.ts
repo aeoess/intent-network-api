@@ -16,6 +16,7 @@ import { networkVisibleView } from './v3-cards.js'
 import * as email from './notifications.js'
 import { createFitExchangeForIntro } from './fit-routes.js'
 import { openV4HandshakeForIntro } from './fit-v4-routes.js'
+import { recordCardEvent } from './card-events.js'
 
 const router = Router()
 const MAX_NOTE = 200
@@ -72,6 +73,7 @@ router.post('/request', rateLimited('intro_request', 20), async (req, res) => {
   const cleanNote = introsDb.stripUrls(String(note ?? '')).slice(0, MAX_NOTE)
   const id = `intro-v3-${Date.now()}-${randomBytes(4).toString('hex')}`
   introsDb.insertIntro({ id, from_card, to_card, from_key: public_key, to_key: target.key, purpose, note: cleanNote })
+  recordCardEvent('intro_requested', from_card, public_key, { intro_id: id, to_card, purpose })
 
   // Email the target, if subscribed and verified. Dark and instant when
   // unconfigured; never breaks the request.
@@ -100,6 +102,7 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
     if (typeof contact !== 'string' || contact.trim().length === 0) { res.status(400).json({ error: 'accept requires a contact line' }); return }
     if (contact.length > MAX_CONTACT) { res.status(400).json({ error: `contact too long (max ${MAX_CONTACT})` }); return }
     introsDb.respondIntro(id, 'accepted', contact.trim())
+    recordCardEvent('intro_accepted', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, purpose: intro.purpose })
     // If both cards share a banked intent, open a structured fit exchange and
     // return the accepter's consent sheet; otherwise the intro proceeds straight
     // to the existing contact-completion flow, unchanged.
@@ -124,10 +127,12 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
   if (action === 'decline_and_block') {
     introsDb.respondIntro(id, 'declined', null)
     introsDb.addBlock(intro.from_card, intro.to_card)
+    recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: true })
     res.json({ id, status: 'declined', blocked: true })
     return
   }
   introsDb.respondIntro(id, 'declined', null)
+  recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: false })
   res.json({ id, status: 'declined' })
 })
 

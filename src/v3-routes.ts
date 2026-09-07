@@ -17,8 +17,10 @@ import * as notifyDb from './notify-db.js'
 import * as matchesDb from './matches-db.js'
 import * as email from './notifications.js'
 import { embed } from './embeddings.js'
-import { networkVisibleText } from './v3-cards.js'
+import { networkVisibleText, networkVisibleView } from './v3-cards.js'
 import { checkRateLimit } from './db.js'
+import { recordCardEvent } from './card-events.js'
+import type { CardEvent } from './card-events.js'
 
 const router = Router()
 
@@ -31,13 +33,58 @@ async function finalizePublish(cardId: string, card: V3Card): Promise<void> {
     const text = networkVisibleText(card)
     if (text.length > 0) {
       const vec = await embed(text)
-      if (vec) { v3db.storeV3Embedding(cardId, vec); matchesDb.storeMatchVector(cardId, vec) }
+      if (vec) {
+        v3db.storeV3Embedding(cardId, vec); matchesDb.storeMatchVector(cardId, vec)
+        recordCardEvent('embedding_stored', cardId, card.subject_key, { dims: vec.length })
+      } else {
+        recordCardEvent('embedding_failed', cardId, card.subject_key, { error: 'embedding model not ready (embed returned null)' })
+      }
     }
   } catch (e) {
     console.error('[v3] embedding failed (card still published):', (e as Error).message)
+    recordCardEvent('embedding_failed', cardId, card.subject_key, { error: (e as Error).message })
   }
-  try { matchesDb.recomputeMatchesForCard(cardId) } catch (e) { console.error('[v3] match compute failed:', (e as Error).message) }
+  let created: { other_card_id: string; overlap_count: number; cosine: number | null }[] = []
+  try { created = matchesDb.recomputeMatchesForCardDetailed(cardId).created } catch (e) { console.error('[v3] match compute failed:', (e as Error).message) }
+  try { await pushNewMatches(cardId, card, created) } catch (e) { console.error('[v3] match push failed:', (e as Error).message) }
   try { await email.notifyAdmin('New Mingle card', `${card.headline} (${cardId})`) } catch { /* admin ping never affects publish */ }
+}
+
+/** Tell BOTH sides about a pair that did not exist before. Until now a match
+ *  only became visible when someone happened to poll /digest, so a match between
+ *  two people who were not looking simply sat there.
+ *
+ *  Email is the only channel that exists, so it is the only one used: a subject
+ *  with no confirmed subscription gets an event in the ledger and nothing else.
+ *  The dedupe id is the unordered pair, so recomputing never re-mails. */
+async function pushNewMatches(
+  cardId: string,
+  card: V3Card,
+  created: { other_card_id: string; overlap_count: number; cosine: number | null }[],
+): Promise<void> {
+  const myHeadline = headlineIfNetworkVisible(card)
+  for (const m of created) {
+    const other = v3db.getV3Card(m.other_card_id)
+    if (!other) continue
+    const pairId = `match:${[cardId, m.other_card_id].sort().join(':')}`
+    const sides = [
+      { key: card.subject_key, card: cardId, other: m.other_card_id, counterpartHeadline: headlineIfNetworkVisible(other.card) },
+      { key: other.card.subject_key, card: m.other_card_id, other: cardId, counterpartHeadline: myHeadline },
+    ]
+    for (const side of sides) {
+      const res = await email.notifyNewMatch(side.key, pairId, side.counterpartHeadline)
+      if (res.sent) recordCardEvent('match_notified', side.card, side.key, { other_card_id: side.other, channel: 'email' })
+      else recordCardEvent('match_notify_skipped', side.card, side.key, { other_card_id: side.other, reason: res.reason ?? 'unknown' })
+    }
+  }
+}
+
+/** The counterpart's headline, but only when the card actually publishes it to
+ *  the network. A private headline stays out of the email. */
+function headlineIfNetworkVisible(card: V3Card | undefined): string {
+  if (!card) return ''
+  const view = networkVisibleView({ ...card } as any) as any
+  return typeof view.headline === 'string' ? view.headline : ''
 }
 
 /** Content identical except the volatile fields (timestamps, approval,
@@ -109,6 +156,7 @@ router.post('/cards', rateLimited('publish', req => String(req.body?.card?.subje
 
   const cardId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   v3db.insertV3Card(cardId, card, card.approval.card_hash)
+  recordCardEvent('card_published', cardId, card.subject_key, { card_type: card.card_type, expires_at: card.expires_at, card_hash: card.approval.card_hash })
   await finalizePublish(cardId, card)
 
   res.status(201).json({ published: true, card_id: cardId, card_hash: card.approval.card_hash, expires_at: card.expires_at, revocation_status: card.revocation_status })
@@ -139,6 +187,9 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
 
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   v3db.insertV3Card(newId, card, card.approval.card_hash)
+  // Recorded against both ids so either end of the chain finds the renewal.
+  recordCardEvent('card_renewed', newId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
+  recordCardEvent('card_renewed', oldId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
   await finalizePublish(newId, card)
 
   // Supersede the old version and clean its index + match artifacts.
@@ -209,6 +260,13 @@ const VERB_STATUS: Record<string, RevocationStatus> = {
   'stop-new-matches': 'stopped_new_matches',
 }
 
+const VERB_EVENT: Record<string, CardEvent> = {
+  'withdraw': 'card_withdrawn',
+  'supersede': 'card_superseded',
+  'revoke-authority': 'card_authority_revoked',
+  'stop-new-matches': 'card_stopped_new_matches',
+}
+
 function requireVerbSignature(req: any, res: any, cardId: string, verb: string): string | null {
   const { signature, public_key } = req.body ?? {}
   if (!signature || !public_key) { res.status(401).json({ error: 'signature and public_key required' }); return null }
@@ -232,6 +290,7 @@ for (const [verb, status] of Object.entries(VERB_STATUS)) {
     if (verb !== 'supersede') v3db.removeFromIndex(cardId)
     // A card that is no longer active must not keep generating matches.
     if (status !== 'active') matchesDb.deleteMatchArtifacts(cardId)
+    recordCardEvent(VERB_EVENT[verb], cardId, key, { revocation_status: status })
     res.json({ card_id: cardId, revocation_status: status })
   })
 }
@@ -244,6 +303,7 @@ router.post('/cards/:cardId/delete-server-copy', rateLimited('verb', req => Stri
   matchesDb.deleteMatchArtifacts(cardId)
   // Deleting the server copy also removes the principal's notification email.
   notifyDb.deleteSubscription(key)
+  recordCardEvent('card_server_copy_deleted', cardId, key, {})
   res.json({ card_id: cardId, revocation_status: 'deleted' })
 })
 
