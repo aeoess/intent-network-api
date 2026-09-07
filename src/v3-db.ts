@@ -234,52 +234,6 @@ export function sweepExpiredV3Cards(): { swept: number } {
   return { swept: res.changes }
 }
 
-/** One-time reclassification for rows the old sweep marked 'withdrawn'.
- *
- *  The old sweep and a user withdrawal wrote the same status, so the row alone
- *  cannot say which happened. The one signal that survives is updated_at: the
- *  sweep can only touch a row whose expires_at has already passed, so it always
- *  stamps updated_at AFTER expires_at, while a principal withdrawing a live card
- *  stamps it BEFORE. Rows are moved to 'expired' only on that strict ordering.
- *
- *  The rule has one blind spot and it is not closed here: a principal who
- *  withdraws a card that has ALREADY lapsed also writes updated_at > expires_at,
- *  and is reclassified as expired. Nothing in the row distinguishes that case,
- *  which is exactly why the ledger exists from now on.
- *
- *  Returns what it moved and what it left, so the counts can be read before and
- *  after rather than asserted. */
-export function migrateSweptWithdrawnToExpired(opts: { dryRun?: boolean } = {}): MigrationResult {
-  const dd = d()
-  const candidates = dd.prepare(
-    `SELECT card_id, subject_key, expires_at, updated_at FROM v3_cards
-     WHERE revocation_status = 'withdrawn' AND expires_at <= ${SQL_NOW_ISO}`,
-  ).all() as any[]
-  const sweptLooking = candidates.filter(r => r.updated_at > r.expires_at)
-  const result: MigrationResult = {
-    moved: sweptLooking.length,
-    kept_withdrawn: candidates.length - sweptLooking.length,
-    moved_card_ids: sweptLooking.map(r => r.card_id),
-    kept_card_ids: candidates.filter(r => !(r.updated_at > r.expires_at)).map(r => r.card_id),
-  }
-  if (opts.dryRun) return result
-  const upd = dd.prepare("UPDATE v3_cards SET revocation_status = 'expired' WHERE card_id = ?")
-  for (const row of sweptLooking) {
-    upd.run(row.card_id)
-    recordCardEvent('card_expired', row.card_id, row.subject_key, {
-      migrated_from: 'withdrawn', expires_at: row.expires_at, updated_at: row.updated_at,
-    })
-  }
-  return result
-}
-
-export interface MigrationResult {
-  moved: number
-  kept_withdrawn: number
-  moved_card_ids: string[]
-  kept_card_ids: string[]
-}
-
 export function v3CardCount(): number {
   return (d().prepare(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`).get() as any).n
 }
@@ -365,8 +319,24 @@ export interface V3CardCounts {
   cards_expired: number
   cards_withdrawn: number
   cards_deleted: number
+  cards_legacy_status_ambiguous: number
   subjects_lifetime: number
   subjects_active: number
+}
+
+/** The moment protocol 3.2.0 went live, before which the expiry sweep wrote
+ *  'withdrawn' for a card that had merely lapsed. Rows created before it whose
+ *  status reads 'withdrawn' past their expiry cannot be told apart from a real
+ *  withdrawal, so they are counted but never reinterpreted.
+ *
+ *  Set MINGLE_V32_DEPLOYED_AT to the deploy timestamp (ISO). While it is unset
+ *  the marker is the current time, so every candidate row counts as ambiguous:
+ *  before the deploy that is exactly right, and after it the number is an
+ *  overcount that shrinks to the truth the moment the operator sets the var.
+ *  An overcount is the safe direction - it never claims certainty it lacks. */
+export function v32DeployMarker(): string {
+  const set = process.env.MINGLE_V32_DEPLOYED_AT
+  return set && !Number.isNaN(Date.parse(set)) ? new Date(set).toISOString() : new Date().toISOString()
 }
 
 export function v3CardCounts(): V3CardCounts {
@@ -378,8 +348,18 @@ export function v3CardCounts(): V3CardCounts {
     // Expired counts the sweep's own status AND rows that have passed their
     // expiry but no sweep has reached yet: both are expired in fact.
     cards_expired: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'expired' OR (revocation_status = 'active' AND expires_at <= ${SQL_NOW_ISO})`),
+    // Ambiguous rows stay counted here, as they always were: nothing is moved.
     cards_withdrawn: one("SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn'"),
     cards_deleted: one("SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'deleted'"),
+    // A subset of cards_withdrawn, not a separate bucket: rows old enough that
+    // the sweep of the day could have written that status. created_at is a
+    // coarse proxy for when the status was written (a long-lived card withdrawn
+    // after the deploy is still counted), so this is an upper bound on how much
+    // of cards_withdrawn cannot be trusted to mean a deliberate exit.
+    cards_legacy_status_ambiguous: one(
+      `SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND expires_at <= ${SQL_NOW_ISO} AND created_at < ?`,
+      v32DeployMarker(),
+    ),
     subjects_lifetime: one('SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards'),
     subjects_active: one(`SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`),
   }

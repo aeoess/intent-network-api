@@ -162,38 +162,6 @@ test('every eligibility filter requires active AND unexpired', () => {
   db.getDb().prepare('DELETE FROM v3_cards WHERE card_id = ?').run(cardId)
 })
 
-test('the withdrawn-to-expired migration moves only rows the sweep could have touched', () => {
-  const now = Date.now()
-  const past = new Date(now - 864e5).toISOString()
-  const ins = db.getDb().prepare(`INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, created_at, expires_at, revocation_status, updated_at)
-    VALUES (?, 'connection', ?, 'h', '{}', 'm', '[]', ?, ?, 'withdrawn', ?)`)
-  // Swept: updated_at AFTER expires_at (only the sweep can produce that).
-  ins.run('mig-swept', 'k1', past, past, new Date(now).toISOString())
-  // Genuinely withdrawn: updated_at BEFORE expires_at.
-  ins.run('mig-user', 'k2', past, past, new Date(now - 2 * 864e5).toISOString())
-
-  // Scoped to the two probe rows: earlier tests leave their own withdrawn rows
-  // in this shared DB, so the assertions name ids rather than global totals.
-  const dry = v3db.migrateSweptWithdrawnToExpired({ dryRun: true })
-  assert.ok(dry.moved_card_ids.includes('mig-swept'), 'a sweep-stamped row must be selected')
-  assert.ok(dry.kept_card_ids.includes('mig-user'), 'a principal-stamped row must be left alone')
-  assert.equal(v3db.getV3Card('mig-swept')!.revocation_status, 'withdrawn', 'dry run must not write')
-
-  const real = v3db.migrateSweptWithdrawnToExpired()
-  assert.ok(real.moved_card_ids.includes('mig-swept'))
-  assert.ok(real.kept_card_ids.includes('mig-user'))
-  assert.equal(real.moved, real.moved_card_ids.length, 'the count must be the ids it actually moved')
-  assert.equal(v3db.getV3Card('mig-swept')!.revocation_status, 'expired')
-  assert.equal(v3db.getV3Card('mig-user')!.revocation_status, 'withdrawn',
-    'a row the sweep could not have written must keep the status the principal chose')
-
-  // Idempotent: a second run has nothing left to move for these ids.
-  const again = v3db.migrateSweptWithdrawnToExpired({ dryRun: true })
-  assert.equal(again.moved_card_ids.includes('mig-swept'), false)
-
-  db.getDb().prepare("DELETE FROM v3_cards WHERE card_id LIKE 'mig-%'").run()
-})
-
 // ══════════════════════════════════════════════════════════════
 // Part 2 - append-only card_events ledger
 // ══════════════════════════════════════════════════════════════
@@ -269,6 +237,42 @@ test('GET /api/stats reports v3 numbers from the v3 tables, and keeps the legacy
   assert.equal(stats.v3.matches_current, q('SELECT COUNT(*) AS n FROM v3_matches'))
   assert.equal(stats.v3.matches_lifetime, q("SELECT COUNT(*) AS n FROM card_events WHERE event = 'match_created'"))
   assert.equal(stats.v3.intros_requested, q("SELECT COUNT(*) AS n FROM card_events WHERE event = 'intro_requested'"))
+})
+
+test('cards_legacy_status_ambiguous bounds the withdrawn rows that cannot be trusted', async () => {
+  const past = new Date(Date.now() - 5 * 864e5).toISOString()
+  const future = new Date(Date.now() + 5 * 864e5).toISOString()
+  const ins = db.getDb().prepare(`INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, created_at, expires_at, revocation_status, updated_at)
+    VALUES (?, 'connection', ?, 'h', '{}', 'a', '[]', ?, ?, ?, ?)`)
+  // Ambiguous: withdrawn, past expiry, created before the marker.
+  ins.run('amb-old', 'ka', past, past, 'withdrawn', past)
+  // Not ambiguous: withdrawn but still live, so no sweep could have written it.
+  ins.run('amb-live', 'kb', past, future, 'withdrawn', past)
+  // Not ambiguous: an expired row already says expired.
+  ins.run('amb-expired', 'kc', past, past, 'expired', past)
+
+  const before = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
+  const d = db.getDb()
+  const q = (sql: string, ...p: unknown[]): number => (d.prepare(sql).get(...p) as any).n
+  assert.equal(before.cards_legacy_status_ambiguous, q(
+    `SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND expires_at <= ${db.SQL_NOW_ISO} AND created_at < ?`,
+    v3db.v32DeployMarker()))
+
+  // It is a SUBSET of cards_withdrawn, never a separate bucket added on top.
+  assert.ok(before.cards_legacy_status_ambiguous <= before.cards_withdrawn,
+    'the ambiguous count must be a subset of cards_withdrawn')
+  assert.ok(before.cards_legacy_status_ambiguous >= 1, 'the seeded ambiguous row must be counted')
+
+  // A marker before those rows existed excludes them: the marker is what moves.
+  process.env.MINGLE_V32_DEPLOYED_AT = '2000-01-01T00:00:00.000Z'
+  const withEarlyMarker = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
+  delete process.env.MINGLE_V32_DEPLOYED_AT
+  assert.equal(withEarlyMarker.cards_legacy_status_ambiguous, 0,
+    'nothing created after the deploy marker is ambiguous')
+  assert.equal(withEarlyMarker.cards_withdrawn, before.cards_withdrawn,
+    'the marker changes only the ambiguity bound, never where a row is counted')
+
+  d.prepare("DELETE FROM v3_cards WHERE card_id LIKE 'amb-%'").run()
 })
 
 test('matches_lifetime keeps counting after the live rows are deleted', async () => {

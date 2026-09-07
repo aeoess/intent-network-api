@@ -54,12 +54,14 @@ there are no accounts. Signatures use the Agent Passport System SDK
   shown, including for expired, withdrawn, superseded, and deleted cards.
 
 `revocation_status` is one of `active`, `stopped_new_matches`, `superseded`,
-`withdrawn`, `expired`, `authority_revoked`, `deleted`. `expired` is written by
-the expiry sweep when a card passes `expires_at`; `withdrawn` is written only by
-the principal's own signed `withdraw` verb. The two were the same value before
-3.2.0, which made every lapsed card read as a deliberate exit. A card row is
-never deleted by expiry; only the principal's own `delete-server-copy` removes
-content.
+`withdrawn`, `expired`, `authority_revoked`, `deleted`. From protocol 3.2.0
+automatic expiry writes `expired` and explicit withdrawal writes `withdrawn`;
+rows from before 3.2.0 that read `withdrawn` past their `expires_at` are
+ambiguous, because the sweep of the day wrote that same value, and they are not
+reinterpreted. They keep counting under `cards_withdrawn` in the stats, and
+`cards_legacy_status_ambiguous` reports an upper bound on how many of them
+cannot be trusted to mean a deliberate exit. A v3 card row is not deleted by
+expiry; only the principal's own `delete-server-copy` removes content.
 
 ### Publish and lifecycle
 - `POST /api/v3/cards` - publish a signed, hash-approved card. Publishing
