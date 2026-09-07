@@ -65,7 +65,9 @@ cannot be trusted to mean a deliberate exit.
 The boundary is a timestamp the server records for itself: the first time this
 build opens a database it writes `v3_2_deployed_at` into `schema_markers`, once,
 and never overwrites it. A row counts as ambiguous when its `updated_at` is
-older than that marker. Every path that changes `revocation_status` stamps
+older than that marker and its `expires_at` has passed; the sweep only ever
+touched lapsed rows, so a pre-marker withdrawal of a card that never lapsed can
+only have been the principal's own. Every path that changes `revocation_status` stamps
 `updated_at`, so a card withdrawn after the deploy is correctly excluded however
 old the card itself is. There is no configuration for this and nothing to set.
 

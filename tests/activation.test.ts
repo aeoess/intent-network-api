@@ -269,19 +269,23 @@ test('cards_legacy_status_ambiguous counts pre-marker withdrawals only', async (
   ins.run('mk-post', 'kb', before, before, 'withdrawn', after)
   // Not withdrawn at all.
   ins.run('mk-active', 'kc', before, after, 'active', before)
+  // Withdrawn before the marker but never lapsed: the sweep only touches expired
+  // rows, so this can only be the principal's own withdrawal. Not ambiguous.
+  ins.run('mk-pre-live', 'kd', before, after, 'withdrawn', before)
 
   const v3 = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
   const d = db.getDb()
   const counted = (id: string): number => (d.prepare(
-    "SELECT COUNT(*) AS n FROM v3_cards WHERE card_id = ? AND revocation_status = 'withdrawn' AND updated_at < ?",
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE card_id = ? AND revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
   ).get(id, marker) as any).n
 
   assert.equal(counted('mk-pre'), 1, 'a pre-marker withdrawn row is ambiguous')
   assert.equal(counted('mk-post'), 0, 'a post-marker withdrawal is the principal\'s own and is not counted')
   assert.equal(counted('mk-active'), 0, 'an active row is never counted')
+  assert.equal(counted('mk-pre-live'), 0, 'a pre-marker withdrawal of a card that never lapsed is not ambiguous')
 
   assert.equal(v3.cards_legacy_status_ambiguous, (d.prepare(
-    "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ?",
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
   ).get(marker) as any).n, 'the endpoint must match the query run directly')
   assert.ok(v3.cards_legacy_status_ambiguous >= 1, 'the seeded pre-marker row must be counted')
   assert.ok(v3.cards_legacy_status_ambiguous <= v3.cards_withdrawn,

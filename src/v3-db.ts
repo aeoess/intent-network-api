@@ -362,9 +362,10 @@ export function v3CardCounts(): V3CardCounts {
     // Still an upper bound, not a census: a principal who genuinely withdrew a
     // card before the marker is counted too, because nothing in the row can
     // distinguish that from the sweep's doing. With no marker recorded the count
-    // is 0 rather than a guess.
+    // is 0 rather than a guess. A pre-marker withdrawn card that never lapsed can only
+    // have been withdrawn by its principal, so only lapsed rows count.
     cards_legacy_status_ambiguous: marker === null ? 0 : one(
-      "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ?",
+      `SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ? AND expires_at <= ${SQL_NOW_ISO}`,
       marker,
     ),
     subjects_lifetime: one('SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards'),
