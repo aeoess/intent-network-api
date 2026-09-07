@@ -8,6 +8,8 @@ import type { AuthenticatedRequest } from './auth.js'
 import * as db from './db.js'
 import { embed, embedBatch } from './embeddings.js'
 import * as notify from './notifications.js'
+import * as v3db from './v3-db.js'
+import * as cardEvents from './card-events.js'
 import {
   computeRelevance, verifyIntentCard, isCardExpired,
 } from 'agent-passport-system'
@@ -561,13 +563,36 @@ router.post('/challenge/create', (req, res) => {
 
 router.get('/stats', (_req, res) => {
   const stats = db.getNetworkStats()
+  const { active_cards, pending_intros, ...counters } = stats
   res.json({
+    // Kept at the top level so existing callers do not break, but every one of
+    // these describes the 48h IntentCard path only. total_matches_computed in
+    // particular is incremented by v2 code alone and has always read 0 while
+    // v3_matches held rows; the v3 block below is the number that is true.
     ...stats,
+    legacy_v2: { ...counters, active_cards, pending_intros },
+    v3: v3Stats(),
     version: '0.4.0',
     protocol: 'agent-passport-system',
     uptime: process.uptime(),
   })
 })
+
+/** The v3 network, counted live from the v3 tables and the event ledger on
+ *  every request. Nothing here reads a stored counter. */
+function v3Stats(): Record<string, number> {
+  const cards = v3db.v3CardCounts()
+  return {
+    ...cards,
+    matches_current: db.tableCount('v3_matches'),
+    matches_lifetime: cardEvents.countEvents('match_created'),
+    handshakes_requested: cardEvents.countEvents('handshake_requested'),
+    handshakes_completed: cardEvents.countEvents('handshake_committed'),
+    intros_requested: cardEvents.countEvents('intro_requested'),
+    intros_accepted: cardEvents.countEvents('intro_accepted'),
+    first_steps_approved: cardEvents.countEvents('first_step_approved'),
+  }
+}
 
 // ══════════════════════════════════════
 // GET /api/health — Detailed health check
