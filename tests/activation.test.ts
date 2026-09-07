@@ -239,40 +239,55 @@ test('GET /api/stats reports v3 numbers from the v3 tables, and keeps the legacy
   assert.equal(stats.v3.intros_requested, q("SELECT COUNT(*) AS n FROM card_events WHERE event = 'intro_requested'"))
 })
 
-test('cards_legacy_status_ambiguous bounds the withdrawn rows that cannot be trusted', async () => {
-  const past = new Date(Date.now() - 5 * 864e5).toISOString()
-  const future = new Date(Date.now() + 5 * 864e5).toISOString()
+test('the 3.2.0 marker is written once and never moves', () => {
+  const marker = v3db.v32DeployMarker()
+  assert.ok(marker, 'a marker must exist after the schema is initialised')
+  assert.ok(!Number.isNaN(Date.parse(marker!)), 'the marker must be an ISO timestamp')
+
+  // Re-running the server's own stamp is what a restart looks like to this
+  // table. This calls the real write path, not a copy of it, so a change from
+  // INSERT OR IGNORE to INSERT OR REPLACE is caught here.
+  db.stampDeployMarkerOnce()
+  db.stampDeployMarkerOnce()
+  assert.equal(v3db.v32DeployMarker(), marker, 'a later start must never overwrite the marker')
+
+  const rows = (db.getDb().prepare('SELECT COUNT(*) AS n FROM schema_markers WHERE key = ?').get(db.V3_2_MARKER_KEY) as any).n
+  assert.equal(rows, 1, 'exactly one marker row')
+})
+
+test('cards_legacy_status_ambiguous counts pre-marker withdrawals only', async () => {
+  const marker = v3db.v32DeployMarker()!
+  const before = new Date(Date.parse(marker) - 864e5).toISOString()
+  const after = new Date(Date.parse(marker) + 864e5).toISOString()
   const ins = db.getDb().prepare(`INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, created_at, expires_at, revocation_status, updated_at)
     VALUES (?, 'connection', ?, 'h', '{}', 'a', '[]', ?, ?, ?, ?)`)
-  // Ambiguous: withdrawn, past expiry, created before the marker.
-  ins.run('amb-old', 'ka', past, past, 'withdrawn', past)
-  // Not ambiguous: withdrawn but still live, so no sweep could have written it.
-  ins.run('amb-live', 'kb', past, future, 'withdrawn', past)
-  // Not ambiguous: an expired row already says expired.
-  ins.run('amb-expired', 'kc', past, past, 'expired', past)
+  // Written before 3.2.0 existed: the sweep of the day and a real withdrawal
+  // produced this same value, so it is ambiguous.
+  ins.run('mk-pre', 'ka', before, before, 'withdrawn', before)
+  // Withdrawn AFTER the deploy, by the verb, on a card created long before it.
+  // Under the old created_at test this was miscounted; under updated_at it is not.
+  ins.run('mk-post', 'kb', before, before, 'withdrawn', after)
+  // Not withdrawn at all.
+  ins.run('mk-active', 'kc', before, after, 'active', before)
 
-  const before = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
+  const v3 = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
   const d = db.getDb()
-  const q = (sql: string, ...p: unknown[]): number => (d.prepare(sql).get(...p) as any).n
-  assert.equal(before.cards_legacy_status_ambiguous, q(
-    `SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND expires_at <= ${db.SQL_NOW_ISO} AND created_at < ?`,
-    v3db.v32DeployMarker()))
+  const counted = (id: string): number => (d.prepare(
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE card_id = ? AND revocation_status = 'withdrawn' AND updated_at < ?",
+  ).get(id, marker) as any).n
 
-  // It is a SUBSET of cards_withdrawn, never a separate bucket added on top.
-  assert.ok(before.cards_legacy_status_ambiguous <= before.cards_withdrawn,
+  assert.equal(counted('mk-pre'), 1, 'a pre-marker withdrawn row is ambiguous')
+  assert.equal(counted('mk-post'), 0, 'a post-marker withdrawal is the principal\'s own and is not counted')
+  assert.equal(counted('mk-active'), 0, 'an active row is never counted')
+
+  assert.equal(v3.cards_legacy_status_ambiguous, (d.prepare(
+    "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ?",
+  ).get(marker) as any).n, 'the endpoint must match the query run directly')
+  assert.ok(v3.cards_legacy_status_ambiguous >= 1, 'the seeded pre-marker row must be counted')
+  assert.ok(v3.cards_legacy_status_ambiguous <= v3.cards_withdrawn,
     'the ambiguous count must be a subset of cards_withdrawn')
-  assert.ok(before.cards_legacy_status_ambiguous >= 1, 'the seeded ambiguous row must be counted')
 
-  // A marker before those rows existed excludes them: the marker is what moves.
-  process.env.MINGLE_V32_DEPLOYED_AT = '2000-01-01T00:00:00.000Z'
-  const withEarlyMarker = (await fetch(`${base}/api/stats`).then(r => r.json())).v3
-  delete process.env.MINGLE_V32_DEPLOYED_AT
-  assert.equal(withEarlyMarker.cards_legacy_status_ambiguous, 0,
-    'nothing created after the deploy marker is ambiguous')
-  assert.equal(withEarlyMarker.cards_withdrawn, before.cards_withdrawn,
-    'the marker changes only the ambiguity bound, never where a row is counted')
-
-  d.prepare("DELETE FROM v3_cards WHERE card_id LIKE 'amb-%'").run()
+  d.prepare("DELETE FROM v3_cards WHERE card_id LIKE 'mk-%'").run()
 })
 
 test('matches_lifetime keeps counting after the live rows are deleted', async () => {

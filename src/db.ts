@@ -91,6 +91,11 @@ function initSchema(): void {
       stat_value INTEGER NOT NULL DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS schema_markers (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     INSERT OR IGNORE INTO network_stats (stat_key, stat_value) VALUES
       ('total_cards_published', 0),
       ('total_matches_computed', 0),
@@ -147,6 +152,30 @@ function initSchema(): void {
     );
   `)
 
+  stampDeployMarkerOnce()
+}
+
+export const V3_2_MARKER_KEY = 'v3_2_deployed_at'
+
+/** Stamp when this build first opened this database. On the production database
+ *  that first open IS the 3.2.0 deploy, which is what makes the marker
+ *  meaningful: every status written before it came from code that could not tell
+ *  an expiry from a withdrawal.
+ *
+ *  INSERT OR IGNORE, so the value is written once and every later start leaves
+ *  it exactly as it is. initSchema calls this on every start; calling it again
+ *  is what a restart looks like to this table, which is how it is tested. */
+export function stampDeployMarkerOnce(): void {
+  getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
+    .run(V3_2_MARKER_KEY, new Date().toISOString())
+}
+
+/** A recorded marker, or null when this database has never had one written.
+ *  Null is a real answer, not a default to paper over: a caller that needs a
+ *  before/after boundary and has no marker must say so rather than guess. */
+export function getSchemaMarker(key: string): string | null {
+  const row = getDb().prepare('SELECT value FROM schema_markers WHERE key = ?').get(key) as any
+  return row?.value ?? null
 }
 
 // ══════════════════════════════════════

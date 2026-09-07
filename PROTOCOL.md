@@ -56,12 +56,21 @@ there are no accounts. Signatures use the Agent Passport System SDK
 `revocation_status` is one of `active`, `stopped_new_matches`, `superseded`,
 `withdrawn`, `expired`, `authority_revoked`, `deleted`. From protocol 3.2.0
 automatic expiry writes `expired` and explicit withdrawal writes `withdrawn`;
-rows from before 3.2.0 that read `withdrawn` past their `expires_at` are
+rows whose status was last written before 3.2.0 and reads `withdrawn` are
 ambiguous, because the sweep of the day wrote that same value, and they are not
 reinterpreted. They keep counting under `cards_withdrawn` in the stats, and
 `cards_legacy_status_ambiguous` reports an upper bound on how many of them
-cannot be trusted to mean a deliberate exit. A v3 card row is not deleted by
-expiry; only the principal's own `delete-server-copy` removes content.
+cannot be trusted to mean a deliberate exit.
+
+The boundary is a timestamp the server records for itself: the first time this
+build opens a database it writes `v3_2_deployed_at` into `schema_markers`, once,
+and never overwrites it. A row counts as ambiguous when its `updated_at` is
+older than that marker. Every path that changes `revocation_status` stamps
+`updated_at`, so a card withdrawn after the deploy is correctly excluded however
+old the card itself is. There is no configuration for this and nothing to set.
+
+A v3 card row is not deleted by expiry; only the principal's own
+`delete-server-copy` removes content.
 
 ### Publish and lifecycle
 - `POST /api/v3/cards` - publish a signed, hash-approved card. Publishing

@@ -7,7 +7,7 @@
 // in a separate vec table so 48h matching never sees v3 rows.
 
 import type { Database } from 'better-sqlite3'
-import { getDb, SQL_NOW_ISO } from './db.js'
+import { getDb, getSchemaMarker, SQL_NOW_ISO, V3_2_MARKER_KEY } from './db.js'
 import type { RevocationStatus, V3Card } from './v3-cards.js'
 import { networkVisibleView } from './v3-cards.js'
 import { recordCardEvent } from './card-events.js'
@@ -324,24 +324,22 @@ export interface V3CardCounts {
   subjects_active: number
 }
 
-/** The moment protocol 3.2.0 went live, before which the expiry sweep wrote
- *  'withdrawn' for a card that had merely lapsed. Rows created before it whose
- *  status reads 'withdrawn' past their expiry cannot be told apart from a real
- *  withdrawal, so they are counted but never reinterpreted.
+/** The moment protocol 3.2.0 first opened this database, before which the expiry
+ *  sweep wrote 'withdrawn' for a card that had merely lapsed. It is written once
+ *  into schema_markers on first start and never overwritten, so it survives
+ *  restarts, redeploys and process moves - nothing about it depends on an
+ *  environment variable staying set, or on anyone remembering to set it.
  *
- *  Set MINGLE_V32_DEPLOYED_AT to the deploy timestamp (ISO). While it is unset
- *  the marker is the current time, so every candidate row counts as ambiguous:
- *  before the deploy that is exactly right, and after it the number is an
- *  overcount that shrinks to the truth the moment the operator sets the var.
- *  An overcount is the safe direction - it never claims certainty it lacks. */
-export function v32DeployMarker(): string {
-  const set = process.env.MINGLE_V32_DEPLOYED_AT
-  return set && !Number.isNaN(Date.parse(set)) ? new Date(set).toISOString() : new Date().toISOString()
+ *  Rows whose status was last written before the marker cannot be told apart
+ *  from a real withdrawal, so they are counted but never reinterpreted. */
+export function v32DeployMarker(): string | null {
+  return getSchemaMarker(V3_2_MARKER_KEY)
 }
 
 export function v3CardCounts(): V3CardCounts {
   const dd = d()
   const one = (sql: string, ...params: unknown[]): number => (dd.prepare(sql).get(...params) as any).n
+  const marker = v32DeployMarker()
   return {
     cards_lifetime: one('SELECT COUNT(*) AS n FROM v3_cards'),
     cards_active: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`),
@@ -351,14 +349,23 @@ export function v3CardCounts(): V3CardCounts {
     // Ambiguous rows stay counted here, as they always were: nothing is moved.
     cards_withdrawn: one("SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn'"),
     cards_deleted: one("SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'deleted'"),
-    // A subset of cards_withdrawn, not a separate bucket: rows old enough that
-    // the sweep of the day could have written that status. created_at is a
-    // coarse proxy for when the status was written (a long-lived card withdrawn
-    // after the deploy is still counted), so this is an upper bound on how much
-    // of cards_withdrawn cannot be trusted to mean a deliberate exit.
-    cards_legacy_status_ambiguous: one(
-      `SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND expires_at <= ${SQL_NOW_ISO} AND created_at < ?`,
-      v32DeployMarker(),
+    // A subset of cards_withdrawn, never a bucket added on top: the withdrawn
+    // rows whose status was last written before 3.2.0, when the sweep and the
+    // withdraw verb produced the same value.
+    //
+    // The test is updated_at, not created_at, and that is the whole point: every
+    // path that changes revocation_status stamps updated_at (setRevocationStatus
+    // for the withdraw verb, deleteV3Card, and the sweep), so a long-lived card
+    // withdrawn AFTER the deploy carries a post-marker updated_at and is
+    // correctly left out. Under created_at it would have been counted.
+    //
+    // Still an upper bound, not a census: a principal who genuinely withdrew a
+    // card before the marker is counted too, because nothing in the row can
+    // distinguish that from the sweep's doing. With no marker recorded the count
+    // is 0 rather than a guess.
+    cards_legacy_status_ambiguous: marker === null ? 0 : one(
+      "SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'withdrawn' AND updated_at < ?",
+      marker,
     ),
     subjects_lifetime: one('SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards'),
     subjects_active: one(`SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`),
