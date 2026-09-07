@@ -33,3 +33,6 @@ specs/ERIK-NEWTON*
 /tmp-*.md
 /scratch-*.md
 *.private.md
+
+# build output: Railway builds from source (npm run build); never commit dist
+dist/
