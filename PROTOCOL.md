@@ -91,7 +91,7 @@ content.
 
 When a new pair is created, both sides are notified by email if and only if each
 has a confirmed notification address with `new_match` on. There is no other push
-channel: a subject without one is recorded in the event ledger and skipped. A
+channel: a subject without one is recorded in the event log and skipped. A
 recomputation that re-derives an existing pair never notifies again.
 
 ### Introductions
@@ -126,6 +126,9 @@ Individual write endpoints enforce their own stricter per-hour caps and return
 - Match results and the digest are visible only to the card owner who signed.
 - Contact details are released only at mutual intro completion, to the two
   parties, and never to any third party or in any list.
-- Expiry never destroys a card row and never reports itself as a withdrawal.
-- The card event ledger is append-only: nothing in the server updates or
-  deletes a recorded event.
+- v3 expiry never reports itself as a withdrawal. Legacy 48h IntentCards are
+  still deleted on expiry, as they always were: their body was published under
+  an ephemeral promise and that promise is kept.
+- The card event log is append-only: nothing in the server updates or deletes
+  a recorded event. It is a log, not a tamper-evident ledger - it carries no
+  hash chain and no signature, and is the server's own account of what it did.

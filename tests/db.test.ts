@@ -16,6 +16,7 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'intent-net-db-test-'))
 process.env.DB_PATH = join(tmpDir, 'test.db')
 
 const db = await import('../src/db.js')
+const cardEvents = await import('../src/card-events.js')
 
 function makeCard(agentId: string, opts: { expiresInMs?: number, publicKey?: string, needs?: any[], offers?: any[] } = {}) {
   const now = Date.now()
@@ -78,7 +79,7 @@ test('re-publishing for the same agent updates in place (one card per agent)', (
   assert.equal((fetched!.needs![0] as any).description, 'UPDATED need')
 })
 
-test('expired cards are marked, kept, and not returned', () => {
+test('expired cards are deleted, and their disappearance is recorded', () => {
   const stale = makeCard('ghost-agent', { expiresInMs: -60_000 }) // already expired
   // Insert directly (publishCard purges first, so raw insert)
   db.getDb().prepare(`
@@ -88,13 +89,27 @@ test('expired cards are marked, kept, and not returned', () => {
 
   assert.equal(db.getCard('ghost-agent'), null, 'expired card must not be returned')
   db.purgeExpired()
-  const row = db.getDb().prepare('SELECT COUNT(*) as c, MAX(expired_at) as e FROM cards WHERE agent_id = ?').get('ghost-agent') as any
-  assert.equal(row.c, 1, 'the expired card row must SURVIVE the purge (history is not destroyed)')
-  assert.ok(row.e, 'the purge must stamp expired_at')
-  assert.equal(db.getCard('ghost-agent'), null, 'a kept expired row is still never returned as active')
+  const row = db.getDb().prepare('SELECT COUNT(*) as c FROM cards WHERE agent_id = ?').get('ghost-agent') as any
+  assert.equal(row.c, 0, 'the 48h body was published under an ephemeral promise and must be deleted')
+
+  // Deleted, but no longer silently: exactly one event says so.
+  const evs = cardEvents.eventsForCard(stale.cardId).filter(e => e.event === 'card_expired')
+  assert.equal(evs.length, 1, 'exactly one card_expired event per deleted row')
+  assert.equal(evs[0].subject_key, 'ghost-agent', 'the event records agent_id as the subject')
+  const detail = JSON.parse(evs[0].detail_json!)
+  assert.equal(detail.expires_at, stale.expiresAt, 'the event records when it lapsed')
+
+  // The event must not smuggle the body back in.
+  assert.deepEqual(Object.keys(detail), ['expires_at'], 'the event carries nothing but the expiry timestamp')
+  const raw = JSON.stringify(evs[0])
+  assert.equal(raw.includes(stale.principalAlias), false, 'no principal alias in the event')
+  assert.equal(raw.includes('card_json'), false, 'no card body in the event')
+  for (const need of stale.needs ?? []) {
+    assert.equal(raw.includes(need.description), false, 'no card content in the event')
+  }
 })
 
-test('purge is the only sweep and it never deletes a card row', () => {
+test('the purge deletes only what has lapsed, once, and leaves live cards alone', () => {
   const live = makeCard('kept-agent')
   db.publishCard(live)
   const stale = makeCard('lapsed-agent', { expiresInMs: -60_000 })
@@ -104,12 +119,18 @@ test('purge is the only sweep and it never deletes a card row', () => {
   `).run(stale.cardId, stale.agentId, stale.publicKey, stale.principalAlias, JSON.stringify(stale), stale.createdAt, stale.expiresAt)
 
   const before = (db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c
-  db.purgeExpired(); db.purgeExpired()   // idempotent, and still non-destructive
+  db.purgeExpired(); db.purgeExpired()   // second run has nothing left to do
   const after = (db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c
-  assert.equal(after, before, 'repeated purges must not remove any card row')
-  // The explicit user delete path is untouched and still removes the row.
-  assert.equal(db.removeCard(stale.cardId, stale.publicKey), true)
-  assert.equal((db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c, before - 1)
+  assert.equal(after, before - 1, 'the lapsed row goes, the live one stays')
+  assert.ok(db.getCard('kept-agent'), 'a live card is untouched by the purge')
+
+  // One event, not two: the second purge found nothing to record.
+  const evs = cardEvents.eventsForCard(stale.cardId).filter(e => e.event === 'card_expired')
+  assert.equal(evs.length, 1, 'a re-run must not record the same expiry twice')
+
+  // The explicit user delete path is untouched and still removes a live row.
+  assert.equal(db.removeCard(live.cardId, live.publicKey), true)
+  assert.equal((db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c, after - 1)
 })
 
 test('removeCard requires the owning public key', () => {

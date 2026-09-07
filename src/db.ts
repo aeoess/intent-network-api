@@ -8,6 +8,7 @@ import Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
 import { join } from 'node:path'
 import type { IntentCard, IntroRequest, IntroResponse, RelevanceMatch } from 'agent-passport-system'
+import { ensureCardEventsSchema, recordCardEventStrict } from './card-events.js'
 
 // DB_PATH is resolved lazily (inside getDb) rather than at module load,
 // so tests can point DB_PATH at a temp file before the first connection
@@ -146,14 +147,6 @@ function initSchema(): void {
     );
   `)
 
-  // ── cards.expired_at (added when purgeExpired stopped deleting rows) ──
-  // A lapsed 48h card is marked, not destroyed. Reads already filter on
-  // expires_at, so the column records WHEN the sweep noticed rather than
-  // gating anything; the row surviving is the point.
-  const cardCols = d.prepare('PRAGMA table_info(cards)').all() as any[]
-  if (!cardCols.some(c => c.name === 'expired_at')) {
-    d.exec('ALTER TABLE cards ADD COLUMN expired_at TEXT')
-  }
 }
 
 // ══════════════════════════════════════
@@ -162,21 +155,17 @@ function initSchema(): void {
 
 export function publishCard(card: IntentCard): { published: boolean; error?: string } {
   const d = getDb()
-  // Mark anything that has lapsed first (rows are kept, not deleted)
+  // Remove expired cards first
   purgeExpired()
 
   // Check if agent already has a card (one card per agent)
-  const existing = d.prepare('SELECT card_id, expired_at FROM cards WHERE agent_id = ?').get(card.agentId) as any
+  const existing = d.prepare('SELECT card_id FROM cards WHERE agent_id = ?').get(card.agentId) as any
   if (existing) {
-    // Update existing card. Reviving a lapsed row clears its expiry mark and
-    // counts as a publication: before purgeExpired stopped deleting, the lapsed
-    // row was gone and this path INSERTed, so the lifetime total must keep
-    // counting the same events it counted then.
+    // Update existing card
     d.prepare(`
-      UPDATE cards SET card_json = ?, principal_alias = ?, expires_at = ?, expired_at = NULL, updated_at = datetime('now')
+      UPDATE cards SET card_json = ?, principal_alias = ?, expires_at = ?, updated_at = datetime('now')
       WHERE agent_id = ?
     `).run(JSON.stringify(card), card.principalAlias, card.expiresAt, card.agentId)
-    if (existing.expired_at) incrementStat('total_cards_published')
     return { published: true }
   }
 
@@ -317,24 +306,39 @@ export function checkRateLimit(publicKey: string, action: string, maxPerHour: nu
 // Utilities
 // ══════════════════════════════════════
 
-/** Mark what has lapsed. This used to DELETE expired `cards` rows, which meant
- *  the network destroyed its own history every time anyone read a card: the
- *  lifetime totals could never be recomputed, and a principal's expired card
- *  vanished instead of showing that it had run out. Nothing here removes a card
- *  row now. The only two paths that still delete one are the explicit user
- *  actions - delete-server-copy (v3) and removeCard by card_id + public_key -
- *  and both are left exactly as they were.
+/** Delete what has lapsed, after recording that it lapsed.
  *
- *  Every "active" read already filters on `expires_at > now`, so keeping the
- *  rows changes no read result; it only stops the data from being destroyed. */
+ *  A legacy 48h IntentCard is published under an ephemeral promise: the body
+ *  goes away when the card runs out. Keeping the row past expiry would quietly
+ *  change that promise for cards whose principals accepted the old one, so the
+ *  DELETE stays exactly as it was on main.
+ *
+ *  What is new is that the disappearance is no longer silent. One card_expired
+ *  event per row is written FIRST, carrying the card_id, the agent_id as the
+ *  subject, and the expiry timestamp - and nothing from the card body. Event
+ *  and delete run in one transaction through recordCardEventStrict, which
+ *  throws rather than swallowing, so a row can never be destroyed without the
+ *  event that says it was. This is the one site in the codebase where an event
+ *  and the change it records commit together; card-events.ts lists the rest. */
 export function purgeExpired(): number {
   const d = getDb()
-  const cards = d.prepare(`UPDATE cards SET expired_at = ${SQL_NOW_ISO} WHERE expires_at <= ${SQL_NOW_ISO} AND expired_at IS NULL`).run()
+  ensureCardEventsSchema()   // DDL must not run inside the transaction below
+  const purgeCards = d.transaction((): number => {
+    const expiring = d.prepare(
+      `SELECT card_id, agent_id, expires_at FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`,
+    ).all() as any[]
+    for (const row of expiring) {
+      // detail carries no card body: the promise was that the content goes.
+      recordCardEventStrict(d, 'card_expired', row.card_id, row.agent_id, { expires_at: row.expires_at })
+    }
+    return d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run().changes
+  })
+  const cards = purgeCards()
   const intros = d.prepare(`UPDATE intros SET status = 'expired' WHERE status = 'pending' AND expires_at <= ${SQL_NOW_ISO}`).run()
   // Clean old rate limit windows (older than 2 hours)
   const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
   d.prepare('DELETE FROM rate_limits WHERE window_start < ?').run(cutoff)
-  return cards.changes + intros.changes
+  return cards + intros.changes
 }
 
 function incrementStat(key: string): void {

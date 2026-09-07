@@ -1,15 +1,45 @@
 // ══════════════════════════════════════════════════════════════
-// Mingle - append-only card event ledger (additive)
+// Mingle - append-only card event log (additive)
 // ══════════════════════════════════════════════════════════════
 // Every consequential transition a card goes through writes one row here and
 // nothing ever updates or deletes one. That is the point: the stats surface and
-// any later audit read history from this table rather than from mutable
+// any later review read history from this table rather than from mutable
 // counters, so a number can be traced back to the events that produced it.
 //
-// recordCardEvent never throws into a caller. An event that cannot be written
-// is a lost line in a log; a publish or a match that fails because the log
-// failed would be a far worse outcome, so the write is wrapped the way
-// finalizePublish wraps its embedding and match work.
+// This is an event log, not an audit ledger. It is not a tamper-evident record
+// and it does not claim to be one: rows carry no hash chain and no signature,
+// and a writer with database access can rewrite history without leaving a
+// trace. Do not cite it as proof of what happened; cite it as the server's own
+// account of what it did.
+//
+// TRANSACTIONALITY. Event insertion is NOT transactional with every state
+// change it records. Two shapes exist and the difference matters when reading
+// a count:
+//
+//   In-transaction (event and state change commit or roll back together):
+//     - legacy card expiry in db.ts purgeExpired, via recordCardEventStrict
+//       inside the same better-sqlite3 transaction as the DELETE.
+//
+//   Best-effort, NOT in a transaction with the change (every other site):
+//     - card_published, card_renewed, card_server_copy_deleted and the four
+//       revocation verbs (v3-routes.ts)
+//     - card_expired from the v3 sweep (v3-db.ts) - the events are written
+//       after the UPDATE commits
+//     - embedding_stored / embedding_failed, match_notified /
+//       match_notify_skipped (v3-routes.ts)
+//     - matching_started, match_created, match_removed, match_dismissed
+//       (matches-db.ts)
+//     - digest_read (match-routes.ts)
+//     - intro_requested / intro_accepted / intro_declined (intros-routes.ts)
+//     - handshake_requested / handshake_committed, first_step_proposed /
+//       first_step_approved (fit-v4-routes.ts)
+//     - handshake_closed (fit-routes.ts)
+//
+// At those sites recordCardEvent swallows its own failure, so a lost event
+// leaves the state change standing. That is deliberate - a publish must not
+// fail because a log line could not be written - but it means an event count
+// is a floor, not a guarantee. recordCardEventStrict is the opposite: it
+// throws, so a caller inside a transaction rolls the state change back with it.
 //
 // There is deliberately no update or delete statement in this module, and a
 // test greps src/ to keep it that way.
@@ -40,7 +70,7 @@ function d(): Database {
   return getDb()
 }
 
-/** The transitions this ledger records. Listing them as a closed set keeps a
+/** The transitions this log records. Listing them as a closed set keeps a
  *  typo from silently creating a new event name that no stats query counts. */
 export const CARD_EVENTS = [
   'card_published',
@@ -72,7 +102,15 @@ export const CARD_EVENTS = [
 
 export type CardEvent = typeof CARD_EVENTS[number]
 
-/** Append one event. Insert-only, and never throws into the caller's response. */
+/** Create the table if it does not exist yet. Callers that need to write an
+ *  event inside their own transaction must call this first: the lazy creation
+ *  in d() would otherwise run DDL from inside that transaction. */
+export function ensureCardEventsSchema(): void {
+  if (!initialized) initCardEventsSchema()
+}
+
+/** Append one event. Insert-only, and never throws into the caller's response.
+ *  Use this everywhere except inside a transaction the event must share. */
 export function recordCardEvent(
   event: CardEvent,
   cardId: string | null,
@@ -87,7 +125,23 @@ export function recordCardEvent(
   }
 }
 
-// ── Read helpers (stats, tests, audit) ────────────────────────────────────
+/** Append one event on an explicit connection and THROW on failure, so a caller
+ *  running inside a transaction rolls its own state change back rather than
+ *  committing a change the log does not record. The connection is passed in
+ *  rather than fetched, so this module never reaches back into db.ts on the
+ *  transactional path. */
+export function recordCardEventStrict(
+  conn: Database,
+  event: CardEvent,
+  cardId: string | null,
+  subjectKey: string | null,
+  detail?: Record<string, unknown>,
+): void {
+  conn.prepare('INSERT INTO card_events (card_id, subject_key, event, detail_json) VALUES (?, ?, ?, ?)')
+    .run(cardId, subjectKey, event, detail ? JSON.stringify(detail) : null)
+}
+
+// ── Read helpers (stats, tests, review) ────────────────────────────────────
 
 export function countEvents(event: CardEvent): number {
   return (d().prepare('SELECT COUNT(*) AS n FROM card_events WHERE event = ?').get(event) as any).n
