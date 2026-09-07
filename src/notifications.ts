@@ -157,6 +157,22 @@ export async function notifyFitRecordReady(recipientKey: string, exchangeId: str
     fitRecordReadyEmail(sub.email, sub.unsub_token), true)
 }
 
+export function newMatchEmail(to: string, counterpartHeadline: string, unsubToken: string): OutgoingEmail {
+  return {
+    to,
+    subject: 'A new match on Mingle',
+    text: `A card published on Mingle overlaps with one of yours.\n\nThe other side: ${counterpartHeadline || '(no headline provided)'}\n\nOpen your assistant and say: show my Mingle digest. Nothing is shared with them, and no introduction has been requested.${FOOTER(unsubToken)}`,
+  }
+}
+
+/** New-match push. NON-direct: nobody acted, so it counts against the daily cap,
+ *  and the dedupe id is the unordered card pair, so a recompute that re-derives
+ *  the same pair can never mail the same person about it twice. */
+export async function notifyNewMatch(recipientKey: string, pairId: string, counterpartHeadline: string): Promise<{ sent: boolean; reason?: string }> {
+  return dispatch(recipientKey, pairId, 'new_match', 'new_match', sub =>
+    newMatchEmail(sub.email, counterpartHeadline, sub.unsub_token), false)
+}
+
 /** First-step proposal notice. Content-free, and NON-direct: it counts toward
  *  the one-per-day cap (not an urgent action, just a nudge). */
 export async function notifyFirstStepProposed(recipientKey: string, introId: string): Promise<{ sent: boolean; reason?: string }> {

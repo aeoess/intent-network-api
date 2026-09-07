@@ -15,10 +15,11 @@ import * as matchesDb from './matches-db.js'
 import * as introsDb from './intros-db.js'
 import * as reportsDb from './reports-db.js'
 import * as email from './notifications.js'
+import { recordCardEvent } from './card-events.js'
 
 const router = Router()
 
-const PROTOCOL = { name: 'mingle-v3', version: '3.1.0' }
+const PROTOCOL = { name: 'mingle-v3', version: '3.2.0' }
 const RATE_LIMIT_CEILING = 600
 
 function checkSig(payload: string, signature: unknown, key: unknown): boolean {
@@ -60,7 +61,8 @@ router.get('/', (_req, res) => {
       'POST /api/v3/cards/search': 'Explicit-field + semantic search; supports created_after, cursor, limit',
       'POST /api/v3/cards/:cardId/renew': 'Re-sign identical content with a fresh expiry, superseding the old card',
       'POST /api/v3/cards/:cardId/withdraw|supersede|revoke-authority|stop-new-matches|delete-server-copy': 'Signed revocation verbs',
-      'GET /api/v3/digest': 'Signed. Your new matches, pending intros, and expiry countdown',
+      'GET /api/v3/digest': 'Signed. Your new matches, pending intros, and expiry countdown (advances your read marker)',
+      'GET /api/v3/matches/pending': 'Signed. Your new matches since the last digest, WITHOUT advancing the read marker (pollable)',
       'POST /api/v3/matches/dismiss': 'Signed. Dismiss one match from your side only',
       'POST /api/v3/report': 'Report a card (reason <= 200 chars, no URLs)',
       'GET /api/v3/intros/mine': 'Signed. Your introductions',
@@ -112,6 +114,7 @@ router.get('/digest', rateLimited('v3_digest', 60), (req, res) => {
   // Reading the digest advances the seen window for these cards.
   for (const id of cardIds) matchesDb.markSeenForCard(id)
   matchesDb.stampDigestCheck(public_key)
+  recordCardEvent('digest_read', null, public_key, { new_match_count: newMatches.length, cards: cardIds.length, previous_check: since })
 
   res.json({
     protocol: PROTOCOL.name,
@@ -121,6 +124,44 @@ router.get('/digest', rateLimited('v3_digest', 60), (req, res) => {
     pending_intros,
     card_expiry,
     previous_check: since,
+  })
+})
+
+// ── GET /api/v3/matches/pending (signed) ──────────────────────────────────
+// The same answer /digest gives about matches, without the side effects. A
+// client (or the MCP loop) can poll this on a timer and only call /digest when
+// the principal actually reads, so polling never silently consumes the
+// "new since last check" window. Same auth as /digest, different payload string
+// so a digest signature cannot be replayed here.
+
+router.get('/matches/pending', rateLimited('v3_pending', 120), (req, res) => {
+  const public_key = String(req.query.public_key ?? '')
+  const nonce = String(req.query.nonce ?? '')
+  const signature = String(req.query.signature ?? '')
+  if (!public_key || !nonce) { res.status(400).json({ error: 'public_key and nonce required' }); return }
+  if (!checkSig(`matches-pending:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
+
+  const cardIds = v3db.activeCardIdsForSubject(public_key)
+  const since = matchesDb.getLastDigestCheck(public_key)
+  const pending = matchesDb.newMatchesForCardsSince(cardIds, since)
+    .sort((a, b) => (a.computed_at < b.computed_at ? 1 : -1))
+    .map(m => ({
+      card_id: m.card_id,
+      other_card_id: m.other_card_id,
+      computed_at: m.computed_at,
+      matched_intents: m.matched_intents,
+      agreed_fields: m.agreed_fields,
+      counterpart_snippets: m.counterpart_snippets,
+      overlap_count: m.overlap_count,
+    }))
+
+  res.json({
+    protocol: PROTOCOL.name,
+    pending_count: pending.length,
+    ordering: 'recency',
+    pending_matches: pending,
+    since,
+    note: 'Reading this does not advance your digest marker; GET /api/v3/digest does.',
   })
 })
 

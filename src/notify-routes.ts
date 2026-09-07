@@ -43,6 +43,7 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
     intro_request: prefs?.intro_request === undefined ? true : !!prefs.intro_request,
     intro_accepted: prefs?.intro_accepted === undefined ? true : !!prefs.intro_accepted,
     weekly_digest: prefs?.weekly_digest === undefined ? false : !!prefs.weekly_digest,
+    new_match: prefs?.new_match === undefined ? true : !!prefs.new_match,
   }
   const existing = notifyDb.getSubscription(subject_key)
   const verifyToken = randomBytes(24).toString('hex')
