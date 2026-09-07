@@ -145,6 +145,15 @@ function initSchema(): void {
       UNIQUE(intro_id, from_agent)
     );
   `)
+
+  // ── cards.expired_at (added when purgeExpired stopped deleting rows) ──
+  // A lapsed 48h card is marked, not destroyed. Reads already filter on
+  // expires_at, so the column records WHEN the sweep noticed rather than
+  // gating anything; the row surviving is the point.
+  const cardCols = d.prepare('PRAGMA table_info(cards)').all() as any[]
+  if (!cardCols.some(c => c.name === 'expired_at')) {
+    d.exec('ALTER TABLE cards ADD COLUMN expired_at TEXT')
+  }
 }
 
 // ══════════════════════════════════════
@@ -153,17 +162,21 @@ function initSchema(): void {
 
 export function publishCard(card: IntentCard): { published: boolean; error?: string } {
   const d = getDb()
-  // Remove expired cards first
+  // Mark anything that has lapsed first (rows are kept, not deleted)
   purgeExpired()
 
   // Check if agent already has a card (one card per agent)
-  const existing = d.prepare('SELECT card_id FROM cards WHERE agent_id = ?').get(card.agentId) as any
+  const existing = d.prepare('SELECT card_id, expired_at FROM cards WHERE agent_id = ?').get(card.agentId) as any
   if (existing) {
-    // Update existing card
+    // Update existing card. Reviving a lapsed row clears its expiry mark and
+    // counts as a publication: before purgeExpired stopped deleting, the lapsed
+    // row was gone and this path INSERTed, so the lifetime total must keep
+    // counting the same events it counted then.
     d.prepare(`
-      UPDATE cards SET card_json = ?, principal_alias = ?, expires_at = ?, updated_at = datetime('now')
+      UPDATE cards SET card_json = ?, principal_alias = ?, expires_at = ?, expired_at = NULL, updated_at = datetime('now')
       WHERE agent_id = ?
     `).run(JSON.stringify(card), card.principalAlias, card.expiresAt, card.agentId)
+    if (existing.expired_at) incrementStat('total_cards_published')
     return { published: true }
   }
 
@@ -304,9 +317,19 @@ export function checkRateLimit(publicKey: string, action: string, maxPerHour: nu
 // Utilities
 // ══════════════════════════════════════
 
+/** Mark what has lapsed. This used to DELETE expired `cards` rows, which meant
+ *  the network destroyed its own history every time anyone read a card: the
+ *  lifetime totals could never be recomputed, and a principal's expired card
+ *  vanished instead of showing that it had run out. Nothing here removes a card
+ *  row now. The only two paths that still delete one are the explicit user
+ *  actions - delete-server-copy (v3) and removeCard by card_id + public_key -
+ *  and both are left exactly as they were.
+ *
+ *  Every "active" read already filters on `expires_at > now`, so keeping the
+ *  rows changes no read result; it only stops the data from being destroyed. */
 export function purgeExpired(): number {
   const d = getDb()
-  const cards = d.prepare(`DELETE FROM cards WHERE expires_at <= ${SQL_NOW_ISO}`).run()
+  const cards = d.prepare(`UPDATE cards SET expired_at = ${SQL_NOW_ISO} WHERE expires_at <= ${SQL_NOW_ISO} AND expired_at IS NULL`).run()
   const intros = d.prepare(`UPDATE intros SET status = 'expired' WHERE status = 'pending' AND expires_at <= ${SQL_NOW_ISO}`).run()
   // Clean old rate limit windows (older than 2 hours)
   const cutoff = new Date(Date.now() - 2 * 3600 * 1000).toISOString()
@@ -327,6 +350,16 @@ export function getNetworkStats(): Record<string, number> {
   stats.active_cards = getCardCount()
   stats.pending_intros = (d.prepare('SELECT COUNT(*) as c FROM intros WHERE status = \'pending\'').get() as any).c
   return stats
+}
+
+/** Rows currently in one table, or 0 when the table has not been created yet.
+ *  The v3, match, and ledger schemas are all created lazily on first use, so a
+ *  stats call can legitimately arrive before any of them exist. */
+export function tableCount(table: string, where = ''): number {
+  const d = getDb()
+  const exists = d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
+  if (!exists) return 0
+  return (d.prepare(`SELECT COUNT(*) AS n FROM ${table} ${where}`).get() as any).n
 }
 
 export function closeDb(): void {

@@ -20,7 +20,11 @@ export const CARD_TYPES = ['connection', 'opportunity'] as const
 export const INTENTS = ['meet', 'collaborate', 'team_up', 'work', 'advise', 'mentor', 'cofound'] as const
 export const EVIDENCE_SOURCES = ['principal_statement', 'artifact_link', 'subject_binding', 'third_party_attestation'] as const
 export const VISIBILITY_LEVELS = ['private', 'network', 'intro_request', 'mutual_intro', 'thread_only'] as const
-export const REVOCATION_STATUSES = ['active', 'stopped_new_matches', 'superseded', 'withdrawn', 'authority_revoked', 'deleted'] as const
+// 'expired' is set by the sweep when a card passes expires_at; 'withdrawn' is
+// only ever set by the principal's own signed withdraw verb. They were the same
+// value until the sweep started saying what it actually did, which made every
+// lapsed card look like a deliberate exit.
+export const REVOCATION_STATUSES = ['active', 'stopped_new_matches', 'superseded', 'withdrawn', 'expired', 'authority_revoked', 'deleted'] as const
 
 export const DEFAULT_TTL_DAYS = 21
 

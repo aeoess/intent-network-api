@@ -243,9 +243,10 @@ test('expired cards are swept and leave search', async () => {
   })
   const body = await res.json()
   assert.equal((body.results as any[]).some(r => r.headline === 'Short-lived sweep probe'), false)
-  // status still shown on direct fetch after sweep
+  // status still shown on direct fetch after sweep, and it says EXPIRED: the
+  // sweep no longer claims the principal withdrew a card that simply lapsed.
   const fetched = await fetch(`${base}/api/v3/cards/${pub.body.card_id}`).then(r => r.json())
-  assert.equal(fetched.revocation_status, 'withdrawn')
+  assert.equal(fetched.revocation_status, 'expired')
 })
 
 // ── Revocation verbs (invariant 7) ──

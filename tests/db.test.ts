@@ -78,7 +78,7 @@ test('re-publishing for the same agent updates in place (one card per agent)', (
   assert.equal((fetched!.needs![0] as any).description, 'UPDATED need')
 })
 
-test('expired cards are purged and not returned', () => {
+test('expired cards are marked, kept, and not returned', () => {
   const stale = makeCard('ghost-agent', { expiresInMs: -60_000 }) // already expired
   // Insert directly (publishCard purges first, so raw insert)
   db.getDb().prepare(`
@@ -88,8 +88,28 @@ test('expired cards are purged and not returned', () => {
 
   assert.equal(db.getCard('ghost-agent'), null, 'expired card must not be returned')
   db.purgeExpired()
-  const row = db.getDb().prepare('SELECT COUNT(*) as c FROM cards WHERE agent_id = ?').get('ghost-agent') as any
-  assert.equal(row.c, 0, 'expired card row must be deleted')
+  const row = db.getDb().prepare('SELECT COUNT(*) as c, MAX(expired_at) as e FROM cards WHERE agent_id = ?').get('ghost-agent') as any
+  assert.equal(row.c, 1, 'the expired card row must SURVIVE the purge (history is not destroyed)')
+  assert.ok(row.e, 'the purge must stamp expired_at')
+  assert.equal(db.getCard('ghost-agent'), null, 'a kept expired row is still never returned as active')
+})
+
+test('purge is the only sweep and it never deletes a card row', () => {
+  const live = makeCard('kept-agent')
+  db.publishCard(live)
+  const stale = makeCard('lapsed-agent', { expiresInMs: -60_000 })
+  db.getDb().prepare(`
+    INSERT INTO cards (card_id, agent_id, public_key, principal_alias, card_json, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(stale.cardId, stale.agentId, stale.publicKey, stale.principalAlias, JSON.stringify(stale), stale.createdAt, stale.expiresAt)
+
+  const before = (db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c
+  db.purgeExpired(); db.purgeExpired()   // idempotent, and still non-destructive
+  const after = (db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c
+  assert.equal(after, before, 'repeated purges must not remove any card row')
+  // The explicit user delete path is untouched and still removes the row.
+  assert.equal(db.removeCard(stale.cardId, stale.publicKey), true)
+  assert.equal((db.getDb().prepare('SELECT COUNT(*) as c FROM cards').get() as any).c, before - 1)
 })
 
 test('removeCard requires the owning public key', () => {
