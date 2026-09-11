@@ -16,6 +16,7 @@ import { networkVisibleView } from './v3-cards.js'
 import * as email from './notifications.js'
 import { createFitExchangeForIntro } from './fit-routes.js'
 import { openV4HandshakeForIntro } from './fit-v4-routes.js'
+import { fitEnabled, FIT_DISABLED_TEXT } from './fit-gate.js'
 import { recordCardEvent } from './card-events.js'
 
 const router = Router()
@@ -109,11 +110,17 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
     // Prefer the v4 predicate handshake when both cards carry a Fit Policy for
     // the shared intent; otherwise fall back to the v3 question-bank exchange,
     // unchanged. Work never opens either (it is not a policy intent).
+    // Structured fit opens only while it is enabled. With the flag off the
+    // acceptance, the stored contact and the acceptance email are unchanged,
+    // and the response says fit is unavailable.
+    const fitOn = fitEnabled()
     let handshake: { id: string; mode: 'v4' } | null = null
     let fit: { id: string; consent_sheet: Record<string, unknown> } | null = null
-    try { handshake = openV4HandshakeForIntro(intro) } catch { /* never blocks accept */ }
-    if (!handshake) {
-      try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
+    if (fitOn) {
+      try { handshake = openV4HandshakeForIntro(intro) } catch { /* never blocks accept */ }
+      if (!handshake) {
+        try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
+      }
     }
     // Tell the requester now. The accepter's contact line is not in this email.
     // It is released only when the requester completes with their own contact.
@@ -127,6 +134,7 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
       fit_mode: handshake ? 'v4' : (fit ? 'v3' : null),
       fit_exchange: fit?.id ?? null,
       consent_sheet: fit?.consent_sheet ?? null,
+      ...(fitOn ? {} : { fit: { available: false, note: FIT_DISABLED_TEXT } }),
     })
     return
   }

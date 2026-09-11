@@ -20,7 +20,7 @@ import * as v3db from './v3-db.js'
 import { networkVisibleView } from './v3-cards.js'
 import * as fitDb from './fit-db.js'
 import * as introsDb from './intros-db.js'
-import { isOpenEndedLedgerItem, postGateDrafted, type PostGateInput } from './fit-gate.js'
+import { fitGate, isOpenEndedLedgerItem, postGateDrafted, type PostGateInput } from './fit-gate.js'
 import { assembleDraftingContext, renderQuestions, type RenderedQuestion } from './fit-context.js'
 import { sealRecord } from './fit-record.js'
 import { verifyReceipt, serverPublicKey } from './server-key.js'
@@ -186,7 +186,7 @@ router.get('/:id', rateLimited('fit_get', 60), (req, res) => {
 
 // ── POST /:id/answers - signed ticket ─────────────────────────────────────
 
-router.post('/:id/answers', rateLimited('fit_answer', 60), async (req, res) => {
+router.post('/:id/answers', fitGate, rateLimited('fit_answer', 60), async (req, res) => {
   const id = String(req.params.id)
   const { answers, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(answers) || answers.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'answers and nonce required' }); return }
@@ -253,7 +253,7 @@ router.post('/:id/answers', rateLimited('fit_answer', 60), async (req, res) => {
 
 // ── POST /:id/round2 - tell me more (<=3 questions) ───────────────────────
 
-router.post('/:id/round2', rateLimited('fit_answer', 60), (req, res) => {
+router.post('/:id/round2', fitGate, rateLimited('fit_answer', 60), (req, res) => {
   const g = partyGuard(req, res, 'fit-round2'); if (!g) return
   const { ex, key } = g
   const { question_ids } = req.body ?? {}
@@ -271,7 +271,7 @@ router.post('/:id/round2', rateLimited('fit_answer', 60), (req, res) => {
 
 // ── POST /:id/custom - ask up to 2 custom questions (post-gated) ───────────
 
-router.post('/:id/custom', rateLimited('fit_answer', 30), (req, res) => {
+router.post('/:id/custom', fitGate, rateLimited('fit_answer', 30), (req, res) => {
   const g = partyGuard(req, res, 'fit-custom'); if (!g) return
   const { ex, key } = g
   const { questions } = req.body ?? {}

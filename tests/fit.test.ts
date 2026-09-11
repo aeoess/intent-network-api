@@ -20,6 +20,9 @@ import { generateKeyPair, sign, canonicalize, verify } from 'agent-passport-syst
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-fit-test-'))
 process.env.DB_PATH = join(tmpDir, 'fit.db')
 process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
+// Structured fit runs only when MINGLE_FIT_ENABLED is exactly "1", and this
+// suite exercises the v3 fit exchange.
+process.env.MINGLE_FIT_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')

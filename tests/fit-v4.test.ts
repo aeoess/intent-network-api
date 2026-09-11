@@ -17,6 +17,10 @@ import { generateKeyPair, sign, canonicalize } from 'agent-passport-system'
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-v4-test-'))
 process.env.DB_PATH = join(tmpDir, 'v4.db')
 process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
+// Structured fit runs only when MINGLE_FIT_ENABLED is exactly "1". The suite
+// exercises fit, so it runs with the flag on. The gate tests at the end set it
+// per case and put it back.
+process.env.MINGLE_FIT_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')
@@ -855,4 +859,129 @@ test('FIRST STEP: only the two parties can read it', async () => {
   const stranger = { keys: generateKeyPair() }
   const g = await getFirstStep(stranger, hs.introId)
   assert.equal(g.error ?? 'blocked', g.error)
+})
+
+// ══════════════════════════════════════════════════════════════
+// The fit gate: MINGLE_FIT_ENABLED
+// ══════════════════════════════════════════════════════════════
+// Structured fit runs only when the flag is exactly "1". These tests drive the
+// disabled state and put the previous value back afterwards. That the same
+// setup opens a v4 handshake with the flag on is covered by the handshake tests
+// above, which run with the flag set at the top of this file.
+
+const GATE_TEXT = 'Agent fit is temporarily unavailable. You can still continue the introduction directly.'
+const GATED_V4 = ['request', 'commit', 'reveal', 'questions', 'answers', 'round2', 'first-step', 'first-step/approve']
+const GATED_V3 = ['answers', 'round2', 'custom']
+
+async function withFitFlag(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const before = process.env.MINGLE_FIT_ENABLED
+  if (value === undefined) delete process.env.MINGLE_FIT_ENABLED
+  else process.env.MINGLE_FIT_ENABLED = value
+  try {
+    await fn()
+  } finally {
+    if (before === undefined) delete process.env.MINGLE_FIT_ENABLED
+    else process.env.MINGLE_FIT_ENABLED = before
+  }
+}
+const postJson = (path: string): Promise<Response> =>
+  fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+
+test('FIT GATE: with the flag unset, accept stores the acceptance, emails the requester, and opens no fit', async () => {
+  const email = await import('../src/notifications.js')
+  const notifyDb = await import('../src/notify-db.js')
+  const introsDb = await import('../src/intros-db.js')
+  const aDims = [dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_exact', 'essential')]
+  const bDims = [dim('weekly_commitment', { min: 25, max: 30 }, 'reveal_exact', 'essential')]
+  // Both cards carry a policy for the intent, so with fit on this pair opens a v4 handshake.
+  const alice = makeCard('Alice gate', ['cofound']); const bob = makeCard('Bob gate', ['cofound'])
+  const aliceCard = await publish(alice); const bobCard = await publish(bob)
+  await setPolicy(alice, aliceCard, aDims); await setPolicy(bob, bobCard, bDims)
+  assert.ok(JSON.stringify(await getPolicy(alice, aliceCard)).includes('weekly_commitment'), "alice's policy is stored")
+  assert.ok(JSON.stringify(await getPolicy(bob, bobCard)).includes('weekly_commitment'), "bob's policy is stored")
+
+  notifyDb.upsertSubscription(alice.keys.publicKey, 'gate-req@example.com', 'vt-gate', 'ut-gate', { intro_request: true, intro_accepted: true, weekly_digest: false, new_match: false })
+  notifyDb.confirmByToken('vt-gate')
+  const sent: { subject: string }[] = []
+  email.setTransport(async (e: any) => { sent.push(e); return { ok: true, id: 'mock' } })
+  const exchanges = (): number => (db.getDb().prepare('SELECT COUNT(*) AS n FROM v3_fit_exchanges').get() as any).n
+  try {
+    const introId = await requestIntro(alice, aliceCard, bobCard, 'cofound')
+    const exchangesBefore = exchanges()
+    sent.length = 0
+    await withFitFlag(undefined, async () => {
+      const acc = await acceptIntro(bob, introId)
+      assert.equal(acc.status, 'accepted', JSON.stringify(acc))
+      assert.deepEqual(acc.fit, { available: false, note: GATE_TEXT })
+      assert.equal(acc.fit_handshake, null)
+      assert.equal(acc.fit_exchange, null)
+      assert.equal(handshakeDb.getHandshake(introId), null, 'no v4 handshake was opened')
+      assert.equal(exchanges(), exchangesBefore, 'no v3 exchange was opened')
+      const stored = introsDb.getIntro(introId)!
+      assert.equal(stored.status, 'accepted')
+      assert.ok(stored.to_contact, 'the acceptance contact is stored')
+      assert.equal(sent.filter(e => /was accepted/i.test(e.subject)).length, 1, 'the requester still gets the acceptance email')
+    })
+  } finally {
+    email.resetTransport()
+  }
+})
+
+test('FIT GATE: with the flag unset, every gated fit route answers 503 fit_disabled', async () => {
+  await withFitFlag(undefined, async () => {
+    for (const p of GATED_V4) {
+      const res = await postJson(`/api/v4/fit/intro-gate/${p}`)
+      assert.equal(res.status, 503, `v4 ${p}`)
+      assert.deepEqual(await res.json(), { error: GATE_TEXT, code: 'fit_disabled' }, `v4 ${p}`)
+    }
+    for (const p of GATED_V3) {
+      const res = await postJson(`/api/v3/fit/ex-gate/${p}`)
+      assert.equal(res.status, 503, `v3 ${p}`)
+      assert.deepEqual(await res.json(), { error: GATE_TEXT, code: 'fit_disabled' }, `v3 ${p}`)
+    }
+    // The gate runs before the rate limiter, so a refusal costs no quota. The
+    // suite clears rate_limits before each test, so this count is meaningful.
+    const quota = (db.getDb().prepare("SELECT COUNT(*) AS n FROM rate_limits WHERE action IN ('fitv4_hs', 'fit_answer')").get() as any).n
+    assert.equal(quota, 0, 'a refusal consumes no rate-limit quota')
+  })
+})
+
+test('FIT GATE: sanitizeSlot still strips control characters, with the class written as escapes', async () => {
+  const { sanitizeSlot } = await import('../src/fit-gate.js')
+  assert.equal(sanitizeSlot('a\u0000b\u001fc\u007fd'), 'a b c d')
+  assert.equal(sanitizeSlot('x\ny'), 'x y')
+  assert.equal(sanitizeSlot('<b>hi</b>'), 'hi')
+})
+
+test('FIT GATE: only the exact value "1" turns fit on', async () => {
+  for (const value of ['true', 'yes', '0', '']) {
+    await withFitFlag(value, async () => {
+      const res = await postJson('/api/v4/fit/intro-gate/request')
+      assert.equal(res.status, 503, `flag ${JSON.stringify(value)}`)
+      assert.equal((await res.json()).code, 'fit_disabled')
+    })
+  }
+})
+
+test('FIT GATE: settings, maintenance and reads keep working with the flag unset', async () => {
+  const dims = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
+  const alice = makeCard('Alice settings', ['cofound']); const aliceCard = await publish(alice)
+  await withFitFlag(undefined, async () => {
+    const sp = await setPolicy(alice, aliceCard, dims)
+    assert.notEqual(sp.status, 503, 'POST /policy is not gated')
+    assert.notEqual(sp.body?.code, 'fit_disabled')
+    const gp = await getPolicy(alice, aliceCard)
+    assert.equal(gp.error, undefined, 'GET /policy is not gated')
+    assert.ok(JSON.stringify(gp).includes('cadence'), 'the stored dimension reads back')
+    const g = await hsGet(alice, 'intro-none')
+    assert.match(String(g.error), /no handshake/, 'a GET on a handshake route still runs')
+    assert.equal((await postJson('/api/v3/fit/sweep')).status, 200, 'the fit sweep is not gated')
+    // The rest of the not-gated list. Each route's own validation may refuse the
+    // empty body, which is a pass. What must never come back is the gate.
+    for (const path of ['/api/v4/fit/autonomy', '/api/v4/fit/autonomy/pause', '/api/v3/fit/disclosures', '/api/v3/fit/ex-none/close']) {
+      const res = await postJson(path)
+      assert.notEqual(res.status, 503, path)
+      assert.notEqual((await res.json()).code, 'fit_disabled', path)
+    }
+  })
 })

@@ -23,7 +23,7 @@ import * as firstStepDb from './fit-firststep-db.js'
 import * as email from './notifications.js'
 import { questionFor } from './fit-questions.js'
 import { ledgerItemLive } from './fit-db.js'
-import { postGateDrafted, type PostGateInput } from './fit-gate.js'
+import { fitGate, postGateDrafted, type PostGateInput } from './fit-gate.js'
 import { extract as airlockExtract, plan as airlockPlan } from './fit-airlock.js'
 import { recordCardEvent } from './card-events.js'
 
@@ -132,7 +132,7 @@ function levelName(a: policyDb.PolicyDimension, b: policyDb.PolicyDimension): st
 
 // ── POST /:introId/request - the signed Fit Request Manifest ──────────────
 
-router.post('/:introId/request', rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/request', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { requested_dimensions, reciprocal_offer, predicate_version, policy_hash, query_budget, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(requested_dimensions) || requested_dimensions.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'requested_dimensions and nonce required' }); return }
@@ -159,7 +159,7 @@ router.post('/:introId/request', rateLimited('fitv4_hs', 30), (req, res) => {
 
 // ── POST /:introId/commit - reciprocity gate; evaluate on mutual commit ───
 
-router.post('/:introId/commit', rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/commit', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { accept_dimensions, reciprocal_offer, policy_hash, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(accept_dimensions) || typeof nonce !== 'string') { res.status(400).json({ error: 'accept_dimensions and nonce required' }); return }
@@ -288,7 +288,7 @@ router.get('/:introId', rateLimited('fitv4_get', 60), (req, res) => {
 
 // ── POST /:introId/reveal - human-tap exact release (state 5) ──────────────
 
-router.post('/:introId/reveal', rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/reveal', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { dimension, public_key, nonce, signature } = req.body ?? {}
   if (typeof dimension !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'dimension and nonce required' }); return }
@@ -387,7 +387,7 @@ function unresolvedQuestions(hs: handshakeDb.HandshakeRow): { dimension: string;
 
 // ── POST /:introId/questions ──────────────────────────────────────────────
 
-router.post('/:introId/questions', rateLimited('fitv4_hs', 60), (req, res) => {
+router.post('/:introId/questions', fitGate, rateLimited('fitv4_hs', 60), (req, res) => {
   const introId = String(req.params.introId)
   const { public_key, nonce, signature } = req.body ?? {}
   if (typeof nonce !== 'string') { res.status(400).json({ error: 'nonce required' }); return }
@@ -400,7 +400,7 @@ router.post('/:introId/questions', rateLimited('fitv4_hs', 60), (req, res) => {
 
 // ── POST /:introId/answers (signed ticket; drafted routes through the airlock) ─
 
-router.post('/:introId/answers', rateLimited('fitv4_hs', 60), (req, res) => {
+router.post('/:introId/answers', fitGate, rateLimited('fitv4_hs', 60), (req, res) => {
   const introId = String(req.params.introId)
   const { answers, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(answers) || answers.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'answers and nonce required' }); return }
@@ -446,7 +446,7 @@ router.post('/:introId/answers', rateLimited('fitv4_hs', 60), (req, res) => {
 
 // ── POST /:introId/round2 ──────────────────────────────────────────────────
 
-router.post('/:introId/round2', rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/round2', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { dimension_ids, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(dimension_ids) || dimension_ids.length === 0 || dimension_ids.length > 3 || typeof nonce !== 'string') { res.status(400).json({ error: 'dimension_ids required (1..3)' }); return }
@@ -511,7 +511,7 @@ router.get('/:introId/qa', rateLimited('fitv4_get', 60), (req, res) => {
 
 // ── POST /:introId/first-step - propose your own half ─────────────────────
 
-router.post('/:introId/first-step', rateLimited('fitv4_hs', 30), async (req, res) => {
+router.post('/:introId/first-step', fitGate, rateLimited('fitv4_hs', 30), async (req, res) => {
   const introId = String(req.params.introId)
   const { half, public_key, nonce, signature } = req.body ?? {}
   if (typeof nonce !== 'string') { res.status(400).json({ error: 'nonce required' }); return }
@@ -536,7 +536,7 @@ router.post('/:introId/first-step', rateLimited('fitv4_hs', 30), async (req, res
 
 // ── POST /:introId/first-step/approve - approve the merged shared artifact ─
 
-router.post('/:introId/first-step/approve', rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/first-step/approve', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { approved_digest, public_key, nonce, signature } = req.body ?? {}
   if (typeof approved_digest !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'approved_digest and nonce required' }); return }

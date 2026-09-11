@@ -16,6 +16,10 @@ import { generateKeyPair, sign, canonicalize } from 'agent-passport-system'
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-intros-test-'))
 process.env.DB_PATH = join(tmpDir, 'intros.db')
 process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
+// Accept opens a fit session only when MINGLE_FIT_ENABLED is exactly "1". This
+// suite runs with it on, so the loop behaves as it did before the gate. The last
+// test runs the loop with the flag off, which is the production setting.
+process.env.MINGLE_FIT_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')
@@ -274,4 +278,30 @@ test('accept emails the requester once, complete emails both, and neither is a d
   assert.equal(again.reason, 'duplicate')
   const againDone = await email.notifyIntroCompleted({ recipientKey: bob.keys.publicKey, introId: id, counterpartyHeadline: 'x', counterpartyContact: 'y' })
   assert.equal(againDone.reason, 'duplicate')
+})
+
+// ── The intro loop stays live while structured fit is off ──
+
+test('with fit disabled, the loop still completes and both contacts release', async () => {
+  const before = process.env.MINGLE_FIT_ENABLED
+  delete process.env.MINGLE_FIT_ENABLED
+  try {
+    const alice = makeCard('Alice without fit'); const bob = makeCard('Bob without fit')
+    const aCard = await publish(alice); const bCard = await publish(bob)
+    const r = await request(alice, aCard, bCard, 'collaborate', 'hello')
+    assert.equal(r.status, 201, JSON.stringify(r.body))
+    const acc = await respond(bob, r.body.id, 'accept', 'bob@signal.example')
+    assert.equal(acc.status, 200, JSON.stringify(acc.body))
+    assert.equal(acc.body.fit.available, false, 'the accept response says fit is unavailable')
+    assert.equal(acc.body.fit_exchange, null)
+    const done = await complete(alice, r.body.id, 'alice@telegram.example')
+    assert.equal(done.status, 200, JSON.stringify(done.body))
+    assert.equal(done.body.complete, true)
+    const am = await mine(alice); const bm = await mine(bob)
+    assert.equal(am.intros[0].counterparty_contact, 'bob@signal.example')
+    assert.equal(bm.intros[0].counterparty_contact, 'alice@telegram.example')
+  } finally {
+    if (before === undefined) delete process.env.MINGLE_FIT_ENABLED
+    else process.env.MINGLE_FIT_ENABLED = before
+  }
 })
