@@ -92,24 +92,58 @@ async function status(keys: any, signer?: any): Promise<{ code: number; body: an
   return { code: res.status, body: await res.json() }
 }
 
-test('status reports subscribed and verified, gated by a valid signature', async () => {
+// What a new subscription starts with. new_match is opt-in, like weekly_digest.
+const NEW_SUB_PREFS = { intro_request: true, intro_accepted: true, weekly_digest: false, new_match: false }
+
+test('status reports subscribed, verified and the effective prefs, gated by a valid signature', async () => {
   const keys = generateKeyPair()
-  // before subscribing: not subscribed
+  // before subscribing: not subscribed, so there are no prefs to report
   let s = await status(keys)
   assert.equal(s.code, 200)
-  assert.deepEqual(s.body, { subscribed: false, verified: false })
+  assert.deepEqual(s.body, { subscribed: false, verified: false, prefs: null })
   // after subscribing, before confirming: subscribed but unverified
   await subscribe(keys, 'status@example.com')
   s = await status(keys)
-  assert.deepEqual(s.body, { subscribed: true, verified: false })
+  assert.deepEqual(s.body, { subscribed: true, verified: false, prefs: NEW_SUB_PREFS })
   // after confirming: verified
   await fetch(`${base}/api/v3/notifications/confirm/${notifyDb.getSubscription(keys.publicKey)!.verify_token}`)
   s = await status(keys)
-  assert.deepEqual(s.body, { subscribed: true, verified: true })
+  assert.deepEqual(s.body, { subscribed: true, verified: true, prefs: NEW_SUB_PREFS })
   // a signature from another key is refused (no one else learns your status)
   const other = generateKeyPair()
   const bad = await status(keys, other)
   assert.equal(bad.code, 403)
+})
+
+// ── Preference merge: a named pref is set, an omitted pref keeps its value ──
+
+test('a new subscription that does not name new_match stores it off, and the response carries all four prefs', async () => {
+  const keys = generateKeyPair()
+  const r = await subscribe(keys, 'defaults@example.com')
+  assert.deepEqual(r.prefs, NEW_SUB_PREFS)
+  assert.deepEqual(notifyDb.getSubscription(keys.publicKey)!.prefs, NEW_SUB_PREFS)
+  const row = db.getDb().prepare('SELECT prefs_json FROM notifications WHERE subject_key = ?').get(keys.publicKey) as any
+  assert.equal(JSON.parse(row.prefs_json).new_match, false, 'stored explicitly off, not merely absent')
+})
+
+test('a resubscribe that names only weekly_digest leaves every other pref as stored', async () => {
+  const keys = generateKeyPair()
+  await subscribe(keys, 'merge@example.com', { new_match: true, intro_request: false })
+  const r = await subscribe(keys, 'merge@example.com', { weekly_digest: true })
+  const expected = { intro_request: false, intro_accepted: true, weekly_digest: true, new_match: true }
+  assert.deepEqual(r.prefs, expected, 'the subscribe response carries the effective prefs')
+  assert.deepEqual(notifyDb.getSubscription(keys.publicKey)!.prefs, expected)
+  assert.deepEqual((await status(keys)).body.prefs, expected, 'signed status shows the same four prefs')
+
+  // The other direction: new_match stays off when a resubscribe does not name it.
+  const off = generateKeyPair()
+  await subscribe(off, 'stays-off@example.com')
+  await subscribe(off, 'stays-off@example.com', { weekly_digest: true })
+  assert.equal(notifyDb.getSubscription(off.publicKey)!.prefs.new_match, false)
+
+  // A resubscribe that names nothing changes nothing.
+  const same = await subscribe(keys, 'merge@example.com')
+  assert.deepEqual(same.prefs, expected)
 })
 
 // ── Intro event emails ──

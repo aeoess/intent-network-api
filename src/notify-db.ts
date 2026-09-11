@@ -61,10 +61,11 @@ function rowToSub(row: any): Subscription {
   return {
     subject_key: row.subject_key, email: row.email, verified: !!row.verified,
     verify_token: row.verify_token, unsub_token: row.unsub_token,
-    // weekly_digest and new_match default off for any row stored before that
-    // pref existed. Nobody who subscribed under the old shape starts receiving
-    // a new kind of mail because the server learned to send it; they opt in by
-    // subscribing again, where new_match now defaults on.
+    // weekly_digest and new_match are off for any row stored before that pref
+    // existed. Nobody who subscribed under the old shape starts receiving a new
+    // kind of mail because the server learned to send it. A new subscription
+    // also starts with both off, and a resubscribe that omits a pref keeps what
+    // is stored, so the only way either turns on is the principal naming it.
     prefs: {
       intro_request: parsed.intro_request !== false,
       intro_accepted: parsed.intro_accepted !== false,

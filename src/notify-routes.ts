@@ -15,7 +15,11 @@ import * as email from './notifications.js'
 const router = Router()
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-const DEFAULT_PREFS = { intro_request: true, intro_accepted: true }
+// What a new subscription starts with. The kinds of mail added after the first
+// two (the weekly digest, new matches) start off, so nobody receives a kind of
+// email they never chose.
+const NEW_SUBSCRIPTION_PREFS: notifyDb.NotifPrefs = { intro_request: true, intro_accepted: true, weekly_digest: false, new_match: false }
+const PREF_KEYS = Object.keys(NEW_SUBSCRIPTION_PREFS) as (keyof notifyDb.NotifPrefs)[]
 
 function rateLimited(action: string, limit: number) {
   return (req: any, res: any, next: any) => {
@@ -39,19 +43,20 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
   } catch (e: any) {
     res.status(403).json({ error: `signature verification failed: ${e.message}` }); return
   }
-  const cleanPrefs = {
-    intro_request: prefs?.intro_request === undefined ? true : !!prefs.intro_request,
-    intro_accepted: prefs?.intro_accepted === undefined ? true : !!prefs.intro_accepted,
-    weekly_digest: prefs?.weekly_digest === undefined ? false : !!prefs.weekly_digest,
-    new_match: prefs?.new_match === undefined ? true : !!prefs.new_match,
-  }
+  // Merge, never reset. A pref the request names is set. A pref it omits keeps
+  // what is stored, or the new-subscription default when nothing is stored yet.
+  // upsertSubscription writes the whole object, so the merge has to happen here.
   const existing = notifyDb.getSubscription(subject_key)
+  const effective: notifyDb.NotifPrefs = { ...(existing?.prefs ?? NEW_SUBSCRIPTION_PREFS) }
+  for (const k of PREF_KEYS) {
+    if (prefs && typeof prefs === 'object' && prefs[k] !== undefined) effective[k] = !!prefs[k]
+  }
   const verifyToken = randomBytes(24).toString('hex')
   const unsubToken = existing?.unsub_token ?? randomBytes(24).toString('hex')
-  notifyDb.upsertSubscription(subject_key, addr, verifyToken, unsubToken, cleanPrefs)
+  notifyDb.upsertSubscription(subject_key, addr, verifyToken, unsubToken, effective)
   // The confirmation is the only email an unverified address receives.
   const sent = await email.sendConfirmation(addr, verifyToken, unsubToken)
-  res.status(201).json({ subscribed: true, verified: false, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled() })
+  res.status(201).json({ subscribed: true, verified: false, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
 })
 
 // ── GET /confirm/:token ───────────────────────────────────────────────────
@@ -102,7 +107,8 @@ router.get('/status', rateLimited('notif_status', 60), (req, res) => {
     res.status(403).json({ error: `signature verification failed: ${e.message}` }); return
   }
   const sub = notifyDb.getSubscription(subject_key)
-  res.json({ subscribed: !!sub, verified: !!sub?.verified })
+  // prefs is the effective four-pref object, or null when there is no subscription.
+  res.json({ subscribed: !!sub, verified: !!sub?.verified, prefs: sub ? sub.prefs : null })
 })
 
 export default router
