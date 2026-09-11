@@ -253,12 +253,14 @@ test('accept emails the requester once, complete emails both, and neither is a d
   const onAccept = sent.filter(e => /was accepted/i.test(e.subject))
   assert.equal(onAccept.length, 1, 'accept sends exactly one acceptance email')
   assert.equal(onAccept[0].to, 'alice-acc@example.com', 'it goes to the requester')
+  assert.equal(onAccept[0].subject, 'Your introduction was accepted on Mingle', 'the accept subject is unchanged')
   assert.equal(sent.some(e => e.text.includes('bob@signal.example')), false, 'the accepter contact is not released on accept')
 
   sent.length = 0
   const done = await complete(alice, id, 'alice@telegram.example')
   assert.equal(done.status, 200, JSON.stringify(done.body))
   assert.deepEqual(sent.map(e => e.to).sort(), ['alice-acc@example.com', 'bob-acc@example.com'], 'complete emails both sides, the requester included')
+  assert.deepEqual(sent.map(e => e.subject), ['Your Mingle connection is complete', 'Your Mingle connection is complete'], 'the completion email has its own subject')
 
   const log = db.getDb().prepare(`SELECT subject_key, type FROM email_log WHERE intro_id = ? AND type IN ('intro_accepted', 'intro_completed') ORDER BY id`).all(id) as any[]
   assert.deepEqual(log.map(l => [l.subject_key, l.type]), [

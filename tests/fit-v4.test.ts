@@ -351,11 +351,136 @@ test('reveal_exact keeps the exact private until a human-tap reveal by the owner
   // Before any reveal, GET carries no exact value.
   const g1 = await hsGet(hs.alice, hs.introId)
   assert.equal(factFor(g1.overlap_map, 'weekly_commitment').exact_a, undefined)
-  // Alice taps reveal for her own dimension; now GET carries the exact values.
+  // Alice taps reveal for her own dimension, and now GET carries her exact value only.
   const rv = await hsReveal(hs.alice, hs.introId, 'weekly_commitment')
   assert.equal(rv.status, 200)
   const g2 = await hsGet(hs.bob, hs.introId)
   assert.ok(factFor(g2.overlap_map, 'weekly_commitment').exact_a !== undefined)
+  assert.equal(factFor(g2.overlap_map, 'weekly_commitment').exact_b, undefined, "bob's value stays private until bob releases it")
+})
+
+// ── EXACT RELEASE binds to each principal (must-not-cut) ──
+// alice requests the handshake and bob commits, so exact_a is alice's value and
+// exact_b is bob's. Each appears only after its own owner taps reveal.
+
+const A_VALUE = { min: 20, max: 40 }
+const B_VALUE = { min: 25, max: 30 }
+
+async function exactHandshake(): Promise<any> {
+  const a = [dim('weekly_commitment', A_VALUE, 'reveal_exact', 'essential')]
+  const b = [dim('weekly_commitment', B_VALUE, 'reveal_exact', 'essential')]
+  const hs = await openHandshake('cofound', a, b)
+  await hsRequest(hs.alice, hs.introId, ['weekly_commitment'], ['weekly_commitment'], a)
+  const cm = await hsCommit(hs.bob, hs.introId, ['weekly_commitment'], ['weekly_commitment'], b)
+  assert.equal(factFor(cm.body.overlap_map, 'weekly_commitment').result, 'exact_available', JSON.stringify(cm.body))
+  return hs
+}
+async function exactsSeenBy(who: any, introId: string): Promise<{ a: unknown; b: unknown }> {
+  const f = factFor((await hsGet(who, introId)).overlap_map, 'weekly_commitment')
+  return { a: f.exact_a, b: f.exact_b }
+}
+const storedReleased = (introId: string): string => handshakeDb.getHandshake(introId)!.released_exacts_json
+const exactCount = async (who: any, cardId: string): Promise<number> => (await getActivity(who, cardId)).summary.exact_values_released
+
+test('EXACT RELEASE: with no release, neither exact is visible to either party', async () => {
+  const hs = await exactHandshake()
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: undefined, b: undefined })
+})
+
+test('EXACT RELEASE: when only the requester releases, only exact_a is visible, to both parties', async () => {
+  const hs = await exactHandshake()
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200)
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: A_VALUE, b: undefined })
+})
+
+test('EXACT RELEASE: once the committer releases too, both exacts are visible', async () => {
+  const hs = await exactHandshake()
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal((await hsReveal(hs.bob, hs.introId, 'weekly_commitment')).status, 200)
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: A_VALUE, b: B_VALUE })
+})
+
+test('EXACT RELEASE: a first release by the committer exposes only exact_b', async () => {
+  const hs = await exactHandshake()
+  assert.equal((await hsReveal(hs.bob, hs.introId, 'weekly_commitment')).status, 200)
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: undefined, b: B_VALUE })
+})
+
+test('EXACT RELEASE: a repeated release is idempotent and the stored set is deduped at write time', async () => {
+  const hs = await exactHandshake()
+  const A = hs.alice.keys.publicKey, B = hs.bob.keys.publicKey
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200, 'a repeat is not an error')
+  assert.equal(storedReleased(hs.introId), JSON.stringify({ weekly_commitment: [A] }), 'one member after A, A')
+  assert.equal((await hsReveal(hs.bob, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal(storedReleased(hs.introId), JSON.stringify({ weekly_commitment: [A, B] }), 'exactly [A, B] after A, A, B, read back from the row')
+  assert.equal(await exactCount(hs.alice, hs.aliceCard), 1, 'a repeat release is not a second disclosure in the ledger')
+  assert.equal(await exactCount(hs.bob, hs.bobCard), 1, "the second releaser's own release is in their ledger")
+})
+
+test('EXACT RELEASE: a legacy single-key row means only that key released, and the next release upgrades it', async () => {
+  const hs = await exactHandshake()
+  const A = hs.alice.keys.publicKey, B = hs.bob.keys.publicKey
+  db.getDb().prepare('UPDATE v4_fit_handshakes SET released_exacts_json = ? WHERE intro_id = ?').run(JSON.stringify({ weekly_commitment: A }), hs.introId)
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: A_VALUE, b: undefined })
+  assert.equal((await hsReveal(hs.bob, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal(storedReleased(hs.introId), JSON.stringify({ weekly_commitment: [A, B] }))
+  assert.equal(await exactCount(hs.bob, hs.bobCard), 1, "bob's release on a legacy row is in bob's ledger")
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: A_VALUE, b: B_VALUE })
+})
+
+test("EXACT RELEASE: the activity ledger records only the caller's own release", async () => {
+  const hs = await exactHandshake()
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal(await exactCount(hs.alice, hs.aliceCard), 1)
+  assert.equal(await exactCount(hs.bob, hs.bobCard), 0, 'the other party released nothing')
+})
+
+test('EXACT RELEASE: releasersFor reads the set form and the legacy string form, and nothing else', () => {
+  assert.deepEqual(handshakeDb.releasersFor({ d: 'kA' }, 'd'), ['kA'])
+  assert.deepEqual(handshakeDb.releasersFor({ d: ['kA', 'kB', 'kA'] }, 'd'), ['kA', 'kB'])
+  assert.deepEqual(handshakeDb.releasersFor({ d: ['kA'] }, 'other'), [])
+  for (const junk of [null, 7, {}, '', [3, null]]) assert.deepEqual(handshakeDb.releasersFor({ d: junk } as any, 'd'), [])
+})
+
+test('EXACT RELEASE: a release on one dimension keeps every other dimension, upgrading legacy strings', async () => {
+  const hs = await exactHandshake()
+  const A = hs.alice.keys.publicKey, B = hs.bob.keys.publicKey
+  db.getDb().prepare('UPDATE v4_fit_handshakes SET released_exacts_json = ? WHERE intro_id = ?').run(JSON.stringify({ weekly_commitment: A, cadence: B }), hs.introId)
+  assert.equal((await hsReveal(hs.bob, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal(storedReleased(hs.introId), JSON.stringify({ weekly_commitment: [A, B], cadence: [B] }))
+})
+
+test('EXACT RELEASE: the release and its ledger row commit together or not at all', async () => {
+  const hs = await exactHandshake()
+  const A = hs.alice.keys.publicKey
+  // Make only the ledger insert fail, after the release itself has been written.
+  db.getDb().exec(`CREATE TEMP TRIGGER fail_exact_ledger BEFORE INSERT ON v4_fit_activity WHEN NEW.action = 'exact_released' BEGIN SELECT RAISE(ABORT, 'injected ledger failure'); END`)
+  try {
+    const nonce = 'hrf' + rid()
+    const body = { dimension: 'weekly_commitment', public_key: A, nonce, signature: sign(`fit-reveal:${hs.introId}:weekly_commitment:${nonce}`, hs.alice.keys.privateKey) }
+    const res = await fetch(`${base}/api/v4/fit/${hs.introId}/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    assert.equal(res.status, 500)
+  } finally {
+    db.getDb().exec('DROP TRIGGER IF EXISTS fail_exact_ledger')
+  }
+  assert.equal(storedReleased(hs.introId), '{}', 'a failed ledger write leaves no release behind')
+  for (const who of [hs.alice, hs.bob]) assert.deepEqual(await exactsSeenBy(who, hs.introId), { a: undefined, b: undefined })
+  assert.equal((await hsReveal(hs.alice, hs.introId, 'weekly_commitment')).status, 200)
+  assert.equal(storedReleased(hs.introId), JSON.stringify({ weekly_commitment: [A] }))
+  assert.equal(await exactCount(hs.alice, hs.aliceCard), 1, 'the retry records the release it makes')
+})
+
+test('EXACT RELEASE: dimension names that are Object.prototype members are stored as plain keys', () => {
+  handshakeDb.createHandshake({ intro_id: 'hs-proto', card_a: 'ca', card_b: 'cb', key_a: 'kA', key_b: 'kB', intent: 'cofound', expires_at: future() })
+  const names = ['constructor', 'toString', 'hasOwnProperty', '__proto__']
+  for (const name of names) {
+    assert.equal(handshakeDb.releaseExact('hs-proto', name, 'kA'), true, name)
+    assert.equal(handshakeDb.releaseExact('hs-proto', name, 'kA'), false, `${name} repeat`)
+  }
+  const stored = handshakeDb.parseReleased(handshakeDb.getHandshake('hs-proto')!.released_exacts_json)
+  for (const name of names) assert.deepEqual(handshakeDb.releasersFor(stored, name), ['kA'], name)
+  assert.deepEqual(handshakeDb.releasersFor({}, 'toString'), [], 'an inherited member is never a release')
 })
 
 // ── ANTI-NARROWING (must-not-cut) ──

@@ -9,7 +9,7 @@
 import { Router } from 'express'
 import { createHash } from 'node:crypto'
 import { verify, canonicalize } from 'agent-passport-system'
-import { checkRateLimit } from './db.js'
+import { checkRateLimit, getDb } from './db.js'
 import * as v3db from './v3-db.js'
 import * as policyDb from './fit-policy-db.js'
 import * as handshakeDb from './fit-handshake-db.js'
@@ -261,18 +261,27 @@ router.get('/:introId', rateLimited('fitv4_get', 60), (req, res) => {
   const base: Record<string, unknown> = { intro_id: introId, intent: hs.intent, state: hs.state, expires_at: hs.expires_at }
   if (hs.state !== 'committed' || !hs.result_json) { res.json(base); return }
 
-  // Merge any human-tap-released exact values into the map for the two parties.
-  const released = JSON.parse(hs.released_exacts_json || '{}') as Record<string, string>
+  // Merge human-tap-released exact values into the map for the two parties.
+  // Each side's value appears only once that side has released it. Exposure
+  // follows the roles (requester_key, committer_key), never the order of the
+  // stored release set, so a first release by the committer never shows the
+  // requester's value.
+  const released = handshakeDb.parseReleased(hs.released_exacts_json)
   const map = JSON.parse(hs.result_json) as OverlapEntry[]
   const requesterCard = cardOfKey(hs, hs.requester_key!)!
   const committerCard = cardOfKey(hs, hs.committer_key!)!
   const polReq = dimMapFor(requesterCard, hs.req_policy_hash!, hs.intent)
   const polCom = dimMapFor(committerCard, hs.com_policy_hash!, hs.intent)
   const withExacts = map.map(e => {
-    if (released[e.dimension]) {
-      return { ...e, exact_a: polReq.get(e.dimension)?.value, exact_b: polCom.get(e.dimension)?.value }
+    const releasers = handshakeDb.releasersFor(released, e.dimension)
+    const requesterReleased = !!hs.requester_key && releasers.includes(hs.requester_key)
+    const committerReleased = !!hs.committer_key && releasers.includes(hs.committer_key)
+    if (!requesterReleased && !committerReleased) return e
+    return {
+      ...e,
+      ...(requesterReleased ? { exact_a: polReq.get(e.dimension)?.value } : {}),
+      ...(committerReleased ? { exact_b: polCom.get(e.dimension)?.value } : {}),
     }
-    return e
   })
   res.json({ ...base, overlap_map: withExacts, receipt: hs.receipt, receipt_digest: hs.receipt_digest, receipt_content: hs.receipt_content_json ? JSON.parse(hs.receipt_content_json) : undefined, server_public_key: serverPublicKey() })
 })
@@ -295,8 +304,15 @@ router.post('/:introId/reveal', rateLimited('fitv4_hs', 30), (req, res) => {
   const ownMap = dimMapFor(ownerCard, ownerHash, hs.intent)
   const own = ownMap.get(dimension)
   if (!own || own.disclosure_state !== 'reveal_exact') { res.status(403).json({ error: 'this dimension is not authorized for exact release by you' }); return }
-  handshakeDb.releaseExact(introId, dimension, public_key)
-  autonomyDb.recordActivity(public_key, introId, 'exact_released', dimension, otherKey(hs, public_key), false)
+  // The release and its ledger row commit together or not at all, so a failed
+  // ledger write never leaves a release the ledger does not show. Only the
+  // caller's own release is recorded, and only the first time. A repeat tap
+  // discloses nothing new.
+  getDb().transaction(() => {
+    if (handshakeDb.releaseExact(introId, dimension, public_key)) {
+      autonomyDb.recordActivity(public_key, introId, 'exact_released', dimension, otherKey(hs, public_key), false)
+    }
+  })()
   res.json({ revealed: dimension })
 })
 

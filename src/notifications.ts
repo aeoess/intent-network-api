@@ -100,6 +100,12 @@ export function introAcceptedEmail(to: string, counterpartyHeadline: string, cou
   }
 }
 
+/** The completion email is the accepted email with the contact line, under its
+ *  own subject. */
+export function introCompletedEmail(to: string, counterpartyHeadline: string, counterpartyContact: string, unsubToken: string): OutgoingEmail {
+  return { ...introAcceptedEmail(to, counterpartyHeadline, counterpartyContact, unsubToken), subject: 'Your Mingle connection is complete' }
+}
+
 // ── Fit exchange templates (v3.6) ─────────────────────────────────────────
 // Content-free by design: the started email names only the counterpart's public
 // headline and the purpose; the record-ready email carries nothing at all.
@@ -148,7 +154,7 @@ export async function notifyIntroAccepted(a: IntroAcceptedArgs): Promise<{ sent:
  *  type, so it never collides with the acceptance email in the dedupe log. */
 export async function notifyIntroCompleted(a: IntroAcceptedArgs): Promise<{ sent: boolean; reason?: string }> {
   return dispatch(a.recipientKey, a.introId, 'intro_completed', 'intro_accepted', sub =>
-    introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
+    introCompletedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
 }
 
 /** Fit-started and record-ready are direct-action emails (a person acted in an

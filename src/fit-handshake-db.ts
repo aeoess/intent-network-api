@@ -111,12 +111,59 @@ export function setCommitResult(introId: string, committerKey: string, accept: s
     .run(committerKey, JSON.stringify(accept), JSON.stringify(reciprocal), policyHash, resultJson, receipt, receiptDigest, receiptContentJson, introId)
 }
 
-export function releaseExact(introId: string, dimension: string, ownerKey: string): void {
-  const row = getHandshake(introId)
-  if (!row) return
-  const released = JSON.parse(row.released_exacts_json || '{}')
-  released[dimension] = ownerKey
-  d().prepare('UPDATE v4_fit_handshakes SET released_exacts_json = ? WHERE intro_id = ?').run(JSON.stringify(released), introId)
+// ── Exact release, one set of releasers per dimension ──────────────────────
+// Each principal releases only their own exact value, so the stored value per
+// dimension is the SET of keys that released it:
+//   { "weekly_commitment": ["keyA", "keyB"] }
+// A row written before this holds one key as a plain string:
+//   { "weekly_commitment": "keyA" }
+// which means only that key released. releasersFor is the one reader of both
+// forms. Every reader of released_exacts_json goes through it.
+
+/** Parse the stored release map. Anything that is not a JSON object reads as
+ *  no releases at all, so a damaged row never exposes an exact value. */
+export function parseReleased(json: string | null | undefined): Record<string, unknown> {
+  try {
+    const v = JSON.parse(json || '{}')
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {}
+  } catch { return {} }
+}
+
+/** Who has released their own exact value for a dimension. The set form is
+ *  read deduped, the legacy string form as a one-member set, and any other
+ *  value as nobody. The set is unordered, so callers test membership by key. */
+export function releasersFor(released: Record<string, unknown>, dimension: string): string[] {
+  // Own keys only, so a dimension named after an Object.prototype member
+  // (constructor, toString, __proto__) never reads an inherited value.
+  const v = Object.hasOwn(released, dimension) ? released[dimension] : undefined
+  if (typeof v === 'string') return v.length > 0 ? [v] : []
+  if (!Array.isArray(v)) return []
+  return [...new Set(v.filter((k): k is string => typeof k === 'string' && k.length > 0))]
+}
+
+/** Add ownerKey to the release set for one dimension, keeping every earlier
+ *  releaser. The whole map is written back in the array form, deduped, so a
+ *  legacy string is upgraded on the next write. Returns true only when the key
+ *  was not already in the set, so a repeat tap changes nothing. */
+export function releaseExact(introId: string, dimension: string, ownerKey: string): boolean {
+  const dd = d()
+  return dd.transaction((): boolean => {
+    const row = getHandshake(introId)
+    if (!row) return false
+    const released = parseReleased(row.released_exacts_json)
+    // A prototype-free map, so any dimension name, __proto__ included, is a
+    // plain own key.
+    const next: Record<string, string[]> = Object.create(null)
+    for (const dim of Object.keys(released)) {
+      const set = releasersFor(released, dim)
+      if (set.length > 0) next[dim] = set
+    }
+    const current = Object.hasOwn(next, dimension) ? next[dimension] : []
+    const added = !current.includes(ownerKey)
+    next[dimension] = added ? [...current, ownerKey] : current
+    dd.prepare('UPDATE v4_fit_handshakes SET released_exacts_json = ? WHERE intro_id = ?').run(JSON.stringify(next), introId)
+    return added
+  })()
 }
 
 // ── Anti-narrowing query budget ────────────────────────────────────────────
