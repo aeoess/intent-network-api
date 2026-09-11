@@ -115,6 +115,12 @@ router.post('/:id/respond', rateLimited('intro_respond', 30), async (req, res) =
     if (!handshake) {
       try { fit = await createFitExchangeForIntro(intro) } catch { /* never blocks accept */ }
     }
+    // Tell the requester now. The accepter's contact line is not in this email.
+    // It is released only when the requester completes with their own contact.
+    try {
+      const toHeadline = liveNetworkHeadline(intro.to_card)?.headline ?? ''
+      await email.notifyIntroAccepted({ recipientKey: intro.from_key, introId: id, counterpartyHeadline: toHeadline, counterpartyContact: '' })
+    } catch { /* notification failure never affects accept */ }
     res.json({
       id, status: 'accepted', awaiting: 'requester_contact',
       fit_handshake: handshake?.id ?? null,
@@ -154,13 +160,15 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), async (req, res)
   introsDb.completeIntro(id, contact.trim())
   const final = introsDb.getIntro(id)!
 
-  // Now complete: release each party's contact to the other, by email.
+  // Now complete: release each party's contact to the other, by email. This is
+  // its own delivery type, so the acceptance email the requester already got
+  // does not dedupe it away.
   try {
     const fromHeadline = liveNetworkHeadline(intro.from_card)?.headline ?? ''
     const toHeadline = liveNetworkHeadline(intro.to_card)?.headline ?? ''
     // requester learns the target's contact; target learns the requester's.
-    await email.notifyIntroAccepted({ recipientKey: intro.from_key, introId: id, counterpartyHeadline: toHeadline, counterpartyContact: final.to_contact ?? '' })
-    await email.notifyIntroAccepted({ recipientKey: intro.to_key, introId: id, counterpartyHeadline: fromHeadline, counterpartyContact: final.from_contact ?? '' })
+    await email.notifyIntroCompleted({ recipientKey: intro.from_key, introId: id, counterpartyHeadline: toHeadline, counterpartyContact: final.to_contact ?? '' })
+    await email.notifyIntroCompleted({ recipientKey: intro.to_key, introId: id, counterpartyHeadline: fromHeadline, counterpartyContact: final.from_contact ?? '' })
   } catch { /* notification failure never affects completion */ }
 
   res.json({ id, status: 'accepted', complete: true })

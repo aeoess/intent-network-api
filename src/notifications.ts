@@ -144,6 +144,13 @@ export async function notifyIntroAccepted(a: IntroAcceptedArgs): Promise<{ sent:
     introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
 }
 
+/** Completion rides the intro_accepted preference but has its own delivery
+ *  type, so it never collides with the acceptance email in the dedupe log. */
+export async function notifyIntroCompleted(a: IntroAcceptedArgs): Promise<{ sent: boolean; reason?: string }> {
+  return dispatch(a.recipientKey, a.introId, 'intro_completed', 'intro_accepted', sub =>
+    introAcceptedEmail(sub.email, a.counterpartyHeadline, a.counterpartyContact ?? '', sub.unsub_token))
+}
+
 /** Fit-started and record-ready are direct-action emails (a person acted in an
  *  exchange they joined), so they are not held back by the non-direct daily cap.
  *  They still require verification, a live pref, and dedupe. */

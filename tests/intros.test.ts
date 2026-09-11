@@ -234,3 +234,42 @@ test('mine requires a valid signature', async () => {
   const res = await fetch(`${base}/api/v3/intros/mine?${qs}`)
   assert.equal(res.status, 403)
 })
+
+// ── Accept and complete are two emails with two delivery types ──
+
+test('accept emails the requester once, complete emails both, and neither is a duplicate of the other', async () => {
+  const alice = makeCard('Alice the requester'); const bob = makeCard('Bob the accepter')
+  const aCard = await publish(alice); const bCard = await publish(bob)
+  await subscribeVerified(alice.keys, 'alice-acc@example.com'); await subscribeVerified(bob.keys, 'bob-acc@example.com')
+  const r = await request(alice, aCard, bCard, 'collaborate', 'hello')
+  assert.equal(r.status, 201, JSON.stringify(r.body))
+  const id = r.body.id
+
+  // Accept may also open a fit exchange, which sends its own mail, so only the
+  // acceptance emails are counted here.
+  sent.length = 0
+  const acc = await respond(bob, id, 'accept', 'bob@signal.example')
+  assert.equal(acc.status, 200, JSON.stringify(acc.body))
+  const onAccept = sent.filter(e => /was accepted/i.test(e.subject))
+  assert.equal(onAccept.length, 1, 'accept sends exactly one acceptance email')
+  assert.equal(onAccept[0].to, 'alice-acc@example.com', 'it goes to the requester')
+  assert.equal(sent.some(e => e.text.includes('bob@signal.example')), false, 'the accepter contact is not released on accept')
+
+  sent.length = 0
+  const done = await complete(alice, id, 'alice@telegram.example')
+  assert.equal(done.status, 200, JSON.stringify(done.body))
+  assert.deepEqual(sent.map(e => e.to).sort(), ['alice-acc@example.com', 'bob-acc@example.com'], 'complete emails both sides, the requester included')
+
+  const log = db.getDb().prepare(`SELECT subject_key, type FROM email_log WHERE intro_id = ? AND type IN ('intro_accepted', 'intro_completed') ORDER BY id`).all(id) as any[]
+  assert.deepEqual(log.map(l => [l.subject_key, l.type]), [
+    [alice.keys.publicKey, 'intro_accepted'],
+    [alice.keys.publicKey, 'intro_completed'],
+    [bob.keys.publicKey, 'intro_completed'],
+  ])
+
+  // Each event still dedupes against itself.
+  const again = await email.notifyIntroAccepted({ recipientKey: alice.keys.publicKey, introId: id, counterpartyHeadline: 'x' })
+  assert.equal(again.reason, 'duplicate')
+  const againDone = await email.notifyIntroCompleted({ recipientKey: bob.keys.publicKey, introId: id, counterpartyHeadline: 'x', counterpartyContact: 'y' })
+  assert.equal(againDone.reason, 'duplicate')
+})
