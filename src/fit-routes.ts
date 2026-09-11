@@ -68,7 +68,7 @@ export function consentSheet(ex: fitDb.ExchangeRow, viewerKey: string): Record<s
     ledger_version_in_effect: myLedgerVersion,
     mode: 'drafted-and-approved (ledger answers are the autonomous tier)',
     limits: { window_hours: 72, round2_questions_max: MAX_ROUND2, custom_questions_max: MAX_CUSTOM_PER_ASKER, answer_chars_max: 800 },
-    retention: 'Transcript and record purge after 30 days; emails are content-free.',
+    retention: 'Fit answers and records are currently retained on the server. Notification emails do not include fit answers or private fit values.',
   }
 }
 

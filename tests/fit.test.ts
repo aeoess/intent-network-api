@@ -207,6 +207,8 @@ test('a cofound intro DOES open a fit exchange with a consent sheet', async () =
   assert.ok(acc.fit_exchange, 'a fit exchange opened')
   assert.equal(acc.consent_sheet.purpose, 'cofound')
   assert.equal(acc.consent_sheet.bank_version, 1)
+  // The sheet makes no purge promise. Nothing deletes fit data yet.
+  assert.equal(acc.consent_sheet.retention, 'Fit answers and records are currently retained on the server. Notification emails do not include fit answers or private fit values.')
 })
 
 // ── Slot sanitization ──
