@@ -19,8 +19,9 @@
 //
 //   - legacy card expiry (db.ts purgeExpired) - the facts are captured before
 //     the DELETE, the DELETE commits, and the events are written afterwards
-//   - card_published, card_renewed, card_server_copy_deleted and the four
-//     revocation verbs (v3-routes.ts)
+//   - card_published, card_renewed, card_replaced (written after the replace
+//     transaction commits), card_server_copy_deleted and the four revocation
+//     verbs (v3-routes.ts)
 //   - card_expired from the v3 sweep (v3-db.ts) - written after the UPDATE
 //   - embedding_stored / embedding_failed, match_notified /
 //     match_notify_skipped (v3-routes.ts)
@@ -71,6 +72,7 @@ function d(): Database {
 export const CARD_EVENTS = [
   'card_published',
   'card_renewed',
+  'card_replaced',
   'card_expired',
   'card_withdrawn',
   'card_superseded',

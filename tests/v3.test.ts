@@ -366,3 +366,122 @@ test('query plus cursor is refused with a 400 that says why', async () => {
   // A cursor without a query still pages through the keyset path.
   assert.equal((await search({ card_type: 'connection', cursor })).status, 200)
 })
+
+// ── Replace: a new version supersedes the old one in one transaction ──
+
+/** Another card for the same key, signed like any other. */
+function sibling(of: Keyed, overrides: Record<string, unknown>): Keyed {
+  const { __keys, approval, signature, ...content } = of
+  const now = Date.now()
+  const card: Record<string, any> = { ...content, created_at: new Date(now).toISOString(), ...overrides }
+  const card_hash = cardContentHash(card)
+  card.approval = { card_hash, approved_at: new Date(now).toISOString(), principal_signature: sign(card_hash, __keys.privateKey) }
+  const { signature: _unused, ...unsigned } = card
+  card.signature = sign(canonicalize(unsigned), __keys.privateKey)
+  card.__keys = __keys
+  return card as Keyed
+}
+
+async function replace(oldId: string, card: Keyed): Promise<{ status: number; body: any }> {
+  const { __keys, ...wire } = card
+  const res = await fetch(`${base}/api/v3/cards/${oldId}/replace`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ card: wire }),
+  })
+  return { status: res.status, body: await res.json() }
+}
+
+const countOf = (sql: string, arg: string): number => (db.getDb().prepare(sql).get(arg) as any).n
+
+test('replace supersedes the old card, links the lineage and leaves a second card of the same key alone', async () => {
+  const v3db = await import('../src/v3-db.js')
+  const matchesDb = await import('../src/matches-db.js')
+  const first = makeCard({ headline: 'Replace probe, first version' })
+  const other = sibling(first, { headline: 'Replace probe, an unrelated second card' })
+  const pFirst = await publish(first); const pOther = await publish(other)
+  assert.equal(pFirst.status, 201, JSON.stringify(pFirst.body)); assert.equal(pOther.status, 201, JSON.stringify(pOther.body))
+  const oldId = pFirst.body.card_id, otherId = pOther.body.card_id
+  // Give the old card index and match artifacts so their removal is observable.
+  v3db.storeV3Embedding(oldId, unitVec({ 5: 1 })); matchesDb.storeMatchVector(oldId, unitVec({ 5: 1 }))
+  const otherBefore = db.getDb().prepare('SELECT * FROM v3_cards WHERE card_id = ?').get(otherId)
+
+  const r = await replace(oldId, sibling(first, { headline: 'Replace probe, second version' }))
+  assert.equal(r.status, 201, JSON.stringify(r.body))
+  const newId = r.body.new_card_id
+  assert.equal(r.body.superseded, oldId)
+
+  assert.equal(v3db.getV3Card(oldId)!.revocation_status, 'superseded')
+  assert.equal(v3db.getV3Card(newId)!.revocation_status, 'active')
+  assert.equal(v3db.getSupersededBy(oldId), newId)
+  assert.equal(v3db.getSupersedes(newId), oldId)
+  const lineage = [oldId, newId].map(id => v3db.getV3Card(id)!.revocation_status)
+  assert.equal(lineage.filter(s => s === 'active').length, 1, 'the replacement lineage has exactly one active member')
+  assert.equal((await (await fetch(`${base}/api/v3/cards/${oldId}`)).json()).superseded_by, newId)
+
+  assert.equal(countOf('SELECT COUNT(*) AS n FROM v3_embedding_cards WHERE card_id = ?', oldId), 0, 'old index entry removed')
+  assert.equal(countOf('SELECT COUNT(*) AS n FROM v3_match_vectors WHERE card_id = ?', oldId), 0, 'old match vector removed')
+  // Several live cards per key are allowed, so the unrelated card stays active beside the new one.
+  assert.deepEqual(db.getDb().prepare('SELECT * FROM v3_cards WHERE card_id = ?').get(otherId), otherBefore, 'the unrelated card is untouched')
+})
+
+test('replace refuses another key, a missing card, a card that is no longer active and a bad signature', async () => {
+  const mine = makeCard({ headline: 'Replace refusal probe' })
+  const pub = await publish(mine)
+  const stranger = makeCard({ headline: 'Replace refusal probe, a stranger' })
+  assert.equal((await replace(pub.body.card_id, stranger)).status, 403, 'another key cannot replace it')
+  assert.equal((await replace('v3-connection-missing', sibling(mine, { headline: 'Replace refusal probe, nowhere' }))).status, 404)
+  const ok = await replace(pub.body.card_id, sibling(mine, { headline: 'Replace refusal probe, v2' }))
+  assert.equal(ok.status, 201, JSON.stringify(ok.body))
+  assert.equal((await replace(pub.body.card_id, sibling(mine, { headline: 'Replace refusal probe, v3' }))).status, 409, 'a superseded card cannot be replaced again')
+  const forged = sibling(mine, { headline: 'Replace refusal probe, forged' })
+  forged.signature = sign('not the card', stranger.__keys.privateKey)
+  assert.equal((await replace(ok.body.new_card_id, forged)).status, 403)
+})
+
+test('a failure inside the replace transaction leaves both cards as they were', async () => {
+  const v3db = await import('../src/v3-db.js')
+  const matchesDb = await import('../src/matches-db.js')
+  const card = makeCard({ headline: 'Replace rollback probe' })
+  const pub = await publish(card)
+  const oldId = pub.body.card_id
+  v3db.storeV3Embedding(oldId, unitVec({ 6: 1 })); matchesDb.storeMatchVector(oldId, unitVec({ 6: 1 }))
+  const next = sibling(card, { headline: 'Replace rollback probe, never lands' })
+
+  // The lineage link is the last write in the transaction, after the insert, the
+  // supersede and the artifact removal. A temp trigger makes exactly that write fail.
+  v3db.getSupersededBy('ensure-table')
+  db.getDb().exec(`CREATE TEMP TRIGGER fail_replace BEFORE INSERT ON v3_supersessions BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+  try {
+    const r = await replace(oldId, next)
+    assert.equal(r.status, 500, JSON.stringify(r.body))
+  } finally {
+    db.getDb().exec('DROP TRIGGER IF EXISTS fail_replace')
+  }
+
+  assert.equal(v3db.getV3Card(oldId)!.revocation_status, 'active', 'the old card is still active')
+  assert.equal(countOf('SELECT COUNT(*) AS n FROM v3_cards WHERE card_hash = ?', next.approval.card_hash), 0, 'the new card was never inserted')
+  assert.equal(v3db.getSupersededBy(oldId), null, 'no lineage link')
+  assert.equal(countOf('SELECT COUNT(*) AS n FROM v3_embedding_cards WHERE card_id = ?', oldId), 1, 'the index entry is intact')
+  assert.equal(countOf('SELECT COUNT(*) AS n FROM v3_match_vectors WHERE card_id = ?', oldId), 1, 'the match vector is intact')
+  assert.equal(v3db.semanticSearchV3(unitVec({ 6: 1 }), 5)[0]?.card_id, oldId, 'the vector itself survived the rollback')
+
+  // With the fault gone the same replacement goes through.
+  assert.equal((await replace(oldId, next)).status, 201)
+})
+
+// ── delete-server-copy is per card, the subscription is per identity ──
+
+test('deleting one of two cards leaves the identity-level subscription intact', async () => {
+  const notifyDb = await import('../src/notify-db.js')
+  const a = makeCard({ headline: 'Delete keeps subscription, card one' })
+  const b = sibling(a, { headline: 'Delete keeps subscription, card two' })
+  const pa = await publish(a); const pb = await publish(b)
+  notifyDb.upsertSubscription(a.__keys.publicKey, 'keep@example.com', 'vt-keep', 'ut-keep', { intro_request: true, intro_accepted: true, weekly_digest: false, new_match: false })
+  const res = await fetch(`${base}/api/v3/cards/${pa.body.card_id}/delete-server-copy`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: signedVerbBody(a, 'delete-server-copy', pa.body.card_id),
+  })
+  assert.equal(res.status, 200)
+  assert.notEqual(notifyDb.getSubscription(a.__keys.publicKey), null, 'the subscription belongs to the identity, not to one card')
+  assert.equal((await (await fetch(`${base}/api/v3/cards/${pb.body.card_id}`)).json()).revocation_status, 'active')
+})

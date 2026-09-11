@@ -18,13 +18,13 @@ import * as matchesDb from './matches-db.js'
 import * as email from './notifications.js'
 import { embed } from './embeddings.js'
 import { networkVisibleText, networkVisibleView } from './v3-cards.js'
-import { checkRateLimit } from './db.js'
+import { checkRateLimit, getDb } from './db.js'
 import { recordCardEvent } from './card-events.js'
 import type { CardEvent } from './card-events.js'
 
 const router = Router()
 
-const LIMITS = { publish: 10, search: 30, verb: 30, renew: 10 }
+const LIMITS = { publish: 10, search: 30, verb: 30, renew: 10, replace: 10 }
 
 /** Store the semantic index vector, compute owner-only matches, and ping the
  *  operator. Shared by publish and renew. Never throws into the response. */
@@ -182,7 +182,7 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
   if (old.card.subject_key !== card.subject_key) { res.status(403).json({ error: 'not the card subject' }); return }
   if (old.revocation_status !== 'active') { res.status(409).json({ error: `only an active card can be renewed (this one is ${old.revocation_status})` }); return }
   if (!sameContentExceptTimestamps(old.card, card)) {
-    res.status(400).json({ error: 'renew requires identical content; use compose and publish to change a card' }); return
+    res.status(400).json({ error: 'renew requires identical content. Use compose and replace to change a card.' }); return
   }
 
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
@@ -199,6 +199,53 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
   v3db.recordSupersession(oldId, newId)
 
   res.status(201).json({ renewed: true, new_card_id: newId, superseded: oldId, card_hash: card.approval.card_hash, expires_at: card.expires_at })
+})
+
+// ── POST /api/v3/cards/:cardId/replace - a new version supersedes the old ──
+// The client composes the new card, the principal approves its hash, and the
+// card is sealed exactly as for publish. Inserting the new card, superseding
+// the old one, removing the old card's index and match artifacts and recording
+// the lineage link commit in one transaction, so a failure leaves both cards as
+// they were. Embedding, matching and email run after the commit, in
+// finalizePublish, which is async and stays outside the transaction.
+
+router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
+  const oldId = String(req.params.cardId)
+  const card = req.body?.card
+  const validation = validateV3Card(card)
+  if ('error' in validation) { res.status(400).json({ error: validation.error }); return }
+  const crypto = verifyCardCrypto(card)
+  if ('error' in crypto) { res.status(403).json({ error: crypto.error }); return }
+  if (Date.parse(card.expires_at) <= Date.now()) { res.status(400).json({ error: 'replacement card is already expired' }); return }
+  if (card.revocation_status !== 'active') { res.status(400).json({ error: 'a replacement card must be published with revocation_status active' }); return }
+
+  const old = v3db.getV3Card(oldId)
+  if (!old) { res.status(404).json({ error: 'card to replace not found' }); return }
+  if (old.card.subject_key !== card.subject_key) { res.status(403).json({ error: 'not the card subject' }); return }
+  if (old.revocation_status !== 'active') { res.status(409).json({ error: `only an active card can be replaced (this one is ${old.revocation_status})` }); return }
+  if (v3db.findActiveCardByHash(card.subject_key, card.approval.card_hash)) {
+    res.status(409).json({ error: 'this exact card is already live, so it cannot be the replacement' }); return
+  }
+
+  const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
+  try {
+    getDb().transaction(() => {
+      v3db.insertV3Card(newId, card, card.approval.card_hash)
+      v3db.setRevocationStatus(oldId, card.subject_key, 'superseded')
+      v3db.removeFromIndex(oldId)
+      matchesDb.deleteMatchArtifacts(oldId)
+      v3db.recordSupersession(oldId, newId)
+    })()
+  } catch (e) {
+    console.error('[v3] replace rolled back:', (e as Error).message)
+    res.status(500).json({ error: 'replace failed and nothing changed' }); return
+  }
+  // Recorded against both ids so either end of the chain finds the replacement.
+  recordCardEvent('card_replaced', newId, card.subject_key, { old_card_id: oldId, new_card_id: newId, card_hash: card.approval.card_hash, expires_at: card.expires_at })
+  recordCardEvent('card_replaced', oldId, card.subject_key, { old_card_id: oldId, new_card_id: newId, card_hash: card.approval.card_hash, expires_at: card.expires_at })
+  await finalizePublish(newId, card)
+
+  res.status(201).json({ replaced: true, new_card_id: newId, superseded: oldId, card_hash: card.approval.card_hash, expires_at: card.expires_at, revocation_status: 'active' })
 })
 
 // ── GET /api/v3/cards/:cardId - fetch, status always shown ───────────────
@@ -308,8 +355,6 @@ router.post('/cards/:cardId/delete-server-copy', rateLimited('verb', req => Stri
   if (!key) return
   v3db.deleteV3Card(cardId, key)
   matchesDb.deleteMatchArtifacts(cardId)
-  // Deleting the server copy also removes the principal's notification email.
-  notifyDb.deleteSubscription(key)
   recordCardEvent('card_server_copy_deleted', cardId, key, {})
   res.json({ card_id: cardId, revocation_status: 'deleted' })
 })
