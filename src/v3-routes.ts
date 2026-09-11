@@ -217,6 +217,13 @@ router.get('/cards/:cardId', (req, res) => {
 
 router.post('/cards/search', rateLimited('search', req => String(req.headers['x-public-key'] ?? '')), async (req, res) => {
   const { card_type, intents, topics, engagement, location, event_ref, query, limit, created_after, cursor } = req.body ?? {}
+  const hasQuery = typeof query === 'string' && query.trim().length > 0
+
+  // A query search is one ranked window whose next_cursor is always null, so a
+  // cursor has no next page to point at. Refuse the pair rather than guess.
+  if (hasQuery && cursor !== undefined && cursor !== null && cursor !== '') {
+    res.status(400).json({ error: 'cursor cannot be combined with query. A query search returns one ranked window and its next_cursor is always null.' }); return
+  }
 
   let decodedCursor: v3db.PageCursor | undefined
   if (typeof cursor === 'string' && cursor.length > 0) {
@@ -229,7 +236,7 @@ router.post('/cards/search', rateLimited('search', req => String(req.headers['x-
   if (created_after !== undefined && typeof created_after !== 'string') { res.status(400).json({ error: 'created_after must be an ISO string' }); return }
 
   let semanticIds: string[] | undefined
-  if (typeof query === 'string' && query.trim().length > 0) {
+  if (hasQuery) {
     try {
       const vec = await embed(query.trim())
       if (!vec) { res.status(500).json({ error: 'semantic search unavailable: embedding model not ready' }); return }

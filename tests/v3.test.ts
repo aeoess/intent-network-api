@@ -317,3 +317,52 @@ test('the v3 router exposes no bulk-export or category-download route', async ()
   const body = await res.json()
   assert.ok(body.count <= 50, `search must cap results, got ${body.count}`)
 })
+
+// ── Semantic search is one ranked window ──
+// The model is cold in this file, so these tests write synthetic unit vectors
+// straight into the index and hand the hit ids to the search, as the route does.
+
+function unitVec(weights: Record<number, number>): Float32Array {
+  const v = new Float32Array(384)
+  for (const [i, w] of Object.entries(weights)) v[Number(i)] = w
+  const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0))
+  return v.map(x => x / norm)
+}
+
+test('a query search ranks by embedding distance, so an older closer card comes first', async () => {
+  const v3db = await import('../src/v3-db.js')
+  const older = makeCard({ headline: 'Semantic probe, older and closer', created_at: new Date(Date.now() - 3600_000).toISOString() })
+  const newer = makeCard({ headline: 'Semantic probe, newer and farther' })
+  const po = await publish(older); const pn = await publish(newer)
+  assert.equal(po.status, 201, JSON.stringify(po.body)); assert.equal(pn.status, 201, JSON.stringify(pn.body))
+  const olderId = po.body.card_id, newerId = pn.body.card_id
+  v3db.storeV3Embedding(olderId, unitVec({ 0: 1, 1: 0.1 }))
+  v3db.storeV3Embedding(newerId, unitVec({ 0: 0.2, 1: 1 }))
+  const mine = (ids: unknown[]) => ids.filter(id => id === olderId || id === newerId)
+
+  const ids = v3db.semanticSearchV3(unitVec({ 0: 1 }), 20).map(h => h.card_id)
+  assert.deepEqual(mine(ids), [olderId, newerId], 'the index ranks the older card nearer')
+
+  const page = v3db.searchV3CardsPaged({ card_type: 'connection' }, { semanticIds: ids, limit: 20 })
+  assert.deepEqual(mine(page.results.map(r => r.card_id)), [olderId, newerId], 'results follow distance order, not recency')
+  assert.equal(page.next_cursor, null, 'a semantic search is one window and is never paged')
+
+  const top = v3db.searchV3CardsPaged({ card_type: 'connection' }, { semanticIds: ids, limit: 1 })
+  assert.deepEqual(top.results.map(r => r.card_id), [olderId], 'limit cuts the ranked list from the top')
+  assert.equal(top.next_cursor, null)
+
+  // The wall search takes the same ids and keeps the same order.
+  assert.deepEqual(mine(v3db.searchV3Cards({ card_type: 'connection' }, ids, 20).map(r => r.card_id)), [olderId, newerId])
+})
+
+test('query plus cursor is refused with a 400 that says why', async () => {
+  const cursor = Buffer.from(JSON.stringify({ created_at: new Date().toISOString(), card_id: 'v3-connection-x' })).toString('base64url')
+  const search = (body: unknown) => fetch(`${base}/api/v3/cards/search`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const res = await search({ query: 'agent identity', cursor })
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.match(body.error, /cursor/)
+  assert.match(body.error, /query/)
+  // A cursor without a query still pages through the keyset path.
+  assert.equal((await search({ card_type: 'connection', cursor })).status, 200)
+})

@@ -158,8 +158,36 @@ function passesJsFilters(card: V3Card, filters: V3SearchFilters): boolean {
   return true
 }
 
+/** Semantic search is one ranked window. Rows follow the order of semanticIds
+ *  (nearest first, as the vector index returned them), are filtered by the
+ *  explicit fields, and are cut at the limit. There is no cursor for it. */
+function semanticWindow(filters: V3SearchFilters, semanticIds: string[], limit: number, createdAfter?: string): Record<string, unknown>[] {
+  const ids = [...new Set(semanticIds)]
+  if (ids.length === 0) return []
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`, `card_id IN (${ids.map(() => '?').join(', ')})`]
+  const params: unknown[] = [...ids]
+  if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
+  if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
+  if (createdAfter) { where.push('created_at > ?'); params.push(createdAfter) }
+  const rows = d().prepare(`SELECT card_id, card_json FROM v3_cards WHERE ${where.join(' AND ')}`).all(...params) as any[]
+  const byId = new Map(rows.map(r => [r.card_id as string, r]))
+
+  const results: Record<string, unknown>[] = []
+  for (const id of ids) {
+    const row = byId.get(id)
+    if (!row) continue
+    const card = JSON.parse(row.card_json) as V3Card
+    card.revocation_status = 'active'
+    if (!passesJsFilters(card, filters)) continue
+    results.push(networkVisibleView({ ...card, card_id: row.card_id }))
+    if (results.length >= limit) break
+  }
+  return results
+}
+
 export function searchV3Cards(filters: V3SearchFilters, semanticIds?: string[], limit = 20): Record<string, unknown>[] {
   const cap = Math.min(limit, SEARCH_CAP)
+  if (semanticIds) return semanticWindow(filters, semanticIds, cap)
   const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
@@ -170,7 +198,6 @@ export function searchV3Cards(filters: V3SearchFilters, semanticIds?: string[], 
   for (const row of rows) {
     const card = JSON.parse(row.card_json) as V3Card
     card.revocation_status = 'active'
-    if (semanticIds && !semanticIds.includes(row.card_id)) continue
     if (!passesJsFilters(card, filters)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     if (results.length >= cap) break
@@ -182,11 +209,17 @@ export interface PageCursor { created_at: string; card_id: string }
 export interface PageOpts { semanticIds?: string[]; limit?: number; createdAfter?: string; cursor?: PageCursor }
 
 /** Stable keyset pagination for third-party agents. Orders by (created_at,
- *  card_id) DESC; the cursor is the last returned item, so pages never skip or
- *  repeat. next_cursor is null when the page did not fill (no more results
- *  within the scan window). */
+ *  card_id) DESC, and the cursor is the last returned item, so pages never skip
+ *  or repeat. next_cursor is null when the page did not fill (no more results
+ *  within the scan window). With semanticIds it is one ranked window instead:
+ *  distance order, cut at the limit, next_cursor always null. A cursor cannot
+ *  be combined with semanticIds. */
 export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}): { results: Record<string, unknown>[]; next_cursor: PageCursor | null } {
   const limit = Math.min(Math.max(1, opts.limit ?? 20), SEARCH_CAP)
+  if (opts.semanticIds) {
+    if (opts.cursor) throw new Error('a cursor cannot be combined with a semantic search')
+    return { results: semanticWindow(filters, opts.semanticIds, limit, opts.createdAfter), next_cursor: null }
+  }
   const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
@@ -205,7 +238,6 @@ export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}
   for (const row of rows) {
     const card = JSON.parse(row.card_json) as V3Card
     card.revocation_status = 'active'
-    if (opts.semanticIds && !opts.semanticIds.includes(row.card_id)) continue
     if (!passesJsFilters(card, filters)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     last = { created_at: row.created_at, card_id: row.card_id }
