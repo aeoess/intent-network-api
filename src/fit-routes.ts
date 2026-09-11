@@ -375,8 +375,9 @@ export function sweepExpiredFitExchanges(): { closed: number } {
   return { closed: expired.length }
 }
 
-// Exposed for tests/manual runs.
-router.post('/sweep', (_req, res) => { res.json(sweepExpiredFitExchanges()) })
+// Exposed for tests and manual runs, rate limited per client. The scheduler in
+// server.ts calls sweepExpiredFitExchanges directly, not this route.
+router.post('/sweep', rateLimited('fit_sweep', 6), (_req, res) => { res.json(sweepExpiredFitExchanges()) })
 
 export { verifyReceipt }
 export default router

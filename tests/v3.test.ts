@@ -485,3 +485,12 @@ test('deleting one of two cards leaves the identity-level subscription intact', 
   assert.notEqual(notifyDb.getSubscription(a.__keys.publicKey), null, 'the subscription belongs to the identity, not to one card')
   assert.equal((await (await fetch(`${base}/api/v3/cards/${pb.body.card_id}`)).json()).revocation_status, 'active')
 })
+
+// ── The bare sweep route is rate limited. The scheduler calls the function. ──
+
+test('the v3 sweep route allows 6 calls an hour per client, then answers 429', async () => {
+  db.getDb().prepare("DELETE FROM rate_limits WHERE action = 'v3_sweep'").run()
+  const codes: number[] = []
+  for (let i = 0; i < 7; i++) codes.push((await fetch(`${base}/api/v3/sweep`, { method: 'POST' })).status)
+  assert.deepEqual(codes, [200, 200, 200, 200, 200, 200, 429])
+})

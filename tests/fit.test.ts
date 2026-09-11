@@ -321,3 +321,9 @@ test('the 72h sweep closes an expired exchange', async () => {
   assert.equal(g.body.state, 'closed')
   assert.ok(g.body.record)
 })
+
+test('the fit sweep route allows 6 calls an hour per client, then answers 429', async () => {
+  const codes: number[] = []
+  for (let i = 0; i < 7; i++) codes.push((await fetch(`${base}/api/v3/fit/sweep`, { method: 'POST' })).status)
+  assert.deepEqual(codes, [200, 200, 200, 200, 200, 200, 429])
+})

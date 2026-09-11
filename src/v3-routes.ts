@@ -24,7 +24,7 @@ import type { CardEvent } from './card-events.js'
 
 const router = Router()
 
-const LIMITS = { publish: 10, search: 30, verb: 30, renew: 10, replace: 10 }
+const LIMITS = { publish: 10, search: 30, verb: 30, renew: 10, replace: 10, sweep: 6 }
 
 /** Store the semantic index vector, compute owner-only matches, and ping the
  *  operator. Shared by publish and renew. Never throws into the response. */
@@ -360,9 +360,10 @@ router.post('/cards/:cardId/delete-server-copy', rateLimited('verb', req => Stri
 })
 
 // ── POST /api/v3/sweep - expiry sweep including index removal ────────────
-// Operationally invoked by a scheduler; exposed for tests and manual runs.
+// The scheduler in server.ts calls sweepExpiredV3Cards directly. This route is
+// for tests and manual runs, rate limited per client (no signer to key on).
 
-router.post('/sweep', (_req, res) => {
+router.post('/sweep', rateLimited('sweep', req => String(req.ip ?? '')), (_req, res) => {
   res.json(v3db.sweepExpiredV3Cards())
 })
 
