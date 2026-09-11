@@ -146,6 +146,32 @@ test('a resubscribe that names only weekly_digest leaves every other pref as sto
   assert.deepEqual(same.prefs, expected)
 })
 
+// A pref change is a resubscribe with the same address, so that path must not
+// act like a new subscription.
+test('a pref update on a confirmed address stays confirmed, says so, and sends no confirmation', async () => {
+  const keys = generateKeyPair()
+  await subscribe(keys, 'confirmed@example.com')
+  await fetch(`${base}/api/v3/notifications/confirm/${notifyDb.getSubscription(keys.publicKey)!.verify_token}`)
+  sent.length = 0
+  const r = await subscribe(keys, 'confirmed@example.com', { new_match: true })
+  assert.equal(r.verified, true, 'the response reports the stored state')
+  assert.equal(r.confirmation_sent, false)
+  assert.equal(sent.length, 0, 'no confirmation email for an address that is already confirmed')
+  assert.deepEqual((await status(keys)).body, { subscribed: true, verified: true, prefs: { ...NEW_SUB_PREFS, new_match: true } })
+})
+
+test('changing the address still resets verification and sends one confirmation', async () => {
+  const keys = generateKeyPair()
+  await subscribe(keys, 'old-addr@example.com')
+  await fetch(`${base}/api/v3/notifications/confirm/${notifyDb.getSubscription(keys.publicKey)!.verify_token}`)
+  sent.length = 0
+  const r = await subscribe(keys, 'new-addr@example.com')
+  assert.equal(r.verified, false)
+  assert.equal(r.confirmation_sent, true)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].to, 'new-addr@example.com')
+})
+
 // ── Intro event emails ──
 
 function publishIntentCard(agentId: string, alias: string): any {

@@ -54,9 +54,13 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
   const verifyToken = randomBytes(24).toString('hex')
   const unsubToken = existing?.unsub_token ?? randomBytes(24).toString('hex')
   notifyDb.upsertSubscription(subject_key, addr, verifyToken, unsubToken, effective)
-  // The confirmation is the only email an unverified address receives.
-  const sent = await email.sendConfirmation(addr, verifyToken, unsubToken)
-  res.status(201).json({ subscribed: true, verified: false, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
+  // upsertSubscription keeps a confirmed row confirmed when the address is
+  // unchanged. That call is only a pref update, so it gets no new confirmation
+  // email, and the response reports the stored state. The confirmation is the
+  // only email an unverified address receives.
+  const verified = notifyDb.getSubscription(subject_key)?.verified ?? false
+  const sent = verified ? { sent: false } : await email.sendConfirmation(addr, verifyToken, unsubToken)
+  res.status(201).json({ subscribed: true, verified, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
 })
 
 // ── GET /confirm/:token ───────────────────────────────────────────────────
