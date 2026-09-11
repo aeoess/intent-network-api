@@ -125,7 +125,7 @@ const DAILY_CAP = 10
  *  type) already went out (dedupe) or, for non-direct mail, the recipient hit
  *  the daily cap. Direct-action mail (a person acted on something they joined)
  *  skips the cap but still dedupes. On true the row is recorded, so callers
- *  should only send after a true. */
+ *  should only send after a true, and call releaseSend if that send fails. */
 export function reserveSend(subjectKey: string, introId: string, type: string, direct = false): { ok: boolean; reason?: string } {
   if (!direct) {
     const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
@@ -138,4 +138,11 @@ export function reserveSend(subjectKey: string, introId: string, type: string, d
   } catch {
     return { ok: false, reason: 'duplicate' }
   }
+}
+
+/** Give a reservation back when the send it reserved did not happen, so a
+ *  retry of the same event can still send. Only the exact
+ *  (recipient, intro_id, type) row is removed. */
+export function releaseSend(subjectKey: string, introId: string, type: string): void {
+  d().prepare('DELETE FROM email_log WHERE subject_key = ? AND intro_id = ? AND type = ?').run(subjectKey, introId, type)
 }

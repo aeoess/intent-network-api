@@ -236,6 +236,49 @@ test('dedupe: the same intro event never emails twice', async () => {
   assert.equal(second.reason, 'duplicate')
 })
 
+// ── A failed send gives its dedupe reservation back ──
+
+function verifiedTarget(tag: string): string {
+  const keys = generateKeyPair()
+  notifyDb.upsertSubscription(keys.publicKey, `${tag}@example.com`, `vt-${tag}`, `ut-${tag}`, { intro_request: true, intro_accepted: true, weekly_digest: false, new_match: false })
+  notifyDb.confirmByToken(`vt-${tag}`)
+  return keys.publicKey
+}
+const logRowsFor = (key: string, introId: string): number =>
+  (db.getDb().prepare('SELECT COUNT(*) AS n FROM email_log WHERE subject_key = ? AND intro_id = ?').get(key, introId) as any).n
+
+test('a transport failure releases the reservation, so a retry sends exactly once', async () => {
+  const key = verifiedTarget('retry')
+  const args = { recipientKey: key, introId: 'introRetry', requesterHeadline: 'X', purpose: 'p', statusUrl: 'u' }
+
+  email.setTransport(async () => ({ ok: false, error: 'provider 503' }))
+  const failed = await email.notifyIntroRequest(args)
+  assert.equal(failed.sent, false)
+  assert.equal(failed.reason, 'provider 503')
+  assert.equal(logRowsFor(key, 'introRetry'), 0, 'the failed send left no reservation behind')
+
+  email.setTransport(async e => { sent.push(e); return { ok: true, id: 'mock' } })
+  const retried = await email.notifyIntroRequest(args)
+  assert.equal(retried.sent, true, JSON.stringify(retried))
+  const again = await email.notifyIntroRequest(args)
+  assert.equal(again.reason, 'duplicate', 'after a real send the dedupe holds')
+  assert.equal(sent.filter(e => e.to === 'retry@example.com').length, 1, 'exactly one email went out')
+  assert.equal(logRowsFor(key, 'introRetry'), 1)
+})
+
+test('a transport that throws also releases the reservation', async () => {
+  const key = verifiedTarget('throws')
+  const args = { recipientKey: key, introId: 'introThrow', requesterHeadline: 'X', purpose: 'p', statusUrl: 'u' }
+  email.setTransport(async () => { throw new Error('socket hang up') })
+  const failed = await email.notifyIntroRequest(args)
+  assert.equal(failed.sent, false)
+  assert.equal(failed.reason, 'socket hang up')
+  assert.equal(logRowsFor(key, 'introThrow'), 0)
+  email.setTransport(async e => { sent.push(e); return { ok: true, id: 'mock' } })
+  assert.equal((await email.notifyIntroRequest(args)).sent, true)
+  assert.equal(sent.filter(e => e.to === 'throws@example.com').length, 1)
+})
+
 // ── Unsubscribe + delete-server-copy ──
 
 test('signed unsubscribe deletes the row', async () => {

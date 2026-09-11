@@ -202,7 +202,11 @@ async function dispatch(
   if (!sub.prefs[prefKey]) return { sent: false, reason: 'pref_off' }
   const reserve = notifyDb.reserveSend(recipientKey, introId, type, direct)
   if (!reserve.ok) return { sent: false, reason: reserve.reason }
-  const result = await send(build(sub))
+  // A send that did not happen gives its reservation back, so a retry of the
+  // same event is not refused as a duplicate of mail that never went out.
+  let result: { ok: boolean; id?: string; error?: string }
+  try { result = await send(build(sub)) } catch (e) { result = { ok: false, error: (e as Error).message } }
+  if (!result.ok) notifyDb.releaseSend(recipientKey, introId, type)
   return { sent: result.ok, reason: result.ok ? undefined : result.error }
 }
 
