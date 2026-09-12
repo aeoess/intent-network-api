@@ -40,6 +40,7 @@ const introsDb = await import('../src/intros-db.js')
 const fitContext = await import('../src/fit-context.js')
 const fitRecord = await import('../src/fit-record.js')
 const serverKey = await import('../src/server-key.js')
+const fitRoutes = await import('../src/fit-routes.js')
 
 let server: Server
 let base: string
@@ -322,19 +323,34 @@ test('only the two parties can read an exchange', async () => {
   assert.equal((await getFit(stranger, exId, '/draft')).status, 403)
 })
 
-test('the 72h sweep closes an expired exchange', async () => {
+test('the 72h sweep closes an expired exchange, driven the way the scheduler drives it', async () => {
+  // POST /api/v3/fit/sweep is GONE as of step 25. It could not be canonicalized: it read no
+  // body, no key and no signature, so there was no actor to name in an envelope. The
+  // scheduler in server.ts has always called sweepExpiredFitExchanges directly, so this
+  // calls the same function the scheduler calls.
   const { exId, alice } = await makeExchange()
   // Force the window into the past.
   db.getDb().prepare('UPDATE v3_fit_exchanges SET expires_at = ? WHERE id = ?').run(new Date(Date.now() - 1000).toISOString(), exId)
-  const swept = await (await fetch(`${base}/api/v3/fit/sweep`, { method: 'POST' })).json()
+  const swept = fitRoutes.sweepExpiredFitExchanges()
   assert.ok(swept.closed >= 1)
   const g = await getFit(alice, exId)
   assert.equal(g.body.state, 'closed')
-  assert.ok(g.body.record)
+  assert.ok(g.body.record, 'and the record is still assembled, signed and served')
 })
 
-test('the fit sweep route allows 6 calls an hour per client, then answers 429', async () => {
-  const codes: number[] = []
-  for (let i = 0; i < 7; i++) codes.push((await fetch(`${base}/api/v3/fit/sweep`, { method: 'POST' })).status)
-  assert.deepEqual(codes, [200, 200, 200, 200, 200, 200, 429])
+test('the removed sweep route answers 404, with the flag set and unset', async () => {
+  // Removal is the only disposition the release gate accepts for this row, so this is the
+  // assertion that flips it from unrepaired to removed.
+  const before = process.env.MINGLE_FIT_ENABLED
+  try {
+    for (const value of ['1', undefined]) {
+      if (value === undefined) delete process.env.MINGLE_FIT_ENABLED
+      else process.env.MINGLE_FIT_ENABLED = value
+      const res = await fetch(`${base}/api/v3/fit/sweep`, { method: 'POST' })
+      assert.equal(res.status, 404, `flag ${String(value)}: the declaration is gone, so no route matches`)
+    }
+  } finally {
+    if (before === undefined) delete process.env.MINGLE_FIT_ENABLED
+    else process.env.MINGLE_FIT_ENABLED = before
+  }
 })

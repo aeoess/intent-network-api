@@ -737,15 +737,18 @@ export function sweepExpiredFitExchanges(): { closed: number } {
   return { closed: expired.length }
 }
 
-// Exposed for tests and manual runs, rate limited per client. The scheduler in
-// server.ts calls sweepExpiredFitExchanges directly, not this route.
+// POST /sweep IS GONE, and this comment is where it was.
 //
-// Behind fitGate as of step 18, which is CONTAINMENT and not repair: this route reads no
-// body, no public key and no signature, so there is nothing to sign and it cannot be
-// canonicalized at all. The release gate still counts it as unrepaired, deliberately,
-// because a route that counts as contained while the flag is off would make the gate
-// circular. Step 25 removes it.
-router.post('/sweep', fitGate, rateLimited('fit_sweep', 6), (_req, res) => { res.json(sweepExpiredFitExchanges()) })
+// It could not be canonicalized at all. Its declaration read (_req, res): no body, no public
+// key, no signature, so there was no actor to name in an envelope and nothing to sign. The
+// alternative to removing it was deciding who signs a sweep, which is a server authority model
+// and a genuine architectural decision that Stage 2B does not make.
+//
+// Removal is cheap because the route was redundant. The scheduler in server.ts calls
+// sweepExpiredFitExchanges directly and always has, so the sweep still runs on its own clock
+// and every expired exchange is still sealed. What is gone is an unauthenticated HTTP handle
+// that sealed and server signed a record for every expired exchange on the instance, at six
+// calls an hour from any client, which is why it held the release gate down on its own.
 
 export { verifyReceipt }
 export default router

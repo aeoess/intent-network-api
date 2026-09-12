@@ -1018,27 +1018,25 @@ test('FIT GATE: settings, maintenance and reads keep working with the flag unset
   })
 })
 
-test('FIT GATE: step 18 brought the last three ungated fit mutations behind the gate', async () => {
-  // At 909ffe3 these three were mutations with a PARTIAL verdict and no fitGate in their
-  // middleware chain, so "fit is contained" was true of nine of the twelve routes rather
-  // than of the surface. Found mechanically while building the release gate.
+test('FIT GATE: step 18 brought the last ungated fit mutations behind the gate', async () => {
+  // At 909ffe3 three routes were mutations with a PARTIAL verdict and no fitGate in their
+  // middleware chain, so "fit is contained" was true of nine of the twelve rather than of the
+  // surface. Found mechanically while building the release gate. The third of the three,
+  // POST /api/v3/fit/sweep, is GONE as of step 25 and has its own 404 test in fit.test.ts.
   //
-  // This is CONTAINMENT and not repair. Each one still counts as unrepaired in the release
+  // This is CONTAINMENT and not repair. Being behind fitGate counts for nothing in the release
   // gate, because a route that counted as unreachable while the flag is off would make the
   // gate circular.
   await withFitFlag(undefined, async () => {
-    for (const path of ['/api/v3/fit/sweep', '/api/v3/fit/ex-none/close', '/api/v4/fit/autonomy/pause']) {
+    for (const path of ['/api/v3/fit/ex-none/close', '/api/v4/fit/autonomy/pause']) {
       const res = await postJson(path)
       assert.equal(res.status, 503, path)
       assert.equal((await res.json()).code, 'fit_disabled', path)
     }
   })
   // And with the flag set each one reaches its own handler, so the gate is the only thing
-  // that changed. The sweep answers, and the other two refuse the empty body themselves.
+  // that changed. Both refuse the empty body themselves.
   await withFitFlag('1', async () => {
-    const swept = await postJson('/api/v3/fit/sweep')
-    assert.equal(swept.status, 200)
-    assert.equal(typeof (await swept.json()).closed, 'number')
     for (const path of ['/api/v3/fit/ex-none/close', '/api/v4/fit/autonomy/pause']) {
       const res = await postJson(path)
       assert.notEqual(res.status, 503, path)

@@ -136,13 +136,11 @@ test('GATE: with the flag at "1" the verdict is exactly whether every entry is s
   assert.equal(v.ok, unsatisfied.length === 0,
     'the enabled verdict must be nothing other than "every entry reached its disposition"')
   assert.equal(v.shortfalls.length > 0, unsatisfied.length > 0)
-  if (!v.ok) {
-    // While the work is unfinished this is the record of what is left. Once step 25 lands
-    // it prints nothing and the assertion above is what holds. Only the header and the
-    // shortfalls, because the flag-unset case already printed every route.
-    const lines = gate.formatGateReport(v).split('\n')
-    console.log([lines[0], ...lines.filter(l => l.startsWith('     '))].join('\n'))
-  }
+  // The header always, so a run log carries the verdict under BOTH flag values, plus the
+  // shortfalls while any remain. The flag-unset case already printed every route, so this
+  // does not repeat them.
+  const lines = gate.formatGateReport(v).split('\n')
+  console.log([lines[0], ...lines.filter(l => l.startsWith('     '))].join('\n'))
 })
 
 // ══════════════════════════════════════════════════════════════
