@@ -181,7 +181,7 @@
       "route": "/api/v4/fit/autonomy",
       "matrix_row": "31",
       "verdict": "YES",
-      "reason": "approved_hash binds the exact scope. Classified YES."
+      "reason": "approved_hash binds the exact scope, which is what the matrix classified YES. It has no replay defense, and registering a scope used to clear a pause, so a replayed body could re-arm autonomous disclosure after a canonically signed pause. setScope now preserves paused, so the replay cannot lift a pause. The route itself is still outside the gate because its verdict is YES."
     },
     {
       "method": "POST",

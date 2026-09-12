@@ -23,6 +23,13 @@ import { sweepExpiredV3Cards } from './v3-db.js'
 import { recomputeAllMatches } from './matches-db.js'
 import { runWeeklyDigest } from './weekly.js'
 import { assertReceiptKeyConfigured, assertTrustedKeySetConfigured } from './server-key.js'
+import {
+  evaluateReleaseGate, enumerateFitMutationRoutes, loadReleaseManifest, formatGateReport,
+} from './fit-release-gate.js'
+import { canonicalOperationsOf } from './write-pipeline.js'
+import { fitGate, fitEnabled } from './fit-gate.js'
+import { boundFieldsFor } from './write-evidence.js'
+import { ENVELOPE_OPERATIONS } from './write-envelope.js'
 
 const PORT = parseInt(process.env.PORT || '3100')
 
@@ -48,6 +55,34 @@ try {
 }
 
 const app = createApp()
+
+// ── The structured fit release gate, at boot ──
+// Nothing ran the gate outside CI, so a deploy with MINGLE_FIT_ENABLED set to "1" against a
+// build whose fit surface had regressed was stopped by nothing at runtime. It is now a boot
+// precondition, which is what "the flag stays unset until the gate passes" has to mean if the
+// flag is what turns the surface on.
+//
+// Entered ONLY when the flag is exactly "1", which is never in production, so with the flag
+// unset there is no filesystem read, no enumeration and no new way for a boot to fail.
+if (fitEnabled()) {
+  try {
+    const verdict = evaluateReleaseGate({
+      manifest: loadReleaseManifest(),
+      registered: enumerateFitMutationRoutes(app, { canonicalOperationsOf, fitGate }),
+      fitEnabled: true,
+      boundFields: op => (ENVELOPE_OPERATIONS as readonly string[]).includes(op) ? boundFieldsFor(op as any, 'canonical') : null,
+    })
+    if (!verdict.ok) {
+      console.error('[fit release gate] refusing to start with MINGLE_FIT_ENABLED=1:')
+      console.error(formatGateReport(verdict))
+      process.exit(1)
+    }
+    console.log(`[fit release gate] ${verdict.statuses.length} routes, all satisfied, fit enabled`)
+  } catch (e) {
+    console.error(`[fit release gate] refusing to start with MINGLE_FIT_ENABLED=1: ${(e as Error).message}`)
+    process.exit(1)
+  }
+}
 
 // ── Initialize DB and start ──
 getDb() // Ensures schema is created

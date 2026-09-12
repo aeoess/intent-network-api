@@ -46,6 +46,8 @@
 // unit test drive a synthetic unfinished entry through the same evaluator the live
 // gate uses.
 
+import { readFileSync } from 'node:fs'
+
 export type Verdict = 'NO' | 'PARTIAL'
 export type Disposition = 'canonical' | 'removed'
 
@@ -100,6 +102,11 @@ export type ProblemKind =
   | 'manifest_duplicate'
   | 'unlisted_mutation_route'
   | 'manifest_route_missing'
+  | 'unknown_operation'
+  | 'semantic_fields_drift'
+  | 'operation_set_wider'
+  | 'duplicate_registration'
+  | 'outside_gate_not_yes'
 
 export type ShortfallKind =
   | 'not_canonical'
@@ -149,10 +156,14 @@ export function evaluateReleaseGate(args: {
   manifest: unknown
   registered: readonly RegisteredRoute[]
   fitEnabled: boolean
-  /** What a canonical signature for this operation covers. Injected rather than
-   *  imported so a unit test can drive a synthetic operation through this evaluator
-   *  rather than through a parallel copy of it. */
-  boundFields: (operation: string) => readonly string[]
+  /** What a canonical signature for this operation covers, or null when there is no
+   *  such operation. Injected rather than imported so a unit test can drive a synthetic
+   *  operation through this evaluator rather than through a parallel copy of it.
+   *
+   *  Null matters: an operation the protocol does not have is a manifest that names
+   *  something that does not exist, which is the gate having stopped measuring rather
+   *  than work being unfinished, so it is a hard problem. */
+  boundFields: (operation: string) => readonly string[] | null
 }): GateVerdict {
   const problems: GateFinding[] = []
   const shortfalls: GateFinding[] = []
@@ -198,13 +209,39 @@ export function evaluateReleaseGate(args: {
     if (typeof e.reason !== 'string' || e.reason.length === 0) {
       problems.push({ kind: 'manifest_entry_malformed', route: at, detail: 'an outside_gate entry must say why it is outside the gate' })
     }
+    if (typeof e.verdict !== 'string' || e.verdict.length === 0) {
+      problems.push({ kind: 'manifest_entry_malformed', route: at, detail: 'an outside_gate entry must carry the verdict that puts it outside' })
+    }
+    // THE ROW CANNOT BE MOVED OUT OF THE GATE. Without this, a PARTIAL or NO row could be
+    // retired from the gate by editing one array into the other and writing a plausible
+    // reason, and the count would still be twelve. The gate covers exactly the rows the
+    // matrix classified PARTIAL or NO, so a row that claims to be outside must claim a
+    // verdict that is neither.
+    if (e.verdict === 'NO' || e.verdict === 'PARTIAL') {
+      problems.push({ kind: 'outside_gate_not_yes', route: at,
+        detail: `claims verdict ${e.verdict}, which is exactly what the gate covers, so it cannot sit outside it` })
+    }
     if (seen.has(at)) problems.push({ kind: 'manifest_duplicate', route: at, detail: 'listed in both halves of the manifest' })
     seen.add(at)
   }
   if (problems.length > 0) return empty
 
   // ── Exact set agreement, in both directions ──
-  const byKey = new Map(args.registered.map(r => [key(r.method, r.route), r]))
+  //
+  // A Map would collapse two declarations of the same method and path and keep the LAST,
+  // while Express runs the FIRST. So the duplicate is refused before any map is built,
+  // rather than silently resolved in the optimistic direction.
+  const byKey = new Map<string, RegisteredRoute>()
+  for (const r of args.registered) {
+    const at = key(r.method, r.route)
+    if (byKey.has(at)) {
+      problems.push({ kind: 'duplicate_registration', route: at,
+        detail: 'registered more than once, and Express runs the FIRST while a lookup would keep the last, so the gate cannot say which chain answers' })
+      continue
+    }
+    byKey.set(at, r)
+  }
+  if (problems.length > 0) return empty
   for (const [at] of byKey) {
     if (!seen.has(at)) {
       problems.push({ kind: 'unlisted_mutation_route', route: at,
@@ -231,17 +268,37 @@ export function evaluateReleaseGate(args: {
     } else if (live === null) {
       problems.push({ kind: 'manifest_route_missing', route: at,
         detail: 'required disposition is canonical and the application does not register it at all' })
+    } else if (args.boundFields(e.operation as string) === null) {
+      problems.push({ kind: 'unknown_operation', route: at,
+        detail: `the manifest names operation ${e.operation}, which the protocol does not have` })
     } else if (live.canonicalOperations === null) {
       shortfalls.push({ kind: 'not_canonical', route: at, detail: 'the handler chain accepts no mingle-write-v1 envelope' })
     } else if (!live.canonicalOperations.includes(e.operation as string)) {
       shortfalls.push({ kind: 'operation_not_accepted', route: at,
         detail: `accepts ${live.canonicalOperations.join(', ') || 'nothing'} rather than the required ${e.operation}` })
+    } else if (live.canonicalOperations.length !== 1) {
+      // A SUPERSET IS NOT A MATCH. A route that also accepts a second operation accepts one
+      // the manifest never named and whose semantic fields were therefore never checked,
+      // which is the gate having stopped measuring rather than unfinished work.
+      problems.push({ kind: 'operation_set_wider', route: at,
+        detail: `accepts ${live.canonicalOperations.join(', ')} while the manifest names only ${e.operation}, so the others are unaudited` })
     } else {
-      const covered = args.boundFields(e.operation as string)
-      const missing = (e.semantic_fields ?? []).filter(f => !covered.includes(f))
+      // EQUALITY, NOT A SUBSET. The manifest's semantic_fields must be exactly the payload
+      // part of that operation's bound list. A subset check would let someone weaken the
+      // manifest and keep the gate green, and the whole point of duplicating the list here
+      // is that the duplication IS the check.
+      const covered = args.boundFields(e.operation as string) as readonly string[]
+      const payloadPart = covered.filter(f => f.startsWith('payload.'))
+      const declared = [...(e.semantic_fields ?? [])]
+      const same = payloadPart.length === declared.length
+        && [...payloadPart].sort().every((f, i) => f === [...declared].sort()[i])
+      const missing = declared.filter(f => !covered.includes(f))
       if (missing.length > 0) {
         shortfalls.push({ kind: 'semantic_field_unbound', route: at,
           detail: `${e.operation} does not bind ${missing.join(', ')}` })
+      } else if (!same) {
+        problems.push({ kind: 'semantic_fields_drift', route: at,
+          detail: `the manifest names [${declared.join(', ')}] and ${e.operation} binds [${payloadPart.join(', ')}], so one of the two has drifted` })
       } else {
         satisfied = true
       }
@@ -262,8 +319,18 @@ export function evaluateReleaseGate(args: {
 
 /** The two mounts that carry the structured fit surface. Both must be found or the
  *  enumeration throws, because an enumeration that quietly finds one is a gate that
- *  passes half the surface without saying so. */
+ *  passes half the surface without saying so.
+ *
+ *  Matched as a case insensitive PREFIX rather than by equality. Express routes case
+ *  insensitively, so `/API/v3/FIT` serves the same requests as `/api/v3/fit`, and a mount
+ *  one level deeper such as `/api/v3/fit/exchange` is still the fit surface. Both forms
+ *  were silently skipped by an equality test. */
 export const FIT_MOUNTS = ['/api/v3/fit', '/api/v4/fit'] as const
+
+function isFitPath(path: string): boolean {
+  const lower = path.toLowerCase()
+  return FIT_MOUNTS.some(m => lower === m || lower.startsWith(m + '/'))
+}
 
 /** A mutation is anything that is not a read. GET is the only read method on these
  *  routers, and stating it this way rather than listing POST means a PUT or a DELETE
@@ -290,11 +357,24 @@ export function mountPrefixOf(layer: unknown): string | null {
   return /^(\/[A-Za-z0-9_.~-]+)+$/.test(path) ? path : null
 }
 
+/** Is this stack layer a mounted router rather than a route or a plain middleware? */
+function routerOf(layer: unknown): unknown[] | null {
+  const inner = (layer as { handle?: { stack?: unknown[] } } | null)?.handle?.stack
+  return Array.isArray(inner) ? inner : null
+}
+
 /** Every structured fit mutation route the app actually registers.
  *
  *  Independent of MINGLE_FIT_ENABLED by construction: fitGate is per-route middleware,
  *  so both fit routers are mounted whatever the flag says, and this reads the same
- *  stack either way. */
+ *  stack either way. A test asserts the two enumerations are identical.
+ *
+ *  WHAT IT PROVES AND WHAT IT DOES NOT. It proves that a route is registered, and that
+ *  SOME layer in its chain carries the canonical tag. It does NOT prove that the tagged
+ *  layer runs before a layer that could answer first, because an Express chain's control
+ *  flow is not readable from the stack. That gap is closed by a behavioural test beside
+ *  this one, which sends an envelope shaped body to every canonical route and requires a
+ *  canonical pipeline refusal code, so the lane is proved reachable rather than present. */
 export function enumerateFitMutationRoutes(app: unknown, opts: {
   canonicalOperationsOf: (handle: unknown) => readonly string[] | null
   fitGate: unknown
@@ -305,18 +385,37 @@ export function enumerateFitMutationRoutes(app: unknown, opts: {
   }
   const found: RegisteredRoute[] = []
   const mountsSeen = new Set<string>()
-  for (const layer of stack as any[]) {
-    const inner = layer?.handle?.stack
-    if (!Array.isArray(inner)) continue
-    const prefix = mountPrefixOf(layer)
-    if (prefix === null) {
-      throw new Error(`release gate: a mounted router's path could not be decoded from ${String(layer?.regexp)}`)
-    }
-    if (!(FIT_MOUNTS as readonly string[]).includes(prefix)) continue
-    mountsSeen.add(prefix)
-    for (const routeLayer of inner as any[]) {
-      const route = routeLayer?.route
-      if (!route || typeof route.path !== 'string') continue
+
+  /** Walk one router's stack, composing the prefix. Recursive, because a sub-router
+   *  mounted inside a fit router carries routes that are just as reachable and were
+   *  invisible to a single level walk. */
+  const walk = (layers: unknown[], prefix: string, inFit: boolean, depth: number): void => {
+    if (depth > 8) throw new Error('release gate: router nesting deeper than 8, which this walk refuses rather than truncates')
+    for (const layer of layers as any[]) {
+      const inner = routerOf(layer)
+      if (inner !== null) {
+        const own = mountPrefixOf(layer)
+        if (own === null) {
+          // Inside the fit surface an undecodable mount is fatal, because it could carry
+          // anything. Outside it, a mount this gate does not care about is skipped.
+          if (inFit) throw new Error(`release gate: a router mounted inside the fit surface could not be decoded from ${String(layer?.regexp)}`)
+          const guess = mountPrefixOf(layer)
+          if (guess === null) continue
+        }
+        const full = prefix + (own ?? '')
+        const fit = inFit || isFitPath(full)
+        if (fit) {
+          for (const m of FIT_MOUNTS) if (full.toLowerCase().startsWith(m)) mountsSeen.add(m)
+        }
+        walk(inner, full, fit, depth + 1)
+        continue
+      }
+      const route = layer?.route
+      if (!route) continue
+      if (!inFit) continue
+      // route.path is a string for the ordinary form and an ARRAY when one declaration
+      // registers several paths. Both are reachable, so both are enumerated.
+      const paths: unknown[] = Array.isArray(route.path) ? route.path : [route.path]
       const chain: any[] = Array.isArray(route.stack) ? route.stack : []
       let operations: readonly string[] | null = null
       let behindFitGate = false
@@ -325,23 +424,40 @@ export function enumerateFitMutationRoutes(app: unknown, opts: {
         if (ops !== null && ops.length > 0) operations = ops
         if (step?.handle === opts.fitGate) behindFitGate = true
       }
-      for (const method of Object.keys(route.methods ?? {})) {
-        if (READ_METHODS.has(method.toLowerCase())) continue
-        found.push({
-          method: method.toUpperCase(),
-          route: prefix + route.path,
-          canonicalOperations: operations,
-          behindFitGate,
-        })
+      for (const p of paths) {
+        if (typeof p !== 'string') {
+          throw new Error(`release gate: a route inside the fit surface has a path this walk cannot read: ${String(p)}`)
+        }
+        for (const method of Object.keys(route.methods ?? {})) {
+          if (READ_METHODS.has(method.toLowerCase())) continue
+          // `router.all` records the pseudo method `_all`, which is enumerated as `_ALL` so
+          // it fails as unlisted rather than passing unseen. A fit mutation registered that
+          // way has to be classified like any other.
+          found.push({
+            method: method.toUpperCase(),
+            route: prefix + (mountPrefixOf(layer) ?? '') + p,
+            canonicalOperations: operations,
+            behindFitGate,
+          })
+        }
       }
     }
   }
+  walk(stack, '', false, 0)
+
   for (const mount of FIT_MOUNTS) {
     if (!mountsSeen.has(mount)) {
       throw new Error(`release gate: ${mount} is not mounted, so the enumeration would cover only part of the fit surface`)
     }
   }
   return found
+}
+
+/** Load the checked-in manifest. Only the boot gate and the tests call this: the
+ *  evaluator itself takes the manifest as an argument and touches no filesystem. */
+export function loadReleaseManifest(): unknown {
+  const url = new URL('../fixtures/mingle-fit-release-gate.json', import.meta.url)
+  return JSON.parse(readFileSync(url, 'utf8'))
 }
 
 /** A one line status per gate entry, for a handoff or a failure message. */
