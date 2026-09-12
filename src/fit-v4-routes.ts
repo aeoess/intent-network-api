@@ -40,6 +40,10 @@ import { writeArtifact } from './private-artifacts.js'
 import { policyHashForCommitment, commitmentIsCurrent, registerPolicyCommitment, commitmentForPolicyHash } from './policy-commitment.js'
 import { renderFitHandshake, warrantList } from './receipt-render.js'
 import { boundFieldsFor } from './write-evidence.js'
+// Shared with the v3 fit exchange handlers, which run the same rules. Two copies of
+// "an unknown payload key is refused rather than dropped" would be two places for that
+// rule to drift.
+import { gateStringList as gateDimensionList, gateHex64, gatePayloadKeys } from './write-payload-gates.js'
 
 const router = Router()
 
@@ -194,8 +198,6 @@ function levelName(a: policyDb.PolicyDimension, b: policyDb.PolicyDimension): st
 //   fit_commit carries request_write_ref, so a commit names the request it answers
 //   first_step_approve moves its digest comparison and its write into one transaction
 
-const HEX64_RE = /^[0-9a-f]{64}$/
-
 /** How a shared helper refuses, so the two lanes can answer in their own idiom. */
 export type Refuse = (status: number, code: string, error: string) => never
 
@@ -206,44 +208,6 @@ class LegacyFitRefusal extends Error {
   }
 }
 const legacyRefuse: Refuse = (status, _code, error) => { throw new LegacyFitRefusal(status, error) }
-
-/** A dimension list a principal signed: non empty, sorted by code unit, no duplicates.
- *  Sorting it here would be a repair after approval, so an unsorted list is refused. */
-function gateDimensionList(value: unknown, field: string): string[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    refuseWrite(400, 'malformed_payload', `${field} must be a non empty array`)
-  }
-  const list = value as unknown[]
-  if (!list.every(x => typeof x === 'string' && x.length > 0)) {
-    refuseWrite(400, 'malformed_payload', `${field} must contain only non empty strings`)
-  }
-  const strings = list as string[]
-  for (let i = 1; i < strings.length; i++) {
-    if (strings[i - 1] === strings[i]) refuseWrite(400, 'malformed_payload', `${field} contains a duplicate`)
-    if (strings[i - 1] > strings[i]) refuseWrite(400, 'malformed_payload', `${field} must be sorted by code unit`)
-  }
-  return strings
-}
-
-function gateHex64(value: unknown, field: string): string {
-  if (typeof value !== 'string' || !HEX64_RE.test(value)) {
-    refuseWrite(400, 'malformed_payload', `${field} must be 64 lowercase hex characters`)
-  }
-  return value as string
-}
-
-/** Exactly these keys, plus optionally these. A field inside payload_digest that the
- *  server ignores is a field the signature says the principal asked for and the server
- *  did not honour, so an unknown one is refused rather than dropped. */
-function gatePayloadKeys(payload: Record<string, unknown>, required: string[], optional: string[] = []): void {
-  const present = Object.keys(payload)
-  for (const k of required) {
-    if (!present.includes(k)) refuseWrite(400, 'malformed_payload', `payload is missing ${k}`)
-  }
-  const allowed = new Set([...required, ...optional])
-  const extra = present.filter(k => !allowed.has(k))
-  if (extra.length > 0) refuseWrite(400, 'malformed_payload', `unexpected payload field: ${extra.join(', ')}`)
-}
 
 /** The actor's card and policy, resolved THROUGH the signed commitment rather than
  *  through a policy_hash the client sent in the clear.

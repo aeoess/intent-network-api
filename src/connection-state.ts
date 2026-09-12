@@ -33,15 +33,33 @@ export const INTRO_STATES: readonly IntroState[] = [
   'requested', 'interested', 'connecting', 'connected', 'declined', 'withdrawn', 'blocked', 'expired',
 ] as const
 
-/** The thirteen product actions, plus fit_round2, which ruling 12 gave envelope
- *  treatment. fit_round2 is not a product action and produces no state, but it is
- *  a signed act on a live connection so it counts as a continuation. */
+/** The thirteen product actions. Each one produces state, so each one is a row of the
+ *  104 cell guard matrix. Protocol sub-actions are the list below this one. */
 export const OPERATIONS = [
   'request_intro', 'withdraw_request', 'express_interest', 'decline', 'block_pair',
   'withdraw_interest', 'share_contact', 'withdraw_contact', 'fit_request', 'fit_commit',
   'release_exact', 'first_step_propose', 'first_step_approve',
 ] as const
-export type Operation = typeof OPERATIONS[number] | 'fit_round2'
+
+/** PROTOCOL SUB-ACTIONS. Signed acts that are not product lifecycle actions, so they
+ *  produce no state and are not part of the 104 cell guard matrix, but they are still
+ *  acts a principal authorizes and so they still need an envelope, an operation name, a
+ *  bound field list and a resource type.
+ *
+ *  Two shapes live here. `fit_round2` names an INTRO, so it counts as a continuation
+ *  exactly like the other fit acts. The `fit_exchange_` family names a v3 FIT EXCHANGE,
+ *  which has its own 72 hour window and its own state machine, so it is not an intro
+ *  continuation and cannot be: the authorization table keys on the intro. */
+export const PROTOCOL_OPERATIONS = [
+  'fit_round2', 'fit_exchange_round2',
+] as const
+export type Operation = typeof OPERATIONS[number] | typeof PROTOCOL_OPERATIONS[number]
+
+/** Operations whose resource is NOT an intro, so the intro state guard is not the right
+ *  question to ask about them. Their own guards live beside their routes. */
+export const NON_INTRO_OPERATIONS: readonly Operation[] = [
+  'fit_exchange_round2',
+] as const
 
 /** A continuation is a signed act on a live connection. The first one moves the
  *  pair to connecting, and each accepted one sets a new expiry from its own time. */
@@ -249,6 +267,12 @@ export function isTerminalState(state: IntroState): boolean {
  *  second request for the same pair is a new intro or a refusal, never a write
  *  against this one. */
 export function isWriteAllowedInState(operation: Operation, state: IntroState): boolean {
+  // An operation that names a fit exchange or a card never names an intro, so there is no
+  // intro state in which it may be written and the answer is always no. Explicit rather
+  // than a missing switch case, which with strictNullChecks off would return undefined and
+  // read as a refusal by accident rather than by decision.
+  if ((NON_INTRO_OPERATIONS as readonly string[]).includes(operation)) return false
+
   // block_pair stays available everywhere, including after a connection, because
   // blocking future pair activity is useful once contacts have been exchanged.
   // After a release it writes only the pair block and no intro level fact, which

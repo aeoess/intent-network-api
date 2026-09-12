@@ -29,16 +29,17 @@
 
 import { verify } from 'agent-passport-system'
 import { jcs, sha256Hex, checkCanonicalPayload, isValidNonce } from './canonical-write.js'
-import { OPERATIONS } from './connection-state.js'
+import { OPERATIONS, PROTOCOL_OPERATIONS } from './connection-state.js'
 import type { Operation } from './connection-state.js'
 
 export const WRITE_DOMAIN = 'mingle-write-v1'
 export const PAYLOAD_DOMAIN = 'mingle-payload-v1'
 export const PRIVATE_VALUE_DOMAIN = 'mingle-private-value-v1'
 
-/** Operations an envelope may name. The thirteen product actions plus fit_round2,
- *  which is a protocol sub-action rather than a product action. */
-export const ENVELOPE_OPERATIONS: readonly Operation[] = [...OPERATIONS, 'fit_round2'] as const
+/** Operations an envelope may name: the thirteen product actions plus every protocol
+ *  sub-action. One list, built from the two the lifecycle module owns, so an operation
+ *  cannot exist for the guard matrix and not for the wire, or the other way round. */
+export const ENVELOPE_OPERATIONS: readonly Operation[] = [...OPERATIONS, ...PROTOCOL_OPERATIONS] as const
 
 export const RESOURCE_TYPES = ['intro', 'intro_request', 'card_pair', 'card', 'fit_exchange'] as const
 export type ResourceType = typeof RESOURCE_TYPES[number]
@@ -65,6 +66,12 @@ export const OPERATION_RESOURCE_TYPE: Record<Operation, ResourceType> = {
   fit_request: 'intro',
   fit_commit: 'intro',
   fit_round2: 'intro',
+  // The v3 fit exchange is its own resource. It has its own 72 hour window, its own
+  // parties and its own state machine, and an act on it is not an act on the intro even
+  // though an exchange belongs to one. Naming the intro instead would put two different
+  // resources behind one identity, and the nonce store, the evidence rows and
+  // anti-downgrade all key on that identity.
+  fit_exchange_round2: 'fit_exchange',
   release_exact: 'intro',
   first_step_propose: 'intro',
   first_step_approve: 'intro',

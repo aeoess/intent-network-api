@@ -26,6 +26,12 @@ import { sealRecord } from './fit-record.js'
 import { verifyReceipt, serverPublicKey } from './server-key.js'
 import * as email from './notifications.js'
 import { recordCardEvent } from './card-events.js'
+import { canonicalWriteRoute, canonicalDispatch, refuseWrite } from './write-pipeline.js'
+import type { CanonicalContext } from './write-pipeline.js'
+import { gateStringList, gateHex64, gatePayloadKeys } from './write-payload-gates.js'
+import { exchangeForWrite, requireAntecedent } from './fit-exchange-guards.js'
+import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
+import { checkLegacyWrite, refuseLegacy } from './legacy-write-gate.js'
 
 const router = Router()
 
@@ -251,21 +257,85 @@ router.post('/:id/answers', fitGate, rateLimited('fit_answer', 60), async (req, 
   res.json({ ok: true, answered: answers.length })
 })
 
+// ══════════════════════════════════════════════════════════════
+// The canonical lane for the v3 fit exchange
+// ══════════════════════════════════════════════════════════════
+// Each repaired route gains a canonical branch ahead of its legacy branch, on the path
+// it already has, dispatched on the presence of an `envelope` key. A published 3.2.2
+// client needs no change: its body simply never carries that key.
+//
+// The resource is the EXCHANGE, not the intro. resource.id is the exchange id, which is
+// also the :id in the path, and canonicalDispatch refuses a disagreement between the two
+// rather than picking a winner.
+//
+// These acts write no connection_authorizations row and are not intro continuations. The
+// exchange has its own 72 hour window and its own state machine, and the authorization
+// table keys on the intro, so recording an exchange act as an intro fact would either
+// move an intro deadline from an act on a different resource or need a second key shape.
+// What they do record is canonical evidence, which is what a later reader needs, and the
+// pipeline records the anti-downgrade mode for (fit_exchange, id, actor).
+
+/** The questions this actor may escalate: the bank for the intent plus every custom
+ *  question on the exchange. Shared by both lanes so the two cannot disagree. */
+function knownQuestionIds(ex: fitDb.ExchangeRow): Set<string> {
+  const ids = new Set(fitDb.getBank(ex.intent).map(q => q.question_id))
+  for (const c of fitDb.customForExchange(ex.id)) ids.add(c.id)
+  return ids
+}
+
 // ── POST /:id/round2 - tell me more (<=3 questions) ───────────────────────
 
-router.post('/:id/round2', fitGate, rateLimited('fit_answer', 60), (req, res) => {
+const canonicalExchangeRound2 = canonicalWriteRoute({
+  operations: ['fit_exchange_round2'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['question_ids', 'antecedent_write_ref'])
+    const questionIds = gateStringList(write.payload.question_ids, 'question_ids', MAX_ROUND2)
+    const antecedent = gateHex64(write.payload.antecedent_write_ref, 'antecedent_write_ref')
+    const exchangeId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+
+    const ex = exchangeForWrite(exchangeId, actorKey, now)
+    requireAntecedent('fit_exchange', exchangeId, antecedent)
+    // EVERY id is checked before the FIRST is written. The legacy loop below used to
+    // validate and insert in one pass, so an unknown third id answered 400 with the first
+    // two already stored, which is a refusal after a write.
+    const known = knownQuestionIds(ex)
+    for (const qid of questionIds) {
+      if (!known.has(qid)) refuseWrite(400, 'unknown_question_id', `unknown question_id ${qid}`)
+    }
+
+    for (const qid of questionIds) fitDb.addRound2(ex.id, actorKey, qid)
+    fitDb.setState(ex.id, 'round2')
+    recordCanonicalEvidence(write)
+    return { exchange_id: ex.id, state: 'round2', round2: questionIds }
+  },
+})
+
+router.post('/:id/round2', fitGate, canonicalDispatch(canonicalExchangeRound2), rateLimited('fit_answer', 60), (req, res) => {
   const g = partyGuard(req, res, 'fit-round2'); if (!g) return
   const { ex, key } = g
   const { question_ids } = req.body ?? {}
   if (!Array.isArray(question_ids) || question_ids.length === 0 || question_ids.length > MAX_ROUND2) { res.status(400).json({ error: `question_ids required (1..${MAX_ROUND2})` }); return }
   if (ex.state === 'closed') { res.status(409).json({ error: 'exchange is closed' }); return }
-  const bankIds = new Set(fitDb.getBank(ex.intent).map(q => q.question_id))
-  const customIds = new Set(fitDb.customForExchange(ex.id).map(c => c.id))
+  // Anti-downgrade first, then the cutoff. An actor who has already escalated on this
+  // exchange with a signed envelope cannot go back to the weaker form.
+  const gate = checkLegacyWrite({ resourceType: 'fit_exchange', resourceId: ex.id, actorKey: key, introId: ex.intro_id })
+  if (gate !== null) { refuseLegacy(res, 'fit_exchange_round2', ex.id, gate); return }
+  // Validate every id before writing any. The old loop did both in one pass.
+  const known = knownQuestionIds(ex)
   for (const qid of question_ids) {
-    if (!bankIds.has(qid) && !customIds.has(qid)) { res.status(400).json({ error: `unknown question_id ${qid}` }); return }
-    fitDb.addRound2(ex.id, key, String(qid))
+    if (!known.has(qid)) { res.status(400).json({ error: `unknown question_id ${qid}` }); return }
   }
+  for (const qid of question_ids) fitDb.addRound2(ex.id, key, String(qid))
   fitDb.setState(ex.id, 'round2')
+  // Labelled legacy_unbound, and the bound list names the exchange id and nothing else,
+  // because fit-round2:${id}:${nonce} covers not one character of question_ids.
+  recordLegacyEvidence({
+    actorKey: key, operation: 'fit_exchange_round2',
+    resourceType: 'fit_exchange', resourceId: ex.id,
+    signature: String(req.query.signature ?? req.body?.signature ?? ''),
+  })
   res.json({ ok: true, round2: question_ids })
 })
 

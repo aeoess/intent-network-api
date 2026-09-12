@@ -41,7 +41,8 @@ const CANONICAL_BOUND: Record<Operation, string[]> = {
   release_exact: ['operation', 'resource.id', 'payload.dimension', 'payload.policy_commitment', 'payload.private_value_commitment'],
   first_step_propose: ['operation', 'resource.id', 'payload.purpose', 'payload.next_action', 'payload.meeting_length', 'payload.agenda', 'payload.each_wants', 'payload.boundaries', 'payload.expiry'],
   first_step_approve: ['operation', 'resource.id', 'payload.approved_digest'],
-  fit_round2: ['operation', 'resource.id', 'payload.dimension_ids', 'payload.question_ids', 'payload.antecedent_write_ref'],
+  fit_round2: ['operation', 'resource.id', 'payload.dimension_ids', 'payload.antecedent_write_ref'],
+  fit_exchange_round2: ['operation', 'resource.id', 'payload.question_ids', 'payload.antecedent_write_ref'],
 }
 
 /** What a published 3.2.2 legacy preimage covers, per operation, taken from the
@@ -59,6 +60,9 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   release_exact: ['intro_id', 'dimension'],
   first_step_propose: ['intro_id'],
   first_step_approve: ['intro_id', 'approved_digest'],
+  // `id` is the EXCHANGE id here, which is what fit-round2:${id}:${nonce} interpolates.
+  // question_ids is absent because not one character of it is in those bytes.
+  fit_exchange_round2: ['id'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -74,6 +78,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   release_exact: 'fit-reveal:${introId}:${dimension}:${nonce}',
   first_step_propose: 'fit-firststep:${introId}:${nonce}',
   first_step_approve: 'fit-firststep-approve:${introId}:${approved_digest}:${nonce}',
+  fit_exchange_round2: 'fit-round2:${id}:${nonce}',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {
@@ -149,6 +154,13 @@ export function recordLegacyEvidence(args: {
 
 export function evidenceById(id: string): EvidenceRow | null {
   const row = getDb().prepare('SELECT * FROM write_evidence WHERE evidence_id = ?').get(id) as any
+  return row ?? null
+}
+
+/** One row by its write_ref, which is how a later act names the act it follows. Null for
+ *  a legacy row, which has no write_ref, and for a ref that names nothing. */
+export function evidenceByWriteRef(writeRef: string): EvidenceRow | null {
+  const row = getDb().prepare('SELECT * FROM write_evidence WHERE write_ref = ?').get(writeRef) as any
   return row ?? null
 }
 
