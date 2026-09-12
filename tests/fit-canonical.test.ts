@@ -1170,7 +1170,7 @@ test('FIT ANSWERS: a rewritten text, a substituted ledger text and an unaskable 
   const item = await setLedgerFor(p.bob, p.bobCard, ['I can give three evenings.'])
   const bad: [string, any, number, string][] = [
     ['a link the gate would strip',
-      [{ dimension: 'cadence', mode: 'drafted', text: 'See https://example.com/cadence' }], 400, 'text_not_stored_as_signed'],
+      [{ dimension: 'cadence', mode: 'drafted', text: 'See https://example.com/cadence' }], 400, 'text_contains_link'],
     ['contact data',
       [{ dimension: 'cadence', mode: 'drafted', text: 'Reach me at me@example.com' }], 400, 'post_gate_refused'],
     ['a ledger text of the signer\'s choosing',

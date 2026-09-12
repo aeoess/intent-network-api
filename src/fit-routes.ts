@@ -286,11 +286,13 @@ const canonicalExchangeAnswers = canonicalWriteRoute({
       if (!gate.ok) {
         refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the answer text was refused')
       }
-      const cleaned = new Map((gate.cleaned ?? []).map(c => [c.question_id, c.text]))
+      // containsUrl rather than a comparison against the gate's cleaned output, for the
+      // reason in the custom handler above: stripUrls collapses whitespace too, so the
+      // comparison refused ordinary prose and blamed a link.
       for (const a of drafted) {
-        if (cleaned.get(a.question_id) !== a.text) {
-          refuseWrite(400, 'text_not_stored_as_signed',
-            `the answer to ${a.question_id} would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.`)
+        if (introsDb.containsUrl(a.text as string)) {
+          refuseWrite(400, 'text_contains_link',
+            `the answer to ${a.question_id} may not contain a link, and Mingle does not rewrite one for you`)
         }
       }
     }
@@ -518,18 +520,21 @@ const canonicalExchangeCustom = canonicalWriteRoute({
     const texts = gateQuestionTexts(write.payload.questions, remaining)
 
     // The post-gate still runs, because it is a safety screen on text a counterparty will
-    // read and it is not negotiable. What changes is what happens when it would REWRITE
-    // the text: the old handler stored the cleaned output, so the stored question was not
-    // the question the principal signed and the record could not be recomputed from the
-    // signature. Now a text that changes under the gate is REFUSED and the client is told
-    // to re-approve, because repairing text after approval is the whole defect.
+    // read and it is not negotiable. What changes is what happens when it would REWRITE the
+    // text: the old handler stored the cleaned output, so the stored question was not the
+    // question the principal signed. Now a link is REFUSED and the text is stored verbatim.
+    //
+    // THE PREDICATE IS containsUrl, NOT A COMPARISON AGAINST THE CLEANED OUTPUT. stripUrls
+    // also collapses whitespace, so comparing against it refused any text with a double
+    // space, a tab, a newline or a non-breaking space, and told the caller to remove a link
+    // they did not have. intros-db.ts:75-81 documents exactly that trap and supplies this
+    // predicate for the canonical lane, and the intro note lane already uses it.
     const gate = postGateDrafted(texts.map((t, i) => ({ question_id: `custom-${i}`, text: t })))
     if (!gate.ok) refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the question text was refused')
-    const cleaned = gate.cleaned ?? []
-    for (let i = 0; i < texts.length; i++) {
-      if (cleaned[i]?.text !== texts[i]) {
-        refuseWrite(400, 'text_not_stored_as_signed',
-          'this question would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.')
+    for (const text of texts) {
+      if (introsDb.containsUrl(text)) {
+        refuseWrite(400, 'text_contains_link',
+          'a custom question may not contain a link, and Mingle does not rewrite one for you')
       }
     }
 

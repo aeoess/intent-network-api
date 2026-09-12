@@ -1139,17 +1139,21 @@ const canonicalFitAnswers = canonicalWriteRoute({
       }
     }
 
-    // The post-gate screens the whole drafted batch, and a text it would REWRITE is refused
-    // rather than cleaned, so the stored answer is the signed answer.
+    // The post-gate screens the whole drafted batch, and a link is refused rather than
+    // stripped, so the stored answer is the signed answer.
+    //
+    // containsUrl rather than a comparison against the gate's cleaned output: stripUrls also
+    // collapses whitespace, so the comparison refused any text with a double space, a tab or
+    // a non-breaking space and told the caller to remove a link they did not have.
+    // intros-db.ts:75-81 documents that trap and supplies this predicate for exactly this.
     const drafted = answers.filter(a => a.mode === 'drafted')
     if (drafted.length > 0) {
       const gate = postGateDrafted(drafted.map(a => ({ question_id: a.dimension, text: a.text as string })))
       if (!gate.ok) refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the answer text was refused')
-      const cleaned = new Map((gate.cleaned ?? []).map(c => [c.question_id, c.text]))
       for (const a of drafted) {
-        if (cleaned.get(a.dimension) !== a.text) {
-          refuseWrite(400, 'text_not_stored_as_signed',
-            `the answer for ${a.dimension} would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.`)
+        if (introsDb.containsUrl(a.text as string)) {
+          refuseWrite(400, 'text_contains_link',
+            `the answer for ${a.dimension} may not contain a link, and Mingle does not rewrite one for you`)
         }
       }
     }

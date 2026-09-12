@@ -446,10 +446,9 @@ test('EXCHANGE CUSTOM: the signed text is stored byte identical, in the order si
   assert.equal(evidence.covers(row, 'payload.questions'), true)
 })
 
-test('EXCHANGE CUSTOM: text that the gate would REWRITE is refused rather than cleaned', async () => {
+test('EXCHANGE CUSTOM: a link is refused rather than stripped, and ordinary prose is not', async () => {
   // The repair. The old handler ran stripUrls and stored the output, so the stored question
-  // was not the question the principal signed and the record could not be recomputed from
-  // the signature. Repairing text after approval is the defect, so this refuses.
+  // was not the question the principal signed. Repairing text after approval is the defect.
   const ex = await exchange()
   const { body } = signedBody({
     operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys,
@@ -457,8 +456,37 @@ test('EXCHANGE CUSTOM: text that the gate would REWRITE is refused rather than c
   })
   const res = await postJson(exUrl(ex.id, '/custom'), body)
   assert.equal(res.status, 400, JSON.stringify(res.json))
-  assert.equal(res.json.code, 'text_not_stored_as_signed')
+  assert.equal(res.json.code, 'text_contains_link')
   assert.deepEqual(fitDb.customForExchange(ex.id), [], 'and nothing is stored in either form')
+
+  // AND THE PART THAT MATTERS MORE. The predicate is containsUrl, not a comparison against
+  // stripUrls' output, because stripUrls collapses whitespace too. Comparing against it
+  // refused every one of these and blamed a link the text does not have.
+  // A tab and a newline are refused EARLIER, by the payload gate, with control_character,
+  // which is accurate. What the comparison got wrong is whitespace the payload gate allows:
+  // a double space, a non-breaking space and an ideographic space.
+  const ordinary = [
+    'Three evenings a week  and most Saturdays.',
+    'A non breaking\u00a0space.',
+    'An ideographic\u3000space.',
+  ]
+  for (const q of ordinary) {
+    const fresh = await exchange()
+    const ok = signedBody({
+      operation: 'fit_exchange_custom', resourceId: fresh.id, keys: fresh.alice.keys, payload: { questions: [q] },
+    })
+    const r = await postJson(exUrl(fresh.id, '/custom'), ok.body)
+    assert.equal(r.status, 201, `${JSON.stringify(q)} was refused: ${JSON.stringify(r.json)}`)
+    assert.deepEqual(fitDb.customForExchange(fresh.id).map(c => c.text), [q],
+      'and stored byte identical, whitespace included')
+  }
+  // The gate's own refusals still stand, with their own codes.
+  const withTab = await exchange()
+  const tabbed = signedBody({
+    operation: 'fit_exchange_custom', resourceId: withTab.id, keys: withTab.alice.keys,
+    payload: { questions: ['A tab\tinside.'] },
+  })
+  assert.equal((await postJson(exUrl(withTab.id, '/custom'), tabbed.body)).json.code, 'control_character')
 
   // The legacy lane still cleans and stores, because that is what a published client
   // expects, and its evidence row says the text was never covered.
@@ -635,7 +663,7 @@ test('EXCHANGE ANSWERS: the LEGACY lane still cannot be recomputed, and its evid
     'the bound list names what ARRIVED and never the stored text')
 })
 
-test('EXCHANGE ANSWERS: a drafted text the gate would rewrite is refused, and nothing is stored', async () => {
+test('EXCHANGE ANSWERS: a link is refused, and ordinary whitespace is stored verbatim', async () => {
   const ex = await exchange()
   const { body } = signedBody({
     operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
@@ -643,8 +671,22 @@ test('EXCHANGE ANSWERS: a drafted text the gate would rewrite is refused, and no
   })
   const res = await postJson(exUrl(ex.id, '/answers'), body)
   assert.equal(res.status, 400)
-  assert.equal(res.json.code, 'text_not_stored_as_signed')
+  assert.equal(res.json.code, 'text_contains_link')
   assert.deepEqual(fitDb.answersForExchange(ex.id), [])
+
+  // Ordinary prose with collapsible whitespace is accepted and stored byte identical. A
+  // comparison against stripUrls' output refused this, because stripUrls collapses
+  // whitespace as well as removing links.
+  const text = 'Three evenings a week  and\u00a0most Saturdays.'
+  const ok = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'drafted', text }] },
+  })
+  const r = await postJson(exUrl(ex.id, '/answers'), ok.body)
+  assert.equal(r.status, 201, JSON.stringify(r.json))
+  assert.equal(fitDb.answersForExchange(ex.id).find(a => a.question_id === 'cofound-1')!.text, text)
+  assert.equal(digestOfStoredAnswers(ex.id, ex.bob.keys.publicKey, 'fit_exchange_answers'), ok.built.payloadDigest,
+    'and it still recomputes to the signed digest, which a collapsed string would not')
 })
 
 test('EXCHANGE ANSWERS: a ledger answer whose signed text is not the item text is refused', async () => {
