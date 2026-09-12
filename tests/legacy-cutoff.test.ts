@@ -4,17 +4,18 @@
 // The last step, because it is the only one that can refuse a working client. What is being
 // held down:
 //
-//   1  ALL EIGHT legacy mutation routes run both checks, driven as a matrix rather than one
-//      route at a time, so a route that forgot the gate is a red test and not an omission
-//      somebody has to notice
+//   1  the legacy mutation routes run both checks, driven as a matrix rather than one route at
+//      a time. The matrix does NOT reach every gate: four of the fifteen call sites need a v3
+//      fit exchange or a v4 round two scene that this file does not build, and they are named
+//      in UNCOVERED_BY_MATRIX below. A manifest check holds every site to being either driven
+//      or listed, so a NEW route that forgets the gate is a red test, and a listed one is a
+//      stated gap rather than an omission nobody notices. Before that check, deleting those
+//      four gates left the whole suite green.
 //   2  the two refusals share a status and a body byte for byte, and are distinguished ONLY
 //      in the internal log, which the tests capture
 //   3  anti-downgrade is per actor and per resource: the counterparty on the same intro is
 //      unaffected, and no row exists for a key that has not written
 //   4  the grandfathered row is exempt from the cutoff and keeps working
-//
-// The eight routes cover all thirteen product actions, because /respond multiplexes
-// express_interest, decline and block_pair.
 
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
@@ -640,4 +641,64 @@ test('GATE: the two refusals are the same status and body, and differ only in th
   for (const r of reasons) {
     assert.equal(gate.LEGACY_REFUSAL.error.includes(r), false, 'the reason never reaches the caller')
   }
+})
+
+// ══════════════════════════════════════════════════════════════
+// Every gate is driven or declared. Nothing is silently ungated.
+// ══════════════════════════════════════════════════════════════
+
+/** The gates this file cannot drive, with the reason. Each needs a scene this file does not
+ *  build: a live v3 fit exchange, which opens on accept only when both cards share a banked
+ *  intent, or a v4 round two, which needs a committed handshake with unresolved dimensions.
+ *  Listed rather than quietly missing, so the count below is a promise and not an accident. */
+const UNCOVERED_BY_MATRIX: Record<string, string> = {
+  fit_exchange_answers: 'needs a live v3 fit exchange scene',
+  fit_exchange_round2: 'needs a live v3 fit exchange scene',
+  fit_exchange_custom: 'needs a live v3 fit exchange scene',
+  fit_exchange_close: 'needs a live v3 fit exchange scene',
+  fit_round2: 'needs a committed v4 handshake with unresolved dimensions',
+  fit_answers: 'driven by fit-v4.test.ts rather than by this matrix',
+  autonomy_pause: 'driven by fit-v4.test.ts rather than by this matrix',
+}
+
+test('MANIFEST: every legacy gate in the source is either driven by this matrix or declared uncovered', async () => {
+  // The header used to claim ALL EIGHT routes were driven. There are fifteen call sites, the
+  // matrix drives ten, and four of the five it misses are live 3.2.2 surfaces. Deleting those
+  // four gates left 583 tests passing. A claim that cannot fail is worse than no claim, so this
+  // reads the source and holds every site to being in one list or the other.
+  const { readdirSync, readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const srcDir = join(import.meta.dirname, '..', 'src')
+  const sites: { file: string; operation: string }[] = []
+  for (const f of readdirSync(srcDir).filter(n => n.endsWith('.ts'))) {
+    const body = readFileSync(join(srcDir, f), 'utf8')
+    for (const m of body.matchAll(/refuseLegacy\(\s*res\s*,\s*[`']([^`']+)[`']/g)) {
+      sites.push({ file: f, operation: m[1] })
+    }
+  }
+  assert.ok(sites.length >= 15, `expected at least fifteen gate sites, found ${sites.length}`)
+
+  // What the matrix actually drives. `respond:${action}` covers the three /respond actions.
+  const driven = new Set<string>([
+    'request_intro', 'respond:accept', 'respond:decline', 'respond:decline_and_block',
+    'share_contact', 'fit_request', 'fit_commit', 'release_exact',
+    'first_step_propose', 'first_step_approve',
+  ])
+  const matrixActions = new Set(LANES.map(l => l.action))
+  assert.equal(matrixActions.size, LANES.length, 'no lane name is duplicated')
+
+  const undeclared = sites
+    .map(s => s.operation)
+    .filter(op => !driven.has(op) && !(op in UNCOVERED_BY_MATRIX))
+    // `respond:${action}` is a template in the source and expands to the three driven names.
+    .filter(op => !op.startsWith('respond:'))
+  assert.deepEqual(undeclared, [],
+    `these legacy gates are neither driven by the matrix nor declared uncovered: ${undeclared.join(', ')}. ` +
+    'Add a lane, or add it to UNCOVERED_BY_MATRIX with the reason it cannot be driven here.')
+
+  // And nothing is declared uncovered that has since disappeared from the source, so the list
+  // cannot rot into a permanent excuse for gates that no longer exist.
+  const present = new Set(sites.map(s => s.operation))
+  const stale = Object.keys(UNCOVERED_BY_MATRIX).filter(op => !present.has(op))
+  assert.deepEqual(stale, [], `UNCOVERED_BY_MATRIX names gates the source no longer has: ${stale.join(', ')}`)
 })

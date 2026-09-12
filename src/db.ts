@@ -203,9 +203,16 @@ export function stampCanonicalMcpReleaseOnce(env: { MINGLE_CANONICAL_MCP_RELEASE
     throw new Error(`MINGLE_CANONICAL_MCP_RELEASED_AT is not a parseable instant: ${at}`)
   }
   const cutoff = new Date(released.getTime() + 30 * 24 * 3600 * 1000)
-  const ins = getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
-  ins.run(CANONICAL_MCP_RELEASED_KEY, released.toISOString())
-  ins.run(LEGACY_WRITE_CUTOFF_KEY, cutoff.toISOString())
+  // ONE TRANSACTION. Two separate INSERT OR IGNORE runs could leave the two markers describing
+  // different releases: with only the release marker present, a later boot under a different
+  // instant kept the old release and stamped a cutoff 30 days after the NEW one, so the pair
+  // said 303 days apart rather than 30. Nothing enforces the 30 day relation on read, so the
+  // atomicity has to be here.
+  getDb().transaction(() => {
+    const ins = getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
+    ins.run(CANONICAL_MCP_RELEASED_KEY, released.toISOString())
+    ins.run(LEGACY_WRITE_CUTOFF_KEY, cutoff.toISOString())
+  })()
 }
 
 /** The absolute cutoff, or null when it has never been stamped.
@@ -217,11 +224,21 @@ export function legacyWriteCutoffAt(): string | null {
   return getSchemaMarker(LEGACY_WRITE_CUTOFF_KEY)
 }
 
-/** Has the legacy write window closed? False when unstamped, by the rule above. */
+/** Has the legacy write window closed? False when unstamped, by the rule above.
+ *
+ *  An UNPARSEABLE marker is a fault, not an answer. Before this it fell through to
+ *  `now >= NaN`, which is false, so a corrupt marker silently treated the window as open
+ *  forever with nothing logged. Failing open is the right direction and NaN arithmetic is not a
+ *  decision, so the fault is now stated once per call and the direction is deliberate. */
 export function legacyWindowClosed(now: Date = new Date()): boolean {
   const cutoff = legacyWriteCutoffAt()
   if (cutoff === null) return false
-  return now.getTime() >= Date.parse(cutoff)
+  const at = Date.parse(cutoff)
+  if (Number.isNaN(at)) {
+    console.error(`[legacy cutoff] the ${LEGACY_WRITE_CUTOFF_KEY} marker is not a parseable instant: ${JSON.stringify(cutoff)}. Treating the window as OPEN, which refuses nobody, and it needs fixing before the cutoff can take effect.`)
+    return false
+  }
+  return now.getTime() >= at
 }
 
 /** A recorded marker, or null when this database has never had one written.

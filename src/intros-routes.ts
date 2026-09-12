@@ -214,7 +214,13 @@ const canonicalRequestIntro = canonicalWriteRoute({
 
 // ── POST /request ─────────────────────────────────────────────────────────
 
-router.post('/request', canonicalDispatch(canonicalRequestIntro), rateLimited('intro_request', 20), asyncRoute(async (req, res) => {
+// THE LIMITER RUNS FIRST, ahead of the canonical dispatch.
+//
+// canonicalDispatch answers the request itself when an envelope is present and never calls
+// next(), so mounting it before the limiter meant the legacy lane paid a 20 per IP cap and the
+// canonical lane paid nothing. The asymmetry favoured the newer lane, which is the wrong way
+// round for a surface that is about to become the only one.
+router.post('/request', rateLimited('intro_request', 20), canonicalDispatch(canonicalRequestIntro), asyncRoute(async (req, res) => {
   const { from_card, to_card, purpose, note, public_key, nonce, signature } = req.body ?? {}
   if (typeof from_card !== 'string' || typeof to_card !== 'string' || typeof nonce !== 'string') {
     res.status(400).json({ error: 'from_card, to_card, nonce required' }); return
@@ -333,7 +339,7 @@ const canonicalRespond = canonicalWriteRoute({
 
 // ── POST /:id/respond {action, contact?} ──────────────────────────────────
 
-router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('intro_respond', 30), asyncRoute(async (req, res) => {
+router.post('/:id/respond', rateLimited('intro_respond', 30), canonicalDispatch(canonicalRespond), asyncRoute(async (req, res) => {
   const id = String(req.params.id)
   const { action, contact, public_key, nonce, signature } = req.body ?? {}
   if (!['accept', 'decline', 'decline_and_block'].includes(action)) { res.status(400).json({ error: 'action must be accept, decline, or decline_and_block' }); return }
