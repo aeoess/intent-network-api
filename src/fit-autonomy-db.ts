@@ -105,9 +105,19 @@ export function setScope(cardId: string, subjectKey: string, scope: AutonomyScop
   const hash = scopeHash(scope)
   const cur = (d().prepare('SELECT version FROM v4_fit_autonomy WHERE card_id = ?').get(cardId) as any)?.version ?? 0
   const version = cur + 1
+  // A PAUSE SURVIVES A SCOPE REGISTRATION. This used to set paused = 0 on the conflict
+  // branch, so registering a scope resumed autonomous disclosure as a side effect, and this
+  // route carries no nonce store, so a captured body replayed verbatim lifted a canonically
+  // signed pause and re-armed autonomous disclosure with no fresh human tap. That defeated
+  // the whole point of giving autonomy_pause an envelope: replay defense on the pause is
+  // worth nothing while an unprotected sibling route undoes it.
+  //
+  // A pause is an explicit stop and only an explicit resume lifts it, which is the
+  // fail-closed direction and the one the rest of this module already takes. A new row still
+  // starts unpaused, because there is nothing to preserve.
   d().prepare(`INSERT INTO v4_fit_autonomy (card_id, subject_key, version, scope_hash, scope_json, paused, updated_at)
     VALUES (?, ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    ON CONFLICT(card_id) DO UPDATE SET subject_key = excluded.subject_key, version = excluded.version, scope_hash = excluded.scope_hash, scope_json = excluded.scope_json, paused = 0, updated_at = excluded.updated_at`)
+    ON CONFLICT(card_id) DO UPDATE SET subject_key = excluded.subject_key, version = excluded.version, scope_hash = excluded.scope_hash, scope_json = excluded.scope_json, paused = v4_fit_autonomy.paused, updated_at = excluded.updated_at`)
     .run(cardId, subjectKey, version, hash, JSON.stringify(scope))
   return { version, scope_hash: hash }
 }

@@ -1502,3 +1502,70 @@ test('AUTONOMY PAUSE: a card with no standing scope is refused rather than told 
   // No evidence row either, because the transaction rolled back.
   assert.equal(evidence.evidenceForResource('card', cardId).length, 0)
 })
+
+test('AUTONOMY PAUSE: a replayed scope registration cannot lift a canonically signed pause', async () => {
+  // The finding this test exists for. POST /autonomy carries no nonce store, and setScope used
+  // to write paused = 0 on its conflict branch, so a captured set-scope body replayed verbatim
+  // re-armed autonomous disclosure after a canonically signed pause. Replay defense on the
+  // pause was worth nothing while an unprotected sibling route undid it.
+  const alice = makeCard('Alice scope replay ' + rid(), ['cofound'])
+  const cardId = await publish(alice)
+  const scope = {
+    intents: ['cofound'], dimensions: ['cadence'],
+    auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false,
+    forbidden_categories: [], expiry: future(),
+  }
+  const approved_hash = autonomyDb.scopeHash(autonomyDb.validateScope(scope).scope!)
+  const setScopeBody = (nonce: string) => ({
+    card_id: cardId, scope, approved_hash, public_key: alice.keys.publicKey, nonce,
+    signature: sign(`set-fit-autonomy:${cardId}:${approved_hash}:${nonce}`, alice.keys.privateKey),
+  })
+  const first = setScopeBody('sc' + rid())
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy`, first)).status, 201)
+  assert.equal(pausedOf(cardId), false)
+  const permits = () => autonomyDb.autonomyPermitsDisclosure(cardId, 'cofound', 'cadence', 'reveal_overlap', 'low')
+  assert.equal(permits(), true, 'a fresh scope permits the disclosure')
+
+  // A canonically signed pause.
+  const pause = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: true }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, pause.body)).status, 201)
+  assert.equal(pausedOf(cardId), true)
+  assert.equal(permits(), false, 'and the pause stops it')
+
+  // The replay, byte for byte the same body including the nonce.
+  const replay = await postJson(`${base}/api/v4/fit/autonomy`, first)
+  assert.equal(replay.status, 201, 'the scope route has no nonce store, so the replay is accepted')
+  assert.equal(pausedOf(cardId), true, 'and the pause SURVIVES it')
+  assert.equal(permits(), false, 'so autonomous disclosure is still stopped')
+
+  // Only an explicit signed resume lifts it.
+  const resume = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: false }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, resume.body)).status, 201)
+  assert.equal(pausedOf(cardId), false)
+  assert.equal(permits(), true)
+})
+
+test('FIT ROUND2: a dimension the counterparty cannot be asked about is refused', async () => {
+  // The answers route checks the answerer's own policy and this one checked only that a
+  // canonical question exists, so a party could escalate a dimension in nobody's policy and,
+  // because the act is a continuation, move the intro's deadline for it.
+  const p = await pair()
+  const req = await canonicalFitRequest(p)
+  assert.equal(req.status, 201)
+  const s = signedBody({
+    operation: 'fit_round2', resource: { type: 'intro', id: p.introId },
+    payload: { dimension_ids: ['decision_model'], antecedent_write_ref: req.built.writeRef },
+    keys: p.bob.keys,
+  })
+  const res = await postJson(fitUrl(p.introId, '/round2'), s.body)
+  assert.equal(res.status, 400, JSON.stringify(res.json))
+  assert.equal(res.json.code, 'dimension_not_askable')
+  assert.match(String(res.json.error), /counterparty's policy/)
+  assert.deepEqual(qaDb.round2ForIntro(p.introId), [], 'nothing stored')
+  assert.equal(facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_round2' as any), null,
+    'and no continuation row, so the deadline did not move')
+})

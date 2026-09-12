@@ -1257,14 +1257,26 @@ const canonicalFitRound2 = canonicalWriteRoute({
     gatePayloadKeys(write.payload, ['dimension_ids', 'antecedent_write_ref'])
     const dimensionIds = gateDimensionList(write.payload.dimension_ids, 'dimension_ids', MAX_QA_ROUND2)
     const antecedent = gateHex64(write.payload.antecedent_write_ref, 'antecedent_write_ref')
-    const { introId, actorKey } = fitPreamble(ctx, null)
+    const { hs, introId, actorKey } = fitPreamble(ctx, null)
     requireAntecedent('intro', introId, antecedent)
     // EVERY id is checked before the FIRST is written, and an unknown one is REFUSED. The
     // legacy loop below silently drops a dimension with no canonical question, so a signer
     // could be told their escalation was accepted while half of it was discarded.
+    //
+    // The dimension must also be one the COUNTERPARTY could answer, which is the check the
+    // answers route has in its own direction and this one lacked. Escalating a dimension that
+    // is in nobody's policy asks a question nobody can be asked, and since this act is a
+    // continuation it moved the intro's deadline for it.
+    const otherCard = cardOfKey(hs, otherKey(hs, actorKey)) as string
+    const theirPolicy = policyDb.getCurrentPolicy(otherCard)
+    const askable = new Set((theirPolicy ? policyDb.dimensionsForIntent(theirPolicy, hs.intent) : []).map(x => x.dimension))
     for (const dim of dimensionIds) {
       if (!questionFor(dim)) {
         refuseWrite(400, 'dimension_not_askable', `dimension "${dim}" has no canonical question`)
+      }
+      if (!askable.has(dim)) {
+        refuseWrite(400, 'dimension_not_askable',
+          `dimension "${dim}" is not in the counterparty's policy for this intent, so they cannot be asked about it`)
       }
     }
 
