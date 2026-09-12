@@ -437,6 +437,14 @@ function evaluateAndReceipt(args: {
   if (commitmentA !== null) commitmentFields.policy_commitment_a = commitmentA
   if (commitmentB !== null) commitmentFields.policy_commitment_b = commitmentB
 
+  // When a warrant is ABSENT rather than weak the renderer emits no sentence about who
+  // authorized what, so `proves` is empty. An empty statement with no explanation reads like a
+  // bug, so the receipt says WHY: the evidence for at least one side is missing, and the
+  // warrants object beside it shows which. Omitted when it does not apply, on the same rule as
+  // the commitments, so the digest is over the absent form.
+  const incomplete: Record<string, true> = {}
+  if (rendered.missing_warrant) incomplete.evidence_incomplete = true
+
   const receiptContent = {
     intro_id: introId, purpose: hs.intent, predicate_version: PREDICATE_VERSION,
     ...commitmentFields,
@@ -445,6 +453,7 @@ function evaluateAndReceipt(args: {
     outcome: overlapMap.map((e: OverlapEntry) => ({ dimension: e.dimension, result: e.result })),
     expiry: hs.expires_at,
     proves: rendered.sentences.join(' '),
+    ...incomplete,
     warrants: { request: warrantList(requestEvidence), commit: warrantList(commitEvidence) },
   }
   const receiptDigest = createHash('sha256').update(canonicalize(receiptContent), 'utf8').digest('hex')

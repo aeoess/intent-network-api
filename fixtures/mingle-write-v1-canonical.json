@@ -16,6 +16,16 @@
       "name": "Date or class instance",
       "code": "unsupported_value",
       "why": "a Date serializes to a string and a Map to {}, so neither survives as the value under test"
+    },
+    {
+      "name": "negative zero",
+      "expected": "0",
+      "why": "JSON.stringify writes -0 as 0, so the file cannot carry the input. RFC 8785 requires -0 to serialize as \"0\", and 2C must assert jcs({e: -0}) === '{\"e\":0}' in its own code"
+    },
+    {
+      "name": "an integer past 2^53",
+      "expected": "9007199254740992",
+      "why": "a JS number literal of 9007199254740993 IS 9007199254740992, so no file can carry it. 2C must assert that the rounded value is what serializes, in its own code"
     }
   ],
   "accepted": [

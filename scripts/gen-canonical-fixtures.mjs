@@ -63,6 +63,11 @@ const notRepresentable = [
   { name: 'undefined member', code: 'null_in_payload', why: 'JSON.stringify drops the member, so the file would carry {a:1} which is a valid payload' },
   { name: 'NaN', code: 'non_finite_number', why: 'JSON.stringify emits null, so the file would carry {a:null} and the case would test null_in_payload instead' },
   { name: 'Date or class instance', code: 'unsupported_value', why: 'a Date serializes to a string and a Map to {}, so neither survives as the value under test' },
+  // Two ACCEPTED cases whose most interesting input cannot survive the file either. Named here
+  // after a review pointed out that the case names promise something the file cannot deliver:
+  // 2C reads the file, sees the rounded value, and would think it had locked the edge case.
+  { name: 'negative zero', expected: '0', why: 'JSON.stringify writes -0 as 0, so the file cannot carry the input. RFC 8785 requires -0 to serialize as "0", and 2C must assert jcs({e: -0}) === \'{"e":0}\' in its own code' },
+  { name: 'an integer past 2^53', expected: '9007199254740992', why: 'a JS number literal of 9007199254740993 IS 9007199254740992, so no file can carry it. 2C must assert that the rounded value is what serializes, in its own code' },
 ]
 
 const out = {
