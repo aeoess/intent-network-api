@@ -419,3 +419,109 @@ test('EXCHANGE ROUND2: the operation must name a fit_exchange, and a replay retu
   assert.deepEqual(again.json.round2, ['cofound-2'])
   assert.equal(fitDb.round2ForExchange(ex.id).length, 1, 'one act, one row')
 })
+
+// ══════════════════════════════════════════════════════════════
+// custom questions, canonical
+// ══════════════════════════════════════════════════════════════
+
+test('EXCHANGE CUSTOM: the signed text is stored byte identical, in the order signed', async () => {
+  const ex = await exchange()
+  const questions = ['What does your week actually look like right now?', 'Who else is already committed?']
+  const { body, built } = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys, payload: { questions },
+  })
+  const res = await postJson(exUrl(ex.id, '/custom'), body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.custom_ids.length, 2)
+
+  const stored = fitDb.customForExchange(ex.id)
+  assert.equal(stored.length, 2)
+  // Order as signed, not sorted: these are sentences a human wrote and the sequence carries
+  // meaning, which is why the text gate does not sort the way the id gate does.
+  assert.deepEqual(stored.map(c => c.text), questions)
+  for (const c of stored) assert.equal(c.asker_key, ex.alice.keys.publicKey)
+
+  const row = evidence.evidenceByWriteRef(built.writeRef)!
+  assert.deepEqual(evidence.boundFieldsOf(row), ['operation', 'resource.id', 'payload.questions'])
+  assert.equal(evidence.covers(row, 'payload.questions'), true)
+})
+
+test('EXCHANGE CUSTOM: text that the gate would REWRITE is refused rather than cleaned', async () => {
+  // The repair. The old handler ran stripUrls and stored the output, so the stored question
+  // was not the question the principal signed and the record could not be recomputed from
+  // the signature. Repairing text after approval is the defect, so this refuses.
+  const ex = await exchange()
+  const { body } = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { questions: ['Have you read https://example.com/manifesto yet?'] },
+  })
+  const res = await postJson(exUrl(ex.id, '/custom'), body)
+  assert.equal(res.status, 400, JSON.stringify(res.json))
+  assert.equal(res.json.code, 'text_not_stored_as_signed')
+  assert.deepEqual(fitDb.customForExchange(ex.id), [], 'and nothing is stored in either form')
+
+  // The legacy lane still cleans and stores, because that is what a published client
+  // expects, and its evidence row says the text was never covered.
+  const nonce = 'c' + rid()
+  const legacy = await postJson(exUrl(ex.id, '/custom'), {
+    questions: ['Have you read https://example.com/manifesto yet?'],
+    public_key: ex.alice.keys.publicKey, nonce,
+    signature: sign(`fit-custom:${ex.id}:${nonce}`, ex.alice.keys.privateKey),
+  })
+  assert.equal(legacy.status, 200, JSON.stringify(legacy.json))
+  const stored = fitDb.customForExchange(ex.id)
+  assert.equal(stored.length, 1)
+  assert.equal(stored[0].text.includes('https://example.com'), false, 'the legacy path still cleans')
+  const rows = evidence.evidenceForResource('fit_exchange', ex.id)
+  assert.deepEqual(evidence.boundFieldsOf(rows[0]), ['id'])
+  assert.equal(evidence.covers(rows[0], 'payload.questions'), false)
+})
+
+test('EXCHANGE CUSTOM: the post-gate still screens, and a refusal stores nothing', async () => {
+  const ex = await exchange()
+  const { body } = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { questions: ['Mail me at someone@example.com and we can talk'] },
+  })
+  const res = await postJson(exUrl(ex.id, '/custom'), body)
+  assert.equal(res.status, 400)
+  assert.equal(res.json.code, 'post_gate_refused')
+  assert.match(String(res.json.error), /contact/)
+  assert.deepEqual(fitDb.customForExchange(ex.id), [])
+})
+
+test('EXCHANGE CUSTOM: the per party cap counts what is already stored, on both lanes', async () => {
+  const ex = await exchange()
+  const one = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys, payload: { questions: ['First question?'] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/custom'), one.body)).status, 201)
+  const two = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys, payload: { questions: ['Second question?', 'Third question?'] },
+  })
+  const over = await postJson(exUrl(ex.id, '/custom'), two.body)
+  assert.equal(over.status, 409)
+  assert.equal(over.json.code, 'custom_cap_reached')
+  assert.equal(fitDb.customForExchange(ex.id).length, 1, 'and the refusal wrote none of the two')
+
+  // The other party has their own cap.
+  const theirs = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.bob.keys, payload: { questions: ['Mine?', 'And mine?'] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/custom'), theirs.body)).status, 201)
+  assert.equal(fitDb.customForExchange(ex.id).length, 3)
+})
+
+test('EXCHANGE CUSTOM: an unknown payload field is refused rather than carried along', async () => {
+  // A field inside payload_digest that the server ignores is a field the signature says the
+  // principal asked for and the server did not honour.
+  const ex = await exchange()
+  const { body } = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { questions: ['Fine question?'], urgent: true },
+  })
+  const res = await postJson(exUrl(ex.id, '/custom'), body)
+  assert.equal(res.status, 400)
+  assert.equal(res.json.code, 'malformed_payload')
+  assert.match(String(res.json.error), /unexpected payload field: urgent/)
+})

@@ -43,6 +43,7 @@ const CANONICAL_BOUND: Record<Operation, string[]> = {
   first_step_approve: ['operation', 'resource.id', 'payload.approved_digest'],
   fit_round2: ['operation', 'resource.id', 'payload.dimension_ids', 'payload.antecedent_write_ref'],
   fit_exchange_round2: ['operation', 'resource.id', 'payload.question_ids', 'payload.antecedent_write_ref'],
+  fit_exchange_custom: ['operation', 'resource.id', 'payload.questions'],
 }
 
 /** What a published 3.2.2 legacy preimage covers, per operation, taken from the
@@ -63,6 +64,8 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   // `id` is the EXCHANGE id here, which is what fit-round2:${id}:${nonce} interpolates.
   // question_ids is absent because not one character of it is in those bytes.
   fit_exchange_round2: ['id'],
+  // Same shape, same omission: fit-custom:${id}:${nonce} covers no character of the text.
+  fit_exchange_custom: ['id'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -79,6 +82,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   first_step_propose: 'fit-firststep:${introId}:${nonce}',
   first_step_approve: 'fit-firststep-approve:${introId}:${approved_digest}:${nonce}',
   fit_exchange_round2: 'fit-round2:${id}:${nonce}',
+  fit_exchange_custom: 'fit-custom:${id}:${nonce}',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {

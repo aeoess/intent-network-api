@@ -341,7 +341,69 @@ router.post('/:id/round2', fitGate, canonicalDispatch(canonicalExchangeRound2), 
 
 // ── POST /:id/custom - ask up to 2 custom questions (post-gated) ───────────
 
-router.post('/:id/custom', fitGate, rateLimited('fit_answer', 30), (req, res) => {
+/** The text list a principal signed. Order is theirs and is never sorted, which is the
+ *  difference from a dimension or question id list: these are sentences a human wrote and
+ *  the sequence carries meaning. */
+function gateQuestionTexts(value: unknown, remaining: number): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    refuseWrite(400, 'malformed_payload', 'questions must be a non empty array')
+  }
+  const list = value as unknown[]
+  if (!list.every(x => typeof x === 'string' && x.trim().length > 0)) {
+    refuseWrite(400, 'malformed_payload', 'each question must be a non empty string')
+  }
+  const texts = list as string[]
+  for (const t of texts) {
+    if (t.length > MAX_CUSTOM_TEXT) {
+      refuseWrite(400, 'malformed_payload', `a custom question is longer than ${MAX_CUSTOM_TEXT} characters`)
+    }
+  }
+  if (texts.length > remaining) {
+    refuseWrite(409, 'custom_cap_reached',
+      `the custom question cap is ${MAX_CUSTOM_PER_ASKER} per party and ${remaining} remain`)
+  }
+  return texts
+}
+
+const canonicalExchangeCustom = canonicalWriteRoute({
+  operations: ['fit_exchange_custom'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['questions'])
+    const exchangeId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+    const ex = exchangeForWrite(exchangeId, actorKey, now)
+    const remaining = MAX_CUSTOM_PER_ASKER - fitDb.customCountByAsker(ex.id, actorKey)
+    const texts = gateQuestionTexts(write.payload.questions, remaining)
+
+    // The post-gate still runs, because it is a safety screen on text a counterparty will
+    // read and it is not negotiable. What changes is what happens when it would REWRITE
+    // the text: the old handler stored the cleaned output, so the stored question was not
+    // the question the principal signed and the record could not be recomputed from the
+    // signature. Now a text that changes under the gate is REFUSED and the client is told
+    // to re-approve, because repairing text after approval is the whole defect.
+    const gate = postGateDrafted(texts.map((t, i) => ({ question_id: `custom-${i}`, text: t })))
+    if (!gate.ok) refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the question text was refused')
+    const cleaned = gate.cleaned ?? []
+    for (let i = 0; i < texts.length; i++) {
+      if (cleaned[i]?.text !== texts[i]) {
+        refuseWrite(400, 'text_not_stored_as_signed',
+          'this question would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.')
+      }
+    }
+
+    const ids: string[] = []
+    for (const text of texts) {
+      const cid = `fitq-${now.getTime()}-${randomBytes(3).toString('hex')}`
+      fitDb.addCustom(cid, ex.id, actorKey, text)
+      ids.push(cid)
+    }
+    recordCanonicalEvidence(write)
+    return { exchange_id: ex.id, custom_ids: ids, questions: texts }
+  },
+})
+
+router.post('/:id/custom', fitGate, canonicalDispatch(canonicalExchangeCustom), rateLimited('fit_answer', 30), (req, res) => {
   const g = partyGuard(req, res, 'fit-custom'); if (!g) return
   const { ex, key } = g
   const { questions } = req.body ?? {}
@@ -349,6 +411,8 @@ router.post('/:id/custom', fitGate, rateLimited('fit_answer', 30), (req, res) =>
   if (!Array.isArray(questions) || questions.length === 0) { res.status(400).json({ error: 'questions required' }); return }
   const existing = fitDb.customCountByAsker(ex.id, key)
   if (existing + questions.length > MAX_CUSTOM_PER_ASKER) { res.status(400).json({ error: `custom question cap is ${MAX_CUSTOM_PER_ASKER} per party` }); return }
+  const gateResult = checkLegacyWrite({ resourceType: 'fit_exchange', resourceId: ex.id, actorKey: key, introId: ex.intro_id })
+  if (gateResult !== null) { refuseLegacy(res, 'fit_exchange_custom', ex.id, gateResult); return }
 
   const texts: string[] = []
   for (const q of questions) {
@@ -367,6 +431,14 @@ router.post('/:id/custom', fitGate, rateLimited('fit_answer', 30), (req, res) =>
     fitDb.addCustom(cid, ex.id, key, c.text)
     ids.push(cid)
   }
+  // The legacy lane keeps storing the cleaned text, because that is what a published
+  // 3.2.2 client expects and changing it would be a behaviour change on the old path. The
+  // evidence row says so: the bound list names the exchange id and nothing else.
+  recordLegacyEvidence({
+    actorKey: key, operation: 'fit_exchange_custom',
+    resourceType: 'fit_exchange', resourceId: ex.id,
+    signature: String(req.query.signature ?? req.body?.signature ?? ''),
+  })
   res.json({ ok: true, custom_ids: ids })
 })
 
