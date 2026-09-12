@@ -2,7 +2,7 @@
 // The private evidence artifacts, and who may read one
 // ══════════════════════════════════════════════════════════════
 // The decided rule: a contact string or an exact fit value never enters a shared or
-// public receipt. The actor signs a COMMITMENT to the private value; the value itself
+// public receipt. The actor signs a COMMITMENT to the private value, and the value itself
 // travels in the opening, beside the signed payload and never inside it. The intended
 // counterparty receives the signed artifact plus the opening and can verify the whole
 // chain alone, with no server key involved.

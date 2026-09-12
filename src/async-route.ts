@@ -3,7 +3,7 @@
 // ══════════════════════════════════════════════════════════════
 // Express 4 does not catch a rejection from an async handler. It never calls the error
 // middleware, never answers, and never closes the socket, so an unexpected throw leaves
-// the client waiting forever rather than failing. A 500 is a bad outcome; no response at
+// the client waiting forever rather than failing. A 500 is a bad outcome. No response at
 // all is a worse one, because a caller cannot retry what it cannot see fail.
 //
 // This is the same defect the canonical write chain already handles at

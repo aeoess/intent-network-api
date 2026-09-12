@@ -199,7 +199,7 @@ router.post('/withdraw-contact', canonicalWriteRoute({
     const artifacts = withdrawArtifacts(introId, actorKey, 'share_contact')
     recordCanonicalEvidence(write)
     // The state is recomputed, not assigned. If another continuation is live it stays
-    // connecting; if the withdrawn contact was the only one it regresses to
+    // connecting, and if the withdrawn contact was the only one it regresses to
     // interested.
     const state = materializeStatus(introId, now)
     return { intro_id: introId, state, artifacts_withdrawn: artifacts }

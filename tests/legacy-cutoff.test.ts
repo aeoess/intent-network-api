@@ -528,7 +528,7 @@ test('DOWNGRADE: canonical is absorbing, so a second canonical write does not we
   }).body)).status, 201)
   assert.equal(wdb.resolveAuthMode('intro', scene.introId, scene.bob.keys.publicKey), 'canonical')
   // Recording legacy_unbound for a key already canonical must not move it back. The refusal
-  // is what a route does; the absorbing update is what the table guarantees if one ever slips.
+  // is what a route does, and the absorbing update is what the table guarantees if one slips.
   wdb.recordAuthMode('intro', scene.introId, scene.bob.keys.publicKey, 'legacy_unbound')
   assert.equal(wdb.resolveAuthMode('intro', scene.introId, scene.bob.keys.publicKey), 'canonical',
     'canonical is absorbing, so the table cannot be walked backwards')
