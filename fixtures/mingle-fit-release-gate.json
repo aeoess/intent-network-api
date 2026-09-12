@@ -1,0 +1,201 @@
+{
+  "manifest": "mingle-fit-release-gate-v1",
+  "built_from": "MINGLE-SIGNED-WRITE-MATRIX.md, the Matrix table and Summary (a). That document is not in this repository and no test reads it: this file is its checked-in projection, and matrix_row plus matrix_rank are how a reader goes back to the classification.",
+  "rule": "Exact set agreement with what the application registers. Every structured fit mutation route on the /api/v3/fit and /api/v4/fit mounts appears in exactly one of the two arrays below. A route in neither fails the gate whatever MINGLE_FIT_ENABLED says, because an unclassified mutation route means the gate has stopped measuring.",
+  "dispositions": "canonical means the route accepts a mingle-write-v1 envelope for the named operation and that operation's bound field list covers every semantic field named here. removed means the declaration is gone from the router. Being behind fitGate satisfies neither, because every route would then count as contained while the flag is off, which is the state the gate exists to decide whether to leave.",
+  "gate": [
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/:id/answers",
+      "matrix_row": "39",
+      "matrix_rank": 7,
+      "verdict": "PARTIAL",
+      "disposition": "canonical",
+      "operation": "fit_exchange_answers",
+      "semantic_fields": ["payload.answers"],
+      "gap": "The preimage already is a content hash over the answers, but the stored text is the post-gate cleaned string, so the record cannot be recomputed from the signature. public_key sits outside the hash and the ledger item text is unbound."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/:id/round2",
+      "matrix_row": "40",
+      "matrix_rank": 4,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "fit_exchange_round2",
+      "semantic_fields": ["payload.question_ids", "payload.antecedent_write_ref"],
+      "gap": "question_ids is not in the preimage at all, so one valid fit-round2 signature authorizes escalating whatever questions the holder chooses."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/:id/custom",
+      "matrix_row": "41",
+      "matrix_rank": 5,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "fit_exchange_custom",
+      "semantic_fields": ["payload.questions"],
+      "gap": "Nothing in the signed bytes covers a single character of the custom question text, and the server stores the post-gate cleaned output rather than the signed text."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/:id/close",
+      "matrix_row": "42",
+      "matrix_rank": 8,
+      "verdict": "PARTIAL",
+      "disposition": "canonical",
+      "operation": "fit_exchange_close",
+      "semantic_fields": ["payload.record_digest"],
+      "gap": "The closer signs close exchange X rather than this is the record, and the digest is computed by the server after the signature."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/sweep",
+      "matrix_row": "43",
+      "matrix_rank": 9,
+      "verdict": "PARTIAL",
+      "disposition": "removed",
+      "gap": "It reads no body, no public key and no signature, so there is no actor to name in an envelope and nothing to sign. It cannot be canonicalized at all, and removal is cheap because the scheduler calls sweepExpiredFitExchanges directly."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/request",
+      "matrix_row": "28",
+      "matrix_rank": 1,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "fit_request",
+      "semantic_fields": [
+        "payload.requested_dimensions",
+        "payload.reciprocal_offer",
+        "payload.predicate_version",
+        "payload.policy_commitment",
+        "payload.query_budget"
+      ],
+      "gap": "A server signed receipt carried a normative proves sentence naming dimensions, reciprocity, policy hash and budget, none of which the signature covered."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/commit",
+      "matrix_row": "29",
+      "matrix_rank": 2,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "fit_commit",
+      "semantic_fields": [
+        "payload.accept_dimensions",
+        "payload.reciprocal_offer",
+        "payload.policy_commitment",
+        "payload.request_write_ref"
+      ],
+      "gap": "Same receipt, plus the autonomous flag, which was client supplied and unsigned and decided whether a human had approved the disclosure."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/reveal",
+      "matrix_row": "30",
+      "matrix_rank": 19,
+      "verdict": "PARTIAL",
+      "disposition": "canonical",
+      "operation": "release_exact",
+      "semantic_fields": ["payload.dimension", "payload.policy_commitment", "payload.private_value_commitment"],
+      "gap": "The exact value and the policy version it is read from were outside the preimage and pinned only by server state."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/autonomy/pause",
+      "matrix_row": "32",
+      "matrix_rank": 20,
+      "verdict": "PARTIAL",
+      "disposition": "canonical",
+      "operation": "autonomy_pause",
+      "semantic_fields": ["payload.paused"],
+      "gap": "Every semantic field is already bound, so what this route lacks is replay defense and an envelope rather than binding."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/answers",
+      "matrix_row": "34",
+      "matrix_rank": 21,
+      "verdict": "PARTIAL",
+      "disposition": "canonical",
+      "operation": "fit_answers",
+      "semantic_fields": ["payload.answers"],
+      "gap": "The v3 ledger item text that ledger mode quotes is fetched live and only ledger_id is signed, and the stored drafted text is the post-gate cleaned string."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/round2",
+      "matrix_row": "35",
+      "matrix_rank": 12,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "fit_round2",
+      "semantic_fields": ["payload.dimension_ids", "payload.antecedent_write_ref"],
+      "gap": "The round two dimension ids are entirely outside the signed bytes, so the signature says the key holder wanted a round two and nothing about on what."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/first-step",
+      "matrix_row": "36",
+      "matrix_rank": 23,
+      "verdict": "NO",
+      "disposition": "canonical",
+      "operation": "first_step_propose",
+      "semantic_fields": [
+        "payload.purpose",
+        "payload.next_action",
+        "payload.meeting_length",
+        "payload.agenda",
+        "payload.each_wants",
+        "payload.boundaries",
+        "payload.expiry"
+      ],
+      "gap": "Every text field of the proposed half and its expiry were outside the signed bytes, and the half travels to the counterparty in a notification."
+    }
+  ],
+  "outside_gate": [
+    {
+      "method": "POST",
+      "route": "/api/v3/fit/disclosures",
+      "matrix_row": "38",
+      "verdict": "YES",
+      "reason": "The preimage carries approved_hash over the exact item set, so the content is bound and the matrix classified it YES. The gate covers the PARTIAL and NO rows."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/policy",
+      "matrix_row": "27",
+      "verdict": "YES",
+      "reason": "Same shape as disclosures: approved_hash binds the exact dimension set. Classified YES."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/policy/commitment",
+      "matrix_row": "none, postdates the matrix",
+      "verdict": "not classified",
+      "reason": "Added in 2B.1 step 13. The commitment is inside its own preimage, so a proxy cannot register a different one, and the route stores no value: it verifies one opening and keeps only the commitment. Listed here so the set agreement is exact and a genuinely new route still fails."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/autonomy",
+      "matrix_row": "31",
+      "verdict": "YES",
+      "reason": "approved_hash binds the exact scope. Classified YES."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/questions",
+      "matrix_row": "33",
+      "verdict": "YES",
+      "reason": "It lists unresolved dimensions and writes nothing. A POST for its signed read, classified YES, and enumerated here because the enumeration treats every non-read method as a mutation rather than trusting a handler to be read only."
+    },
+    {
+      "method": "POST",
+      "route": "/api/v4/fit/:introId/first-step/approve",
+      "matrix_row": "37",
+      "verdict": "YES",
+      "reason": "The one legacy preimage that covers its whole semantic content, because it interpolates the approved digest. Classified YES, and it gained a canonical branch in step 12 anyway."
+    }
+  ]
+}

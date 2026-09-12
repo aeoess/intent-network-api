@@ -70,9 +70,23 @@ function refuse(res: Response, status: number, code: string, error: string): voi
   res.status(status).json({ code, error })
 }
 
+/** The property a canonical middleware carries so the release gate can SEE it.
+ *
+ *  The gate enumerates what the application actually registers and then asks each route
+ *  whether it accepts a mingle-write-v1 envelope. Asking by reading a hand written list
+ *  would make the gate a list someone forgets to update. Asking the registered handler
+ *  itself cannot go stale, because the tag and the behaviour are the same object. */
+export const CANONICAL_OPERATIONS_TAG = 'mingleCanonicalOperations'
+
+/** Read the tag off a registered Express handler, or null when it carries none. */
+export function canonicalOperationsOf(handle: unknown): readonly string[] | null {
+  const tagged = (handle as Record<string, unknown> | null | undefined)?.[CANONICAL_OPERATIONS_TAG]
+  return Array.isArray(tagged) ? (tagged as string[]) : null
+}
+
 /** Build the Express handler for one canonical write route. */
 export function canonicalWriteRoute<T>(route: CanonicalRoute<T>) {
-  return async (req: Request, res: Response): Promise<void> => {
+  const handler = async (req: Request, res: Response): Promise<void> => {
     // Express 4 does not catch a rejection from an async handler, so an unexpected
     // throw would leave the request hanging with no response at all rather than
     // failing. Found while implementing: a primary key violation inside a handler
@@ -87,6 +101,8 @@ export function canonicalWriteRoute<T>(route: CanonicalRoute<T>) {
       }
     }
   }
+  ;(handler as any)[CANONICAL_OPERATIONS_TAG] = [...route.operations]
+  return handler
 }
 
 async function runRoute<T>(route: CanonicalRoute<T>, req: Request, res: Response): Promise<void> {
@@ -212,7 +228,7 @@ export function hasEnvelope(body: unknown): boolean {
  *  agreement only lets the request reach envelope verification, which is what decides
  *  anything. */
 export function canonicalDispatch(canonical: (req: Request, res: Response) => Promise<void>) {
-  return async (req: Request, res: Response, next: (err?: unknown) => void): Promise<void> => {
+  const dispatch = async (req: Request, res: Response, next: (err?: unknown) => void): Promise<void> => {
     if (!hasEnvelope(req.body)) { next(); return }
     // Whichever name this router gave the resource in its path. The intro routes call it
     // :id and the fit routes call it :introId, and both are the same resource.
@@ -229,4 +245,8 @@ export function canonicalDispatch(canonical: (req: Request, res: Response) => Pr
     // canonicalWriteRoute carries its own error boundary, so this never rejects.
     await canonical(req, res)
   }
+  // The tag travels through the wrapper, so a route that shares its path with a legacy
+  // handler is still visible to the gate as canonical.
+  ;(dispatch as any)[CANONICAL_OPERATIONS_TAG] = canonicalOperationsOf(canonical) ?? []
+  return dispatch
 }
