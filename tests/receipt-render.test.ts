@@ -68,6 +68,8 @@ test('GOLDEN: every approved sentence matches the decided text character for cha
       'This act was authorized under standing scope S. It was not individually approved.',
     fit_legacy:
       'Acting keys A and B each sent a signed fit message naming this introduction. Those signatures did not cover the dimensions, the reciprocal offer, the policy hash or the budget. Mingle evaluated predicate version V from the values it stored and produced the listed outcome.',
+    fit_mixed:
+      'Mingle observed canonical authorization from [party] for [operation]. The counterparty used a legacy authorization form that does not cryptographically bind all fit semantics. Mingle evaluated predicate version [V] using the submitted fit data and recorded outcome [O].',
     fit_commitment_disclosure:
       'The policy commitments in this receipt hide the policy behind them. Either owner may later disclose their policy and salt to an auditor or counterparty of their choosing.',
     first_step_canonical:
@@ -200,9 +202,50 @@ test('WARRANT: the fit receipt needs BOTH sides canonical, because its sentence 
       request: bound('fit_request', reqKind), commit: bound('fit_commit', comKind), standingScope: false,
     })
     assert.equal(r.keys.includes('fit_canonical'), false, `${reqKind}/${comKind}: one canonical side is not enough`)
-    assert.equal(r.keys.includes('fit_legacy'), true)
     assert.equal(r.keys.includes('legacy_side_present'), true)
   }
+})
+
+test('GOLDEN: a MIXED fit pair renders the ruling ceiling, and the fully legacy pair does not', () => {
+  // Three cases, not two. The 2B.1 review found the mixed pair getting the fully-legacy
+  // sentence while the receipt's own warrants object named four fields the canonical side DID
+  // cover, so the prose under-claimed against the data printed beside it. The ruling closed it
+  // with one sentence, and this holds that sentence to the character on both mixed
+  // orientations while keeping the blunt one for the pair where neither side is bound.
+  for (const [reqKind, comKind] of [['legacy_unbound', 'canonical'], ['canonical', 'legacy_unbound']] as const) {
+    const r = render.renderFitHandshake({
+      request: bound('fit_request', reqKind), commit: bound('fit_commit', comKind), standingScope: false,
+    })
+    assert.equal(r.keys.includes('fit_mixed'), true, `${reqKind}/${comKind} is the mixed case`)
+    assert.equal(r.keys.includes('fit_legacy'), false, 'and never also the fully legacy sentence')
+    assert.equal(r.keys.includes('fit_canonical'), false)
+    assert.equal(r.sentences[0], render.SENTENCES.fit_mixed)
+    assert.equal(r.mixed, true, 'a reader is told once that a legacy side is present')
+  }
+  const neither = render.renderFitHandshake({
+    request: bound('fit_request', 'legacy_unbound'), commit: bound('fit_commit', 'legacy_unbound'), standingScope: false,
+  })
+  assert.equal(neither.keys.includes('fit_legacy'), true, 'neither side bound keeps the blunt sentence')
+  assert.equal(neither.keys.includes('fit_mixed'), false)
+
+  // The ceiling, clause by clause. It never says both parties authorized the exact
+  // semantics, never says a value is true, and never promotes the legacy side.
+  const text = render.SENTENCES.fit_mixed
+  assert.ok(text.includes('canonical authorization from [party] for [operation]'))
+  assert.ok(text.includes('does not cryptographically bind all fit semantics'))
+  assert.ok(text.includes('recorded outcome [O]'))
+  for (const banned of [/both (parties|keys) authorized/i, /\bis true\b/i, /\bverified\b/i, /equivalent/i]) {
+    assert.equal(banned.test(text), false, `the ceiling must not contain ${banned}`)
+  }
+
+  // And an ABSENT warrant still emits nothing about either side, mixed included: absent is
+  // not weak, and there is no approved sentence for a missing row.
+  const oneAbsent = render.renderFitHandshake({
+    request: bound('fit_request', 'canonical'), commit: null, standingScope: false,
+  })
+  assert.equal(oneAbsent.keys.includes('fit_mixed'), false)
+  assert.equal(oneAbsent.keys.includes('fit_legacy'), false)
+  assert.equal(oneAbsent.missing_warrant, true)
 })
 
 test('WARRANT: the standing scope sentence appears only when a CANONICAL commit established one', () => {

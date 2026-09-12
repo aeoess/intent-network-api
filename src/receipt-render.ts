@@ -56,6 +56,19 @@ export const SENTENCES = {
   fit_standing_scope: 'This act was authorized under standing scope S. It was not individually approved.',
   /** 5.4 the v4 handshake receipt, legacy. Blunt on purpose. */
   fit_legacy: 'Acting keys A and B each sent a signed fit message naming this introduction. Those signatures did not cover the dimensions, the reciprocal offer, the policy hash or the budget. Mingle evaluated predicate version V from the values it stored and produced the listed outcome.',
+  /** 5.4b the MIXED v4 handshake receipt, one side canonical and one side legacy. The
+   *  ceiling, decided by ruling, and nothing stronger is permitted here.
+   *
+   *  The 2B.1 review found that a mixed pair got the fully-legacy sentence while the
+   *  receipt's own `warrants` object named four fields the canonical side did cover, so
+   *  the prose under-claimed against the data beside it. Under-claiming is the safe
+   *  direction and it was left for a ruling rather than fixed by inventing copy. This is
+   *  that ruling. It names which side is canonical and for what, says plainly that the
+   *  counterparty's form does not bind all fit semantics, and reports the evaluation as
+   *  something Mingle recorded rather than something true. It never says both parties
+   *  authorized the exact semantics, never says a value is true, and never promotes the
+   *  legacy side. */
+  fit_mixed: 'Mingle observed canonical authorization from [party] for [operation]. The counterparty used a legacy authorization form that does not cryptographically bind all fit semantics. Mingle evaluated predicate version [V] using the submitted fit data and recorded outcome [O].',
   /** 5.7 the disclosure model, stated to the reader. */
   fit_commitment_disclosure: 'The policy commitments in this receipt hide the policy behind them. Either owner may later disclose their policy and salt to an auditor or counterparty of their choosing.',
 
@@ -205,10 +218,15 @@ export function renderFitHandshake(args: {
   // signed fit message naming this introduction", which is a positive claim, and gating it on
   // the mere absence of a canonical warrant would make a missing evidence row assert it.
   const absent = isAbsent(args.request) || isAbsent(args.commit)
+  // Three cases, not two. Both bound is canonical, NEITHER bound is the blunt legacy
+  // sentence, and exactly one bound is the mixed ceiling. Collapsing mixed into legacy is
+  // what made the prose under-claim against the receipt's own warrants object.
+  const mixed = !canonical && (requestBound || commitBound)
   const out = build([
     ['fit_canonical', canonical],
     ['fit_commitment_disclosure', canonical],
-    ['fit_legacy', !canonical && !absent],
+    ['fit_mixed', mixed && !absent],
+    ['fit_legacy', !canonical && !mixed && !absent],
     ['legacy_side_present', !canonical && !absent],
     // 5.3 is required wherever a scope applied, and only a canonical commit can establish
     // one: on the legacy lane whether the act was autonomous is established by nothing.
