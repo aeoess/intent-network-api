@@ -76,6 +76,9 @@ export const OPERATION_RESOURCE_TYPE: Record<Operation, ResourceType> = {
   fit_exchange_custom: 'fit_exchange',
   fit_exchange_answers: 'fit_exchange',
   fit_exchange_close: 'fit_exchange',
+  // Card scoped. Autonomy is a property of a card's standing policy, not of any one
+  // introduction, so the resource is the card and the pause applies wherever that card acts.
+  autonomy_pause: 'card',
   release_exact: 'intro',
   first_step_propose: 'intro',
   first_step_approve: 'intro',

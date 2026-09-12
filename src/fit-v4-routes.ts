@@ -959,13 +959,54 @@ router.post('/autonomy', rateLimited('fitv4_policy', 20), (req, res) => {
 })
 
 // ── POST /autonomy/pause - halt (or resume) all autonomous disclosure ─────
+// Matrix row 32, the one fit row whose semantic fields were ALREADY bound: the legacy
+// preimage interpolates the card id and the boolean. What it lacked was replay defense and an
+// envelope, so a captured pause could be replayed to un-pause later, and that is what the
+// canonical lane adds. Card scoped, so resource.type is card.
 
-router.post('/autonomy/pause', fitGate, rateLimited('fitv4_policy', 30), (req, res) => {
+const canonicalAutonomyPause = canonicalWriteRoute({
+  operations: ['autonomy_pause'],
+  handler: (ctx: CanonicalContext) => {
+    const { write } = ctx
+    gatePayloadKeys(write.payload, ['paused'])
+    if (typeof write.payload.paused !== 'boolean') {
+      refuseWrite(400, 'malformed_payload', 'paused must be a boolean')
+    }
+    const cardId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+    // The only authorization question a card scoped act has: is the signer the card's
+    // subject. Checked against the stored card, never against anything in the request.
+    if (!ownsCard(cardId, actorKey)) {
+      refuseWrite(403, 'not_the_card_subject', 'only the card subject may pause that card\'s autonomy')
+    }
+    // setPaused only UPDATEs, because paused is a column on the standing scope row. A card
+    // with no scope has no autonomy to pause, and autonomyPermitsDisclosure already returns
+    // false for it, so reporting success here would tell a principal they had stopped
+    // something that was never running. The legacy branch still answers 200 in that case,
+    // which is a pre-existing wart kept for compatibility and recorded in the handoff.
+    if (!autonomyDb.setPaused(cardId, write.payload.paused as boolean)) {
+      refuseWrite(409, 'no_autonomy_scope',
+        'this card has no standing autonomy scope, so there is nothing to pause or resume')
+    }
+    recordCanonicalEvidence(write)
+    return { card_id: cardId, paused: write.payload.paused }
+  },
+})
+
+router.post('/autonomy/pause', fitGate, canonicalDispatch(canonicalAutonomyPause), rateLimited('fitv4_policy', 30), (req, res) => {
   const { card_id, paused, public_key, nonce, signature } = req.body ?? {}
   if (typeof card_id !== 'string' || typeof paused !== 'boolean' || typeof nonce !== 'string') { res.status(400).json({ error: 'card_id, paused, nonce required' }); return }
   if (!checkSig(`fit-autonomy-pause:${card_id}:${paused}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
   if (!ownsCard(card_id, public_key)) { res.status(403).json({ error: 'not the card subject' }); return }
+  // No introId: a card is not an introduction, so there is no grandfathering exemption to
+  // claim here and the cutoff applies plainly.
+  const pauseGate = checkLegacyWrite({ resourceType: 'card', resourceId: card_id, actorKey: public_key })
+  if (pauseGate !== null) { refuseLegacy(res, 'autonomy_pause', card_id, pauseGate); return }
   autonomyDb.setPaused(card_id, paused)
+  recordLegacyEvidence({
+    actorKey: public_key, operation: 'autonomy_pause',
+    resourceType: 'card', resourceId: card_id, signature: String(signature ?? ''),
+  })
   res.json({ card_id, paused })
 })
 

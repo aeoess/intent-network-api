@@ -1337,3 +1337,160 @@ test('FIT ROUND2: the legacy lane is recorded as weak and never as a continuatio
   assert.equal(facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_round2' as any), null,
     'nothing in those bytes says which dimensions, so there is nothing to move a deadline on')
 })
+
+/** A standing autonomy scope on a card, so there is something for a pause to act on. */
+function giveScope(who: any, cardId: string): void {
+  const v = autonomyDb.validateScope({
+    intents: ['cofound'], dimensions: ['cadence'],
+    auto_reveal_overlap: true, reveal_bucket_on_reciprocity: false,
+    forbidden_categories: [], expiry: future(),
+  })
+  assert.equal(v.ok, true, v.error)
+  autonomyDb.setScope(cardId, who.keys.publicKey, v.scope!)
+}
+const pausedOf = (cardId: string) => autonomyDb.getScope(cardId)?.paused ?? null
+
+// ══════════════════════════════════════════════════════════════
+// autonomy_pause, canonical (step 24)
+// ══════════════════════════════════════════════════════════════
+// Matrix row 32, rank 20, PARTIAL, and the one fit row whose semantic fields were already
+// bound: fit-autonomy-pause interpolates the card id and the boolean. What it lacked was
+// replay defense and an envelope, so a captured pause could be replayed to un-pause later.
+
+test('AUTONOMY PAUSE: the boolean is bound, the card is the resource, and the write lands', async () => {
+  const alice = makeCard('Alice pause ' + rid(), ['cofound'])
+  const cardId = await publish(alice)
+  giveScope(alice, cardId)
+  const s = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: true }, keys: alice.keys,
+  })
+  const res = await postJson(`${base}/api/v4/fit/autonomy/pause`, s.body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.paused, true)
+  assert.equal(pausedOf(cardId), true)
+
+  const row = evidence.evidenceByWriteRef(s.built.writeRef)!
+  assert.equal(row.resource_type, 'card')
+  assert.equal(row.resource_id, cardId)
+  assert.deepEqual(evidence.boundFieldsOf(row), ['operation', 'resource.id', 'payload.paused'])
+
+  // And resuming is the same act with the other value, so the boolean is doing work.
+  const back = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: false }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, back.body)).status, 201)
+  assert.equal(pausedOf(cardId), false)
+})
+
+test('AUTONOMY PAUSE: a replay returns the stored result and does not flip the state back', async () => {
+  // The repair. The legacy preimage carries a nonce that nothing stores, so a captured pause
+  // could be replayed at any later time, which on this route means silently resuming
+  // autonomous disclosure the principal had stopped.
+  const alice = makeCard('Alice replay ' + rid(), ['cofound'])
+  const cardId = await publish(alice)
+  giveScope(alice, cardId)
+  const pause = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: true }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, pause.body)).status, 201)
+
+  const resume = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: false }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, resume.body)).status, 201)
+  assert.equal(pausedOf(cardId), false)
+
+  // Replaying the pause returns the stored answer rather than applying it again. The state is
+  // whatever the LAST accepted act said, and a replay is not an act.
+  const again = await postJson(`${base}/api/v4/fit/autonomy/pause`, pause.body)
+  assert.equal(again.status, 200)
+  assert.equal(again.json.idempotent, true)
+  assert.equal(again.json.paused, true, 'the stored result of the original act')
+  assert.equal(pausedOf(cardId), false, 'and the live state is still what the later act set')
+})
+
+test('AUTONOMY PAUSE: a card that is not the signer\'s is refused, and so is a non boolean', async () => {
+  const alice = makeCard('Alice own ' + rid(), ['cofound'])
+  const bob = makeCard('Bob own ' + rid(), ['cofound'])
+  const aliceCard = await publish(alice)
+  const bobCard = await publish(bob)
+  giveScope(alice, aliceCard)
+  giveScope(bob, bobCard)
+
+  const notMine = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: bobCard }, payload: { paused: true }, keys: alice.keys,
+  })
+  const res = await postJson(`${base}/api/v4/fit/autonomy/pause`, notMine.body)
+  assert.equal(res.status, 403)
+  assert.equal(res.json.code, 'not_the_card_subject')
+  assert.equal(pausedOf(bobCard), false, 'and nothing was written')
+
+  for (const payload of [{ paused: 'true' }, { paused: 1 }, {}, { paused: true, scope: 'all' }]) {
+    const bad = signedBody({
+      operation: 'autonomy_pause', resource: { type: 'card', id: aliceCard }, payload, keys: alice.keys,
+    })
+    const out = await postJson(`${base}/api/v4/fit/autonomy/pause`, bad.body)
+    assert.equal(out.status, 400, JSON.stringify(payload))
+    assert.equal(out.json.code, 'malformed_payload', JSON.stringify(payload))
+  }
+  assert.equal(pausedOf(aliceCard), false)
+
+  // An envelope naming an intro for a card scoped operation dies in the envelope checks.
+  const wrongType = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'intro', id: 'intro-x' }, payload: { paused: true }, keys: alice.keys,
+  })
+  const typed = await postJson(`${base}/api/v4/fit/autonomy/pause`, wrongType.body)
+  assert.equal(typed.status, 400)
+  assert.equal(typed.json.code, 'resource_type_mismatch')
+})
+
+test('AUTONOMY PAUSE: the legacy lane works, records the fields it really bound, and downgrades are refused', async () => {
+  const alice = makeCard('Alice legacy pause ' + rid(), ['cofound'])
+  const cardId = await publish(alice)
+  giveScope(alice, cardId)
+  const nonce = 'ap' + rid()
+  const res = await postJson(`${base}/api/v4/fit/autonomy/pause`, {
+    card_id: cardId, paused: true, public_key: alice.keys.publicKey, nonce,
+    signature: sign(`fit-autonomy-pause:${cardId}:true:${nonce}`, alice.keys.privateKey),
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+  assert.equal(pausedOf(cardId), true)
+
+  const ev = evidence.evidenceForResource('card', cardId)
+  assert.equal(ev.length, 1)
+  assert.equal(ev[0].evidence, 'legacy_unbound')
+  assert.deepEqual(evidence.boundFieldsOf(ev[0]), ['card_id', 'paused'],
+    'the one legacy fit preimage with nothing missing, so its bound list names both fields')
+  assert.equal(ev[0].legacy_preimage, 'fit-autonomy-pause:${card_id}:${paused}:${nonce}')
+
+  // Once this key has used the canonical form on this card the legacy one is closed to it.
+  const canon = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: false }, keys: alice.keys,
+  })
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy/pause`, canon.body)).status, 201)
+  const n2 = 'ap2' + rid()
+  const back = await postJson(`${base}/api/v4/fit/autonomy/pause`, {
+    card_id: cardId, paused: true, public_key: alice.keys.publicKey, nonce: n2,
+    signature: sign(`fit-autonomy-pause:${cardId}:true:${n2}`, alice.keys.privateKey),
+  })
+  assert.equal(back.status, 426)
+  assert.equal(back.json.code, 'client_upgrade_required')
+  assert.equal(pausedOf(cardId), false, 'and the refused call changed nothing')
+})
+
+test('AUTONOMY PAUSE: a card with no standing scope is refused rather than told it succeeded', async () => {
+  // paused is a column on the scope row, so setPaused on a card with no scope changes nothing.
+  // Reporting success would tell a principal they had stopped something that was never
+  // running, and autonomyPermitsDisclosure already returns false for such a card.
+  const alice = makeCard('Alice noscope ' + rid(), ['cofound'])
+  const cardId = await publish(alice)
+  const s = signedBody({
+    operation: 'autonomy_pause', resource: { type: 'card', id: cardId }, payload: { paused: true }, keys: alice.keys,
+  })
+  const res = await postJson(`${base}/api/v4/fit/autonomy/pause`, s.body)
+  assert.equal(res.status, 409)
+  assert.equal(res.json.code, 'no_autonomy_scope')
+  assert.equal(autonomyDb.getScope(cardId), null, 'and nothing was created to hold the flag')
+  // No evidence row either, because the transaction rolled back.
+  assert.equal(evidence.evidenceForResource('card', cardId).length, 0)
+})
