@@ -1260,7 +1260,7 @@ router.post('/:introId/answers', fitGate, canonicalDispatch(canonicalFitAnswers)
           continue
         }
         // drafted: store the raw (human view) AND the airlock extraction (structured).
-        // The extractor sees ONLY {answer, question, schema}; its output carries no
+        // The extractor sees ONLY {answer, question, schema}, and its output carries no
         // free text from the answer, so nothing crosses into a policy-bearing planner.
         const raw = cleaned.get(a.dimension)!
         const extraction = airlockExtract({ answer: raw, question: questionFor(a.dimension)!, schema: { dimension: a.dimension } })
