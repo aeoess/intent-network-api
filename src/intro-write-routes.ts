@@ -100,8 +100,13 @@ router.post('/withdraw-request', canonicalWriteRoute({
       // never canonically signed, which is the one thing the adapters may never do.
       recordAuthorization({ introId, actorKey, operation: 'request_intro', evidenceId, evidence: 'legacy_unbound' })
     }
+    // Not a refusal. Every reachable reason to refuse was checked above: the row is either
+    // live, or it was just backfilled live. A failure here is an INVARIANT VIOLATION rather
+    // than a caller error, so it becomes a 500 through the pipeline's boundary instead of
+    // pretending the caller did something wrong. Keeping the two apart matters, because a
+    // refusal after a write is a side effect that preceded a check.
     if (!withdrawAuthorization({ introId, actorKey, operation: 'request_intro', withdrawnBy: write.writeRef })) {
-      refuseWrite(409, 'already_withdrawn', 'this request was already withdrawn')
+      throw new Error(`withdraw_request found no live request_intro row after its checks passed: ${introId}`)
     }
     const state = materializeStatus(introId, now)
     return { intro_id: introId, state, grandfathered }
@@ -127,8 +132,15 @@ router.post('/withdraw-interest', canonicalWriteRoute({
         'contacts were released, and Mingle does not pretend a released contact can be unshared')
     }
     guardState('withdraw_interest', facts, now)
-    if (!withdrawAuthorization({ introId, actorKey, operation: 'express_interest', withdrawnBy: write.writeRef })) {
+    // Read before writing, so every refusal precedes every side effect. The guard above
+    // already implies a live interest, because mutual interest is what `interested` means, so
+    // this is the specific answer for a caller whose act is already done.
+    const interest = authorizationOf(introId, actorKey, 'express_interest')
+    if (interest === null || interest.live !== 1) {
       refuseWrite(409, 'already_withdrawn', 'this interest was already withdrawn')
+    }
+    if (!withdrawAuthorization({ introId, actorKey, operation: 'express_interest', withdrawnBy: write.writeRef })) {
+      throw new Error(`withdraw_interest found no live express_interest row after its checks passed: ${introId}`)
     }
     // The contact authorization goes with it, as defence in depth rather than as a
     // reachable path. The guard above already refuses withdraw_interest in connecting
@@ -174,8 +186,14 @@ router.post('/withdraw-contact', canonicalWriteRoute({
         'contacts were released, and Mingle does not pretend a released contact can be unshared')
     }
     guardState('withdraw_contact', facts, now)
-    if (!withdrawAuthorization({ introId, actorKey, operation: 'share_contact', withdrawnBy: write.writeRef })) {
+    // Reachable, and it is the answer for a party who is in a connecting intro because the
+    // OTHER side shared. Read first, so the refusal precedes every write.
+    const mine = authorizationOf(introId, actorKey, 'share_contact')
+    if (mine === null || mine.live !== 1) {
       refuseWrite(409, 'no_contact_authorization', 'this key holds no live contact authorization on this introduction')
+    }
+    if (!withdrawAuthorization({ introId, actorKey, operation: 'share_contact', withdrawnBy: write.writeRef })) {
+      throw new Error(`withdraw_contact found no live share_contact row after its checks passed: ${introId}`)
     }
     blankOwnContact(facts, actorKey)
     const artifacts = withdrawArtifacts(introId, actorKey, 'share_contact')

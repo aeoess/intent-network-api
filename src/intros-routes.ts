@@ -177,7 +177,12 @@ const canonicalRequestIntro = canonicalWriteRoute({
       request_id: requestId, actor_key: actorKey, operation: 'request_intro',
       created_type: 'intro', created_id: introId, write_ref: write.writeRef,
     })
-    if (!claim.claimed) refuseWrite(409, 'request_id_taken', 'this request id was claimed concurrently')
+    // Not a refusal. createMapRow was read at the top of this transaction and found nothing,
+    // and SQLite serializes write transactions, so no other writer can have claimed it in
+    // between. A failure here is an invariant violation and belongs in the log as a 500.
+    if (!claim.claimed) {
+      throw new Error(`request_id ${requestId} was claimed between the read and the claim inside one transaction`)
+    }
 
     // The note is stored byte identical to the signed bytes. No stripUrls, no slice, no
     // trim, no String() coercion. That is the whole difference between the lanes, and a
