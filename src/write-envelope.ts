@@ -66,6 +66,7 @@ export const OPERATION_RESOURCE_TYPE: Record<Operation, ResourceType> = {
   fit_request: 'intro',
   fit_commit: 'intro',
   fit_round2: 'intro',
+  fit_answers: 'intro',
   // The v3 fit exchange is its own resource. It has its own 72 hour window, its own
   // parties and its own state machine, and an act on it is not an act on the intro even
   // though an exchange belongs to one. Naming the intro instead would put two different

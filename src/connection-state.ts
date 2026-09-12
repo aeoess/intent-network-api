@@ -51,7 +51,8 @@ export const OPERATIONS = [
  *  which has its own 72 hour window and its own state machine, so it is not an intro
  *  continuation and cannot be: the authorization table keys on the intro. */
 export const PROTOCOL_OPERATIONS = [
-  'fit_round2', 'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers',
+  'fit_round2', 'fit_answers',
+  'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers',
 ] as const
 export type Operation = typeof OPERATIONS[number] | typeof PROTOCOL_OPERATIONS[number]
 
@@ -64,7 +65,7 @@ export const NON_INTRO_OPERATIONS: readonly Operation[] = [
 /** A continuation is a signed act on a live connection. The first one moves the
  *  pair to connecting, and each accepted one sets a new expiry from its own time. */
 export const CONTINUATIONS: readonly Operation[] = [
-  'share_contact', 'fit_request', 'fit_commit', 'fit_round2', 'release_exact',
+  'share_contact', 'fit_request', 'fit_commit', 'fit_round2', 'fit_answers', 'release_exact',
   'first_step_propose', 'first_step_approve',
 ] as const
 
@@ -292,6 +293,7 @@ export function isWriteAllowedInState(operation: Operation, state: IntroState): 
     case 'fit_request':
     case 'fit_commit':
     case 'fit_round2':
+    case 'fit_answers':
     case 'release_exact':
     case 'first_step_propose':
     case 'first_step_approve':

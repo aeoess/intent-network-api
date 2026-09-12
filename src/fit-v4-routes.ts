@@ -1023,7 +1023,130 @@ router.post('/:introId/questions', fitGate, rateLimited('fitv4_hs', 60), (req, r
 
 // ── POST /:introId/answers (signed ticket; drafted routes through the airlock) ─
 
-router.post('/:introId/answers', fitGate, rateLimited('fitv4_hs', 60), (req, res) => {
+interface SignedQaAnswer { dimension: string; mode: 'ledger' | 'drafted' | 'skip'; text?: string; ledger_id?: string }
+
+/** The answers a principal signed, sorted by dimension with exactly the keys each mode
+ *  needs.
+ *
+ *  SORTED BY DIMENSION IS A PROTOCOL RULE, for the same reason as the v3 side: the repair is
+ *  that the stored record recomputes to the signed payload_digest, JCS keeps array order, and
+ *  v4_fit_qa has one row per (intro, dimension, answerer) with no sequence column, so
+ *  dimension order is the only order storage preserves. */
+function gateQaAnswers(value: unknown): SignedQaAnswer[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    refuseWrite(400, 'malformed_payload', 'answers must be a non empty array')
+  }
+  const out: SignedQaAnswer[] = []
+  for (const raw of value as unknown[]) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      refuseWrite(400, 'malformed_payload', 'each answer must be an object')
+    }
+    const a = raw as Record<string, unknown>
+    if (typeof a.dimension !== 'string' || a.dimension.length === 0) {
+      refuseWrite(400, 'malformed_payload', 'each answer needs a dimension')
+    }
+    if (a.mode !== 'ledger' && a.mode !== 'drafted' && a.mode !== 'skip') {
+      refuseWrite(400, 'malformed_payload', 'each answer mode must be ledger, drafted, or skip')
+    }
+    const want = a.mode === 'skip' ? ['dimension', 'mode']
+      : a.mode === 'drafted' ? ['dimension', 'mode', 'text']
+      : ['dimension', 'ledger_id', 'mode', 'text']
+    const have = Object.keys(a).sort()
+    if (have.length !== want.length || have.some((k, i) => k !== want[i])) {
+      refuseWrite(400, 'malformed_payload', `a ${a.mode} answer carries exactly ${want.join(', ')}`)
+    }
+    if (a.mode !== 'skip' && (typeof a.text !== 'string' || a.text.length === 0)) {
+      refuseWrite(400, 'malformed_payload', 'text must be a non empty string')
+    }
+    if (a.mode === 'ledger' && (typeof a.ledger_id !== 'string' || a.ledger_id.length === 0)) {
+      refuseWrite(400, 'malformed_payload', 'a ledger answer needs a ledger_id')
+    }
+    out.push(a as unknown as SignedQaAnswer)
+  }
+  for (let i = 1; i < out.length; i++) {
+    if (out[i - 1].dimension === out[i].dimension) {
+      refuseWrite(400, 'malformed_payload', `answers carries dimension ${out[i].dimension} twice`)
+    }
+    if (out[i - 1].dimension > out[i].dimension) {
+      refuseWrite(400, 'malformed_payload', 'answers must be sorted by dimension, so the stored record recomputes to the signed digest')
+    }
+  }
+  return out
+}
+
+const canonicalFitAnswers = canonicalWriteRoute({
+  operations: ['fit_answers'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['answers'])
+    const answers = gateQaAnswers(write.payload.answers)
+    // Any handshake state: answering questions is not gated on where the predicate
+    // evaluation got to, and it never was.
+    const { hs, introId, actorKey } = fitPreamble(ctx, null)
+    const ownCard = cardOfKey(hs, actorKey) as string
+    const pol = policyDb.getCurrentPolicy(ownCard)
+    const permitted = new Set((pol ? policyDb.dimensionsForIntent(pol, hs.intent) : []).map(x => x.dimension))
+    for (const a of answers) {
+      if (!questionFor(a.dimension) || !permitted.has(a.dimension)) {
+        refuseWrite(400, 'dimension_not_askable',
+          `dimension "${a.dimension}" is not an askable dimension in your policy for this intent`)
+      }
+    }
+
+    // The post-gate screens the whole drafted batch, and a text it would REWRITE is refused
+    // rather than cleaned, so the stored answer is the signed answer.
+    const drafted = answers.filter(a => a.mode === 'drafted')
+    if (drafted.length > 0) {
+      const gate = postGateDrafted(drafted.map(a => ({ question_id: a.dimension, text: a.text as string })))
+      if (!gate.ok) refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the answer text was refused')
+      const cleaned = new Map((gate.cleaned ?? []).map(c => [c.question_id, c.text]))
+      for (const a of drafted) {
+        if (cleaned.get(a.dimension) !== a.text) {
+          refuseWrite(400, 'text_not_stored_as_signed',
+            `the answer for ${a.dimension} would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.`)
+        }
+      }
+    }
+
+    // A ledger answer binds the TEXT, and is stored verbatim with no composed wrap. The
+    // matrix gap was that the quoted v3 ledger sentence was fetched live while only
+    // ledger_id was signed, so the words in the record were warranted by nothing.
+    for (const a of answers) {
+      if (a.mode !== 'ledger') continue
+      const item = ledgerItemLive(ownCard, a.ledger_id as string)
+      if (!item) {
+        refuseWrite(409, 'ledger_item_superseded', `ledger item ${a.ledger_id} was superseded, so re-approve and re-answer`)
+      }
+      if ((item as { text: string }).text !== a.text) {
+        refuseWrite(409, 'ledger_text_mismatch',
+          `the signed text for ${a.dimension} is not the text of ledger item ${a.ledger_id}, so it is refused rather than replaced`)
+      }
+    }
+
+    for (const a of answers) {
+      // The extraction is derived from the SIGNED text by a deterministic function, so it
+      // asserts nothing the signature does not cover. It sees only {answer, question,
+      // schema} and its output carries no free text into a policy bearing planner.
+      const extraction = a.mode === 'drafted'
+        ? JSON.stringify(airlockExtract({ answer: a.text as string, question: questionFor(a.dimension) as string, schema: { dimension: a.dimension } }))
+        : null
+      qaDb.upsertQa({
+        intro_id: introId, dimension: a.dimension, answerer_key: actorKey, mode: a.mode,
+        text: a.mode === 'skip' ? null : (a.text as string),
+        extraction_json: extraction,
+      })
+    }
+    const evidenceId = recordCanonicalEvidence(write)
+    // A continuation, exactly as fit_round2 is: a signed act by a party on a live
+    // connection. So it writes an authorization row and the connecting window measures
+    // from it, which is what makes answering count as activity.
+    recordAuthorization({ introId, actorKey, operation: 'fit_answers', evidenceId, evidence: 'canonical' })
+    const state = materializeStatus(introId, now)
+    return { intro_id: introId, state, answered: answers.length }
+  },
+})
+
+router.post('/:introId/answers', fitGate, canonicalDispatch(canonicalFitAnswers), rateLimited('fitv4_hs', 60), (req, res) => {
   const introId = String(req.params.introId)
   const { answers, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(answers) || answers.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'answers and nonce required' }); return }
@@ -1032,6 +1155,8 @@ router.post('/:introId/answers', fitGate, rateLimited('fitv4_hs', 60), (req, res
   const hs = handshakeDb.getHandshake(introId)
   if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
   if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  const legacyGate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyGate !== null) { refuseLegacy(res, 'fit_answers', introId, legacyGate); return }
   const ownCard = cardOfKey(hs, public_key)!
   const pol = policyDb.getCurrentPolicy(ownCard)
   const permitted = new Set((pol ? policyDb.dimensionsForIntent(pol, hs.intent) : []).map(x => x.dimension))
@@ -1064,6 +1189,14 @@ router.post('/:introId/answers', fitGate, rateLimited('fitv4_hs', 60), (req, res
     const extraction = airlockExtract({ answer: raw, question: questionFor(a.dimension)!, schema: { dimension: a.dimension } })
     qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'drafted', text: raw, extraction_json: JSON.stringify(extraction) })
   }
+  // Recorded as weak, and never as a canonical authorization. The bound list names the
+  // SUBMITTED answers rather than the stored text, because this lane still cleans and still
+  // wraps, and it writes no connection_authorizations row: a legacy fit answer is not a
+  // continuation, because nothing in those bytes says which answers were authorized.
+  recordLegacyEvidence({
+    actorKey: public_key, operation: 'fit_answers',
+    resourceType: 'intro', resourceId: introId, signature: String(signature ?? ''),
+  })
   res.json({ ok: true, answered: answers.length })
 })
 

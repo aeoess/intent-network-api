@@ -42,6 +42,7 @@ const CANONICAL_BOUND: Record<Operation, string[]> = {
   first_step_propose: ['operation', 'resource.id', 'payload.purpose', 'payload.next_action', 'payload.meeting_length', 'payload.agenda', 'payload.each_wants', 'payload.boundaries', 'payload.expiry'],
   first_step_approve: ['operation', 'resource.id', 'payload.approved_digest'],
   fit_round2: ['operation', 'resource.id', 'payload.dimension_ids', 'payload.antecedent_write_ref'],
+  fit_answers: ['operation', 'resource.id', 'payload.answers'],
   fit_exchange_round2: ['operation', 'resource.id', 'payload.question_ids', 'payload.antecedent_write_ref'],
   fit_exchange_custom: ['operation', 'resource.id', 'payload.questions'],
   fit_exchange_answers: ['operation', 'resource.id', 'payload.answers'],
@@ -74,6 +75,9 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   // arrived and not what was stored, and a list naming plain `answers` would let a reader
   // take it for the stored text.
   fit_exchange_answers: ['exchange_id', 'answers_submitted'],
+  // The v4 side of the same shape and the same caveat: a hash over what ARRIVED, while the
+  // stored drafted text is cleaned and the stored ledger text is a composed sentence.
+  fit_answers: ['intro_id', 'answers_submitted'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -92,6 +96,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   fit_exchange_round2: 'fit-round2:${id}:${nonce}',
   fit_exchange_custom: 'fit-custom:${id}:${nonce}',
   fit_exchange_answers: 'sha256(JCS({exchange_id, nonce, answers}))',
+  fit_answers: 'sha256(JCS({intro_id, nonce, answers}))',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {

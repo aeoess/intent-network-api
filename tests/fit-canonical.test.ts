@@ -21,7 +21,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import type { Server } from 'node:http'
 import Database from 'better-sqlite3'
 import { generateKeyPair, sign, canonicalize } from 'agent-passport-system'
@@ -47,6 +47,7 @@ const autonomyDb = await import('../src/fit-autonomy-db.js')
 const commitments = await import('../src/policy-commitment.js')
 const artifacts = await import('../src/private-artifacts.js')
 const evidence = await import('../src/write-evidence.js')
+const qaDb = await import('../src/fit-qa-db.js')
 const { cardContentHash } = await import('../src/v3-cards.js')
 const { newNonce, jcs } = await import('../src/canonical-write.js')
 
@@ -1041,4 +1042,189 @@ test('AGREEMENT: every canonical fit act renews the connecting window and the co
       assert.equal(derived, 'connecting', `${intro_id} holds a live continuation`)
     }
   }
+})
+
+// ══════════════════════════════════════════════════════════════
+// fit_answers, canonical (step 22)
+// ══════════════════════════════════════════════════════════════
+// Matrix row 34, rank 21, PARTIAL. The ledger item TEXT that ledger mode quotes was
+// fetched live while only ledger_id was signed, and the stored drafted text was the
+// post-gate cleaned string. So the record could not be recomputed from the signature in
+// either mode, and the quoted words were warranted by nothing.
+
+/** Recompute the payload digest from what the DATABASE holds, the way a later reader would. */
+function digestOfStoredQa(introId: string, answererKey: string): string {
+  const rows = qaDb.qaForIntro(introId)
+    .filter(r => r.answerer_key === answererKey)
+    .sort((a, b) => (a.dimension < b.dimension ? -1 : 1))
+  const answers = rows.map(r => {
+    if (r.mode === 'skip') return { dimension: r.dimension, mode: r.mode }
+    if (r.mode === 'ledger') return { dimension: r.dimension, ledger_id: ledgerIdOf(r), mode: r.mode, text: r.text }
+    return { dimension: r.dimension, mode: r.mode, text: r.text }
+  })
+  return env.buildEnvelope({
+    operation: 'fit_answers' as any, actorKey: answererKey,
+    resource: { type: 'intro', id: introId } as any,
+    issuedAt: '2026-01-01T00:00:00.000Z', nonce: 'y'.repeat(22), payload: { answers },
+  }).payloadDigest
+}
+/** v4_fit_qa has no ledger_id column, so the test carries the id it signed. */
+let signedLedgerId = ''
+function ledgerIdOf(_row: unknown): string { return signedLedgerId }
+
+async function setLedgerFor(who: any, cardId: string, texts: string[]): Promise<{ id: string; text: string }> {
+  const approved_hash = (await import('../src/fit-db.js')).ledgerHash(texts)
+  const nonce = 'dl' + rid()
+  const r = await (await fetch(`${base}/api/v3/fit/disclosures`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      card_id: cardId, items: texts.map(t => ({ text: t })), approved_hash,
+      public_key: who.keys.publicKey, nonce,
+      signature: sign(`set-disclosures:${cardId}:${approved_hash}:${nonce}`, who.keys.privateKey),
+    }),
+  })).json()
+  assert.ok(r.items, JSON.stringify(r))
+  return { id: r.items[0].id, text: r.items[0].text }
+}
+
+test('FIT ANSWERS: the stored answer recomputes to the signed payload digest, in all three modes', async () => {
+  const p = await pair([
+    dim('cadence', 'mixed', 'reveal_overlap'),
+    dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_exact'),
+    dim('start_window', 'flexible', 'reveal_overlap'),
+  ], [
+    dim('cadence', 'mixed', 'reveal_overlap'),
+    dim('weekly_commitment', { min: 10, max: 30 }, 'reveal_exact'),
+    dim('start_window', 'within_month', 'reveal_overlap'),
+  ])
+  // A handshake must exist, exactly as the legacy route has always required. fit_request is
+  // the one act that opens one, and answering is not it.
+  assert.equal((await canonicalFitRequest(p)).status, 201)
+  const item = await setLedgerFor(p.bob, p.bobCard, ['I can give three evenings and one weekend day.'])
+  signedLedgerId = item.id
+
+  const answers = [
+    { dimension: 'cadence', mode: 'drafted', text: 'Mixed, with one live day a week.' },
+    { dimension: 'start_window', mode: 'skip' },
+    { dimension: 'weekly_commitment', ledger_id: item.id, mode: 'ledger', text: item.text },
+  ]
+  const s = signedBody({
+    operation: 'fit_answers', resource: { type: 'intro', id: p.introId }, payload: { answers }, keys: p.bob.keys,
+  })
+  const res = await postJson(fitUrl(p.introId, '/answers'), s.body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.answered, 3)
+
+  assert.equal(digestOfStoredQa(p.introId, p.bob.keys.publicKey), s.built.payloadDigest,
+    'the stored rows must rebuild the exact payload the principal signed')
+
+  const rows = qaDb.qaForIntro(p.introId)
+  const ledgerRow = rows.find(r => r.dimension === 'weekly_commitment')!
+  assert.equal(ledgerRow.text, item.text)
+  assert.equal(ledgerRow.text!.includes('Their approved brief states'), false,
+    'no server composed wrap around words the principal signed')
+  assert.equal(rows.find(r => r.dimension === 'start_window')!.text, null)
+  // The airlock extraction is still stored for a drafted answer, derived from the signed
+  // text by a deterministic function, so it asserts nothing the signature does not cover.
+  assert.ok(rows.find(r => r.dimension === 'cadence')!.extraction_json)
+
+  const row = evidence.evidenceByWriteRef(s.built.writeRef)!
+  assert.deepEqual(evidence.boundFieldsOf(row), ['operation', 'resource.id', 'payload.answers'])
+})
+
+test('FIT ANSWERS: it is a CONTINUATION, so it moves the connecting deadline', async () => {
+  // The same treatment fit_round2 has, and for the same reason: a signed act by a party on
+  // a live connection. Answering is activity, and expiry measures inactivity.
+  const p = await pair()
+  assert.equal(facts.introProjection(p.introId, p.bob.keys.publicKey)!.state, 'interested')
+  assert.equal((await canonicalFitRequest(p)).status, 201)
+
+  const answers = [{ dimension: 'cadence', mode: 'drafted', text: 'Mixed works for me.' }]
+  const s = signedBody({
+    operation: 'fit_answers', resource: { type: 'intro', id: p.introId }, payload: { answers }, keys: p.bob.keys,
+  })
+  assert.equal((await postJson(fitUrl(p.introId, '/answers'), s.body)).status, 201)
+
+  const after = facts.introProjection(p.introId, p.bob.keys.publicKey)!
+  assert.equal(after.state, 'connecting')
+  assert.ok(state.CONTINUATIONS.includes('fit_answers' as any), 'it is in the continuation list')
+  const auth = facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_answers' as any)!
+  assert.equal(auth.live, 1)
+  assert.equal(auth.evidence, 'canonical')
+  // The deadline is 30 days from THIS act's own time, which is what makes answering count as
+  // activity. Asserted against the row rather than against a clock, so it is exact.
+  assert.equal(after.expires_at, new Date(Date.parse(auth.created_at) + 30 * 864e5).toISOString())
+})
+
+test('FIT ANSWERS: a rewritten text, a substituted ledger text and an unaskable dimension are all refused', async () => {
+  const p = await pair()
+  assert.equal((await canonicalFitRequest(p)).status, 201)
+  const item = await setLedgerFor(p.bob, p.bobCard, ['I can give three evenings.'])
+  const bad: [string, any, number, string][] = [
+    ['a link the gate would strip',
+      [{ dimension: 'cadence', mode: 'drafted', text: 'See https://example.com/cadence' }], 400, 'text_not_stored_as_signed'],
+    ['contact data',
+      [{ dimension: 'cadence', mode: 'drafted', text: 'Reach me at me@example.com' }], 400, 'post_gate_refused'],
+    ['a ledger text of the signer\'s choosing',
+      [{ dimension: 'weekly_commitment', ledger_id: item.id, mode: 'ledger', text: 'I can give nine evenings.' }], 409, 'ledger_text_mismatch'],
+    ['a ledger id that names nothing',
+      [{ dimension: 'weekly_commitment', ledger_id: 'nope', mode: 'ledger', text: 'x' }], 409, 'ledger_item_superseded'],
+    ['a dimension with no canonical question',
+      [{ dimension: 'favourite_colour', mode: 'drafted', text: 'Blue.' }], 400, 'dimension_not_askable'],
+    ['unsorted answers',
+      [{ dimension: 'weekly_commitment', mode: 'skip' }, { dimension: 'cadence', mode: 'skip' }], 400, 'malformed_payload'],
+    ['a skip carrying text',
+      [{ dimension: 'cadence', mode: 'skip', text: 'x' }], 400, 'malformed_payload'],
+  ]
+  for (const [why, answers, status, code] of bad) {
+    const s = signedBody({
+      operation: 'fit_answers', resource: { type: 'intro', id: p.introId }, payload: { answers }, keys: p.bob.keys,
+    })
+    const res = await postJson(fitUrl(p.introId, '/answers'), s.body)
+    assert.equal(res.status, status, `${why}: ${JSON.stringify(res.json)}`)
+    assert.equal(res.json.code, code, why)
+  }
+  assert.deepEqual(qaDb.qaForIntro(p.introId), [], 'and not one refusal left a row behind')
+})
+
+test('FIT ANSWERS: the legacy lane still works, is recorded as weak, and is no continuation', async () => {
+  const p = await legacyPair()
+  const nonce = 'la' + rid()
+  const answers = [{ dimension: 'cadence', mode: 'drafted', text: 'Mixed, see https://example.com/x' }]
+  const hash = createHash('sha256').update(canonicalize({ intro_id: p.introId, nonce, answers }), 'utf8').digest('hex')
+  const res = await postJson(fitUrl(p.introId, '/answers'), {
+    answers, public_key: p.bob.keys.publicKey, nonce, signature: sign(hash, p.bob.keys.privateKey),
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+  const row = qaDb.qaForIntro(p.introId).find(r => r.dimension === 'cadence')!
+  assert.equal(row.text!.includes('https://example.com'), false, 'the legacy lane still cleans')
+
+  const ev = evidence.evidenceForResource('intro', p.introId).filter(e => e.operation === 'fit_answers')
+  assert.equal(ev.length, 1)
+  assert.equal(ev[0].evidence, 'legacy_unbound')
+  assert.deepEqual(evidence.boundFieldsOf(ev[0]), ['intro_id', 'answers_submitted'])
+  assert.equal(evidence.covers(ev[0], 'payload.answers'), false)
+  // No authorization row, so a legacy answer never moves a deadline: nothing in those bytes
+  // says which answers were authorized.
+  assert.equal(facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_answers' as any), null)
+})
+
+test('FIT ANSWERS: anti-downgrade, a canonical answer closes the legacy form for that key', async () => {
+  const p = await legacyPair()
+  const s = signedBody({
+    operation: 'fit_answers', resource: { type: 'intro', id: p.introId },
+    payload: { answers: [{ dimension: 'cadence', mode: 'drafted', text: 'Mixed.' }] }, keys: p.bob.keys,
+  })
+  assert.equal((await postJson(fitUrl(p.introId, '/answers'), s.body)).status, 201)
+
+  const nonce = 'ld' + rid()
+  const answers = [{ dimension: 'cadence', mode: 'drafted', text: 'Actually async.' }]
+  const hash = createHash('sha256').update(canonicalize({ intro_id: p.introId, nonce, answers }), 'utf8').digest('hex')
+  const back = await postJson(fitUrl(p.introId, '/answers'), {
+    answers, public_key: p.bob.keys.publicKey, nonce, signature: sign(hash, p.bob.keys.privateKey),
+  })
+  assert.equal(back.status, 426)
+  assert.equal(back.json.code, 'client_upgrade_required')
+  assert.equal(qaDb.qaForIntro(p.introId).find(r => r.dimension === 'cadence')!.text, 'Mixed.',
+    'and the refused call changed nothing')
 })
