@@ -43,6 +43,33 @@ export const ENVELOPE_OPERATIONS: readonly Operation[] = [...OPERATIONS, 'fit_ro
 export const RESOURCE_TYPES = ['intro', 'intro_request', 'card_pair', 'card', 'fit_exchange'] as const
 export type ResourceType = typeof RESOURCE_TYPES[number]
 
+/** The resource type each operation names, which the design fixes exactly: a create
+ *  names the request it is idempotent on, a block names the pair, and every other
+ *  act names the intro.
+ *
+ *  Enforced here rather than per route, because it is a property of the protocol and
+ *  not of a path. Without it an envelope could name `operation: "withdraw_request"`
+ *  against `resource: { type: "card_pair" }`, pass every shape check, verify, and
+ *  land on whichever route accepted the operation. Then two envelopes for the same
+ *  act would carry two different resource identities, and anti-downgrade, evidence
+ *  and the nonce store all key on that identity. */
+export const OPERATION_RESOURCE_TYPE: Record<Operation, ResourceType> = {
+  request_intro: 'intro_request',
+  block_pair: 'card_pair',
+  withdraw_request: 'intro',
+  express_interest: 'intro',
+  decline: 'intro',
+  withdraw_interest: 'intro',
+  share_contact: 'intro',
+  withdraw_contact: 'intro',
+  fit_request: 'intro',
+  fit_commit: 'intro',
+  fit_round2: 'intro',
+  release_exact: 'intro',
+  first_step_propose: 'intro',
+  first_step_approve: 'intro',
+}
+
 /** The two operations that carry a private value, so the two that require an
  *  `opening` beside the payload and refuse one anywhere else. */
 export const PRIVATE_VALUE_OPERATIONS: readonly Operation[] = ['share_contact', 'release_exact'] as const
@@ -86,6 +113,7 @@ export type EnvelopeRejection =
   | 'unknown_operation'
   | 'malformed_actor_key'
   | 'unknown_resource_type'
+  | 'resource_type_mismatch'
   | 'malformed_resource_id'
   | 'malformed_issued_at'
   | 'malformed_nonce'
@@ -180,6 +208,10 @@ export function verifyWriteBody(body: WireBody | unknown): EnvelopeResult {
   }
   if (typeof resource.id !== 'string' || !RESOURCE_ID_RE.test(resource.id)) {
     return bad(400, 'malformed_resource_id', 'resource.id is not a well formed identifier')
+  }
+  const wantType = OPERATION_RESOURCE_TYPE[operation]
+  if (resource.type !== wantType) {
+    return bad(400, 'resource_type_mismatch', `${operation} names a ${wantType}, not a ${resource.type}`)
   }
   if (typeof envelope.issued_at !== 'string' || !ISO_MS_Z.test(envelope.issued_at) || Number.isNaN(Date.parse(envelope.issued_at))) {
     return bad(400, 'malformed_issued_at', 'issued_at must be ISO 8601 with milliseconds and a trailing Z')
@@ -286,6 +318,18 @@ export function checkFreshness(envelope: WriteEnvelope, now: Date = new Date()):
     return bad(401, 'stale_authorization', 'issued_at is more than 2 minutes in the future')
   }
   return null
+}
+
+/** The signed resource id for a card pair: the two card ids sorted by UTF-16 code
+ *  unit, then JCS, then SHA-256.
+ *
+ *  Hashed rather than joined so the signed id has a fixed shape and no separator
+ *  question. The internal storage key at intros-db.ts:78 stays exactly as it is, a
+ *  raw NUL join, so no stored block row changes and isBlocked keeps working. This
+ *  form exists only inside signed bytes. */
+export function cardPairResourceId(cardA: string, cardB: string): string {
+  const sorted = [cardA, cardB].sort()
+  return sha256Hex(jcs(sorted))
 }
 
 /** The commitment behind a private value. Binds operation and resource as well as

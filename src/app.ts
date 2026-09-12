@@ -15,6 +15,7 @@ import v3Routes from './v3-routes.js'
 import v3Pages from './v3-pages.js'
 import notifyRoutes from './notify-routes.js'
 import introsRoutes from './intros-routes.js'
+import introWriteRoutes from './intro-write-routes.js'
 import fitRoutes from './fit-routes.js'
 import fitV4Routes from './fit-v4-routes.js'
 import matchRoutes, { v3RateHeaders } from './match-routes.js'
@@ -46,6 +47,11 @@ export function createApp() {
   app.use('/api/v3/notifications', notifyRoutes)
   // Mingle v3 introductions (request, respond, complete, mine)
   app.use('/api/v3/intros', introsRoutes)
+  // The canonical mingle-write-v1 actions that have no legacy form. Mounted BEFORE
+  // nothing and AFTER the legacy router, because the paths are disjoint: these are
+  // fixed words and the legacy router's only parameterized paths are /:id/respond
+  // and /:id/complete, which no path here matches.
+  app.use('/api/v3/intros', introWriteRoutes)
   // Mingle v3.6 structured fit exchange (disclosures, draft, answers, close)
   app.use('/api/v3/fit', fitRoutes)
   // Mingle v4 private fit (policy, predicate handshake)
