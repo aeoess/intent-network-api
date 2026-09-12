@@ -60,10 +60,23 @@ export function authorizationsFor(introId: string): AuthorizationRow[] {
   // write_evidence.write_ref carries a unique index, so the join is one row at most and
   // cannot multiply the authorization rows. A legacy act has a null write_ref and joins to
   // nothing, which is correct: there is no envelope to date the withdrawal by.
+  //
+  // The join is also constrained to THIS intro's own resource. Every writer of withdrawn_by
+  // passes its own write's ref, so a row from another resource is unreachable today, and
+  // pinning it in the SQL makes a wrong-row basis impossible rather than merely unreached.
+  //
+  // ORDERING INVARIANT, load bearing and otherwise undocumented: a withdrawal's evidence row
+  // must be recorded BEFORE materializeStatus runs in the same transaction. The basis is this
+  // join, so a materialization that ran first would derive from a null withdrawn_at, write
+  // `withdrawn` into the legacy column for an intro that is actually still live, and the sweep
+  // would never revisit it, because its candidate filter reads only pending and accepted. All
+  // three withdrawal routes record evidence first, and a scan in the verification script holds
+  // them to it.
   return d().prepare(`
     SELECT a.*, e.recorded_at AS withdrawn_at
     FROM connection_authorizations a
-    LEFT JOIN write_evidence e ON e.write_ref = a.withdrawn_by
+    LEFT JOIN write_evidence e
+      ON e.write_ref = a.withdrawn_by AND e.resource_type = 'intro' AND e.resource_id = a.intro_id
     WHERE a.intro_id = ?
     ORDER BY a.created_at, a.operation, a.actor_key, a.subject
   `).all(introId) as AuthorizationRow[]
@@ -353,11 +366,13 @@ export function materializeStatus(introId: string, now: Date = new Date()): Intr
 
 /** The shortest TTL, which is what makes the candidate filter both sound and complete.
  *
- *  Every expiry basis is at or after the intro's own created_at: `requested` measures from
- *  it directly, `interested` from an authorization inserted no earlier, and `connecting`
- *  from a continuation inserted later still. So the EARLIEST any intro can expire is
- *  created_at plus 14 days, and an intro younger than that cannot be expired whatever its
- *  facts say. That argument is why the filter can be one comparison rather than a scan. */
+ *  Every expiry basis is at or after the intro's own created_at. There are FOUR of them now:
+ *  `requested` measures from the intro row directly, `interested` from an authorization
+ *  inserted no earlier, `connecting` from a continuation inserted later still, and since the
+ *  TTL ruling the interested basis can also be a withdrawal's accepted time, which is later
+ *  than the authorization it withdrew. So the EARLIEST any intro can expire is created_at plus
+ *  14 days, and an intro younger than that cannot be expired whatever its facts say. That
+ *  argument is why the filter can be one comparison rather than a scan. */
 const SHORTEST_TTL_DAYS = 14
 
 /** Bring v3_intros.status into line for rows that expired without anyone writing to them.

@@ -39,14 +39,18 @@
 // WHAT THIS DOES NOT DO, and the limit matters more than the mechanism. The time
 // bound rests on recorded_at, which is the server's own record of when it issued
 // the receipt. It stops a retired key from being used for NEW work by an honest
-// server, and it bounds the damage from a retired key that leaks later. It does
-// NOT prevent a holder of a compromised retired private key from BACKDATING: such
-// a holder can sign any digest and claim any recorded_at at or before retired_at,
-// and nothing in this module can contradict them. Strong anti-backdating needs a
-// mechanism outside 2B, either a transparency log that publishes receipt digests
-// as they are issued or a third party timestamp over each one, so that a receipt
-// with no entry in the log at its claimed time is refutable. That is a Stage 2C or
-// later decision and this module deliberately does not pretend otherwise.
+// server. It does NOT prevent a holder of a compromised retired private key from
+// BACKDATING: such a holder can sign any digest and claim any recorded_at at or
+// before retired_at, and nothing in this module can contradict them. So the bound
+// is only as good as where recorded_at CAME FROM. Against this server's own stored
+// rendered_at it holds. Against a time handed to the verifier by whoever presents
+// the artifact it holds not at all, because no signature covers that time.
+//
+// Strong anti-backdating needs a mechanism outside 2B, either a transparency log
+// that publishes receipt digests as they are issued or a third party timestamp over
+// each one, so that a receipt with no entry in the log at its claimed time is
+// refutable. That is a Stage 2C or later decision and this module deliberately does
+// not pretend otherwise.
 //
 // This is configuration and verifier machinery ONLY. There is no key management
 // API here, no admin surface, no database backed rotation service and no automatic
@@ -152,6 +156,12 @@ export type TrustedSetResult =
 // issued_at, and for the same reason: the shape alone admits a calendar invalid
 // instant that V8 silently rolls over.
 const ISO_MS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
+// An Ed25519 public key as this codebase writes one everywhere else: 64 lowercase hex. A
+// retired entry's key used to be any non-empty string, so a typo became a trusted
+// verification_only entry with a derived id nobody's receipts carry, which SILENTLY deleted
+// the history the entry was added to preserve while the boot log said one retired key was
+// trusted. It fails closed, so no trust was widened, and the loss was total either way.
+const PUBKEY_HEX = /^[0-9a-f]{64}$/
 
 function isExactIso(value: string): boolean {
   if (!ISO_MS_Z.test(value)) return false
@@ -192,9 +202,13 @@ export function loadTrustedKeySetFrom(env: ReceiptKeyEnv): TrustedSetResult {
     }
     const publicKey = item.slice(0, at).trim()
     const retiredAt = item.slice(at + 1).trim()
-    if (publicKey.length === 0 || !isExactIso(retiredAt)) {
+    if (!PUBKEY_HEX.test(publicKey)) {
       return setFail('retired_key_malformed',
-        `MINGLE_RECEIPT_RETIRED_PUBKEYS entry for ${publicKey.slice(0, 16) || '(empty)'} carries retired_at "${retiredAt}", which must be ISO 8601 with milliseconds and a trailing Z and must name a real instant.`)
+        `MINGLE_RECEIPT_RETIRED_PUBKEYS entry "${publicKey.slice(0, 16)}..." is not 64 lowercase hex characters. A mistyped key derives a different issuer id, so it would be trusted while every receipt under the real key stopped resolving.`)
+    }
+    if (!isExactIso(retiredAt)) {
+      return setFail('retired_key_malformed',
+        `MINGLE_RECEIPT_RETIRED_PUBKEYS entry for ${publicKey.slice(0, 16)} carries retired_at "${retiredAt}", which must be ISO 8601 with milliseconds and a trailing Z and must name a real instant.`)
     }
     const issuerKeyId = deriveIssuerKeyId(publicKey)
     if (issuerKeyId === active.issuerKeyId) {
@@ -220,9 +234,12 @@ export function trustedKeyEntryFor(env: ReceiptKeyEnv, issuerKeyId: string): Tru
   return (set as { ok: true; entries: TrustedKeyEntry[] }).entries.find(e => e.issuerKeyId === issuerKeyId) ?? null
 }
 
-export function resolveIssuerKeyWith(env: ReceiptKeyEnv, issuerKeyId: string): string | null {
-  return trustedKeyEntryFor(env, issuerKeyId)?.publicKey ?? null
-}
+// THERE IS NO resolveIssuerKeyWith. It used to return a retired key's bare public key with
+// no time bound and no parameter that could carry one, so a caller who resolved and then
+// verified bypassed the retirement rule entirely and nothing in its signature hinted at it.
+// The module already refuses to export a verifier that takes a public key as an argument, for
+// the same reason: it is the shape that invites the mistake. A caller who needs the key uses
+// trustedKeyEntryFor, which hands back the role and the retired_at beside it.
 
 export type ReceiptCheckReason =
   | 'issuer_unresolved'

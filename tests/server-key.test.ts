@@ -187,7 +187,7 @@ test('ROTATION: a historical receipt under a retired key still verifies', () => 
   // Drop the retained key and the same receipt becomes unresolvable rather than
   // invalid. Those are different failures and an operator needs to see which.
   const without = { MINGLE_RECEIPT_PRIVKEY: fresh.privateKey, MINGLE_RECEIPT_PUBKEY: fresh.publicKey }
-  assert.equal(sk.resolveIssuerKeyWith(without, oldId), null)
+  assert.equal(sk.trustedKeyEntryFor(without, oldId), null)
   assert.equal(sk.verifyReceiptWith(without, digest, receipt, oldId, BEFORE_RETIREMENT), false)
 })
 
@@ -244,8 +244,16 @@ test('ROTATION: a malformed, duplicated or self-referential retired entry refuse
   assert.equal(codeOf(`${old.publicKey}@${RETIRED_AT},${old.publicKey}@2020-01-01T00:00:00.000Z`), 'retired_key_duplicate')
   // The active signer listed as retired, which is one entry holding two roles.
   assert.equal(codeOf(`${testKey.publicKey}@${RETIRED_AT}`), 'retired_key_is_active_signer')
+  // A retired entry whose public key is not a key at all. It used to be accepted, so a typo
+  // became a trusted entry with a derived id nobody's receipts carry, which SILENTLY deleted
+  // the history the entry was added to preserve while the boot log said one retired key was
+  // trusted. It fails closed, and the loss was total either way.
+  assert.equal(codeOf(`not-a-public-key@${RETIRED_AT}`), 'retired_key_malformed')
+  assert.equal(codeOf(`${old.publicKey.toUpperCase()}@${RETIRED_AT}`), 'retired_key_malformed')
+  assert.equal(codeOf(`${old.publicKey.slice(0, -2)}@${RETIRED_AT}`), 'retired_key_malformed',
+    'a truncated key is the realistic typo, and it must not be trusted')
   // And an invalid set resolves NOTHING, so a misconfiguration cannot widen trust.
-  assert.equal(sk.resolveIssuerKeyWith({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey },
+  assert.equal(sk.trustedKeyEntryFor({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey },
     sk.deriveIssuerKeyId(testKey.publicKey)), null)
   assert.throws(() => sk.assertReceiptKeyConfigured({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey }),
     /PUBKEY@RETIRED_AT/)
@@ -274,7 +282,7 @@ test('ROTATION: the module says out loud what it does not prevent', async () => 
 test('RECEIPT KEY: an unresolvable issuer_key_id is reported as unresolvable, not as a bad signature', () => {
   const env = { MINGLE_RECEIPT_PRIVKEY: testKey.privateKey, MINGLE_RECEIPT_PUBKEY: testKey.publicKey }
   const unknown = sk.deriveIssuerKeyId(generateKeyPair().publicKey)
-  assert.equal(sk.resolveIssuerKeyWith(env, unknown), null)
+  assert.equal(sk.trustedKeyEntryFor(env, unknown), null)
   const out = sk.checkReceiptWith(env, 'a'.repeat(64), 'ff'.repeat(64), unknown)
   assert.equal(out.ok, false)
   if (out.ok) return
@@ -290,11 +298,22 @@ test('RECEIPT KEY: verification never trusts a key carried beside the artifact',
   const forged = sign(digest, rogue.privateKey)
   const env = { MINGLE_RECEIPT_PRIVKEY: testKey.privateKey, MINGLE_RECEIPT_PUBKEY: testKey.publicKey }
   // The rogue key is not in the trusted set, so its id resolves to nothing.
-  assert.equal(sk.resolveIssuerKeyWith(env, sk.deriveIssuerKeyId(rogue.publicKey)), null)
+  assert.equal(sk.trustedKeyEntryFor(env, sk.deriveIssuerKeyId(rogue.publicKey)), null)
   assert.equal(sk.verifyReceiptWith(env, digest, forged, sk.deriveIssuerKeyId(rogue.publicKey)), false)
   // And the module exposes no function that accepts a public key as an argument
   // for verification, which is the shape that would invite the mistake.
   assert.equal(typeof (sk as any).verifyReceiptWithPublicKey, 'undefined')
+  // NOR one that hands back a bare public key with no time bound and no parameter that could
+  // carry one. resolveIssuerKeyWith used to, so a caller who resolved and then verified
+  // bypassed the retirement rule entirely and nothing in its signature hinted at it.
+  assert.equal(typeof (sk as any).resolveIssuerKeyWith, 'undefined')
+  // trustedKeyEntryFor is the replacement, and it hands back the role and the retired_at
+  // beside the key, so a caller cannot see the key without seeing the bound.
+  const retired = generateKeyPair()
+  const withRetired = { ...env, MINGLE_RECEIPT_RETIRED_PUBKEYS: `${retired.publicKey}@${RETIRED_AT}` }
+  const entry = sk.trustedKeyEntryFor(withRetired, sk.deriveIssuerKeyId(retired.publicKey))!
+  assert.equal(entry.role, 'verification_only')
+  assert.equal(entry.retiredAt, RETIRED_AT)
 })
 
 // ── The cached accessors, and the startup gate ────────────────────────────

@@ -1244,29 +1244,41 @@ router.post('/:introId/answers', fitGate, canonicalDispatch(canonicalFitAnswers)
     for (const c of gate.cleaned ?? []) cleaned.set(c.question_id, c.text)
   }
 
-  for (const a of answers) {
-    if (a.mode === 'skip') { qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'skip', text: null }); continue }
-    if (a.mode === 'ledger') {
-      const item = ledgerItemLive(ownCard, String(a.ledger_id))
-      if (!item) { res.status(409).json({ error: `ledger item ${a.ledger_id} was superseded; re-approve and re-answer` }); return }
-      qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'ledger', text: `Their approved brief states: "${item.text}"` })
-      continue
-    }
-    // drafted: store the raw (human view) AND the airlock extraction (structured).
-    // The extractor sees ONLY {answer, question, schema}; its output carries no
-    // free text from the answer, so nothing crosses into a policy-bearing planner.
-    const raw = cleaned.get(a.dimension)!
-    const extraction = airlockExtract({ answer: raw, question: questionFor(a.dimension)!, schema: { dimension: a.dimension } })
-    qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'drafted', text: raw, extraction_json: JSON.stringify(extraction) })
+  // ONE TRANSACTION for the writes and the evidence row. The loop refuses mid-batch on a
+  // superseded ledger item, and at 86a038d that left the answers before the refusal stored.
+  // Adding the evidence row at the end of a non-transactional handler made that worse: a
+  // partial batch stored answers with no record of the act at all. The other legacy fit
+  // branches already wrap theirs this way. A client sees the same status and the same body.
+  try {
+    getDb().transaction(() => {
+      for (const a of answers) {
+        if (a.mode === 'skip') { qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'skip', text: null }); continue }
+        if (a.mode === 'ledger') {
+          const item = ledgerItemLive(ownCard, String(a.ledger_id))
+          if (!item) throw new LegacyFitRefusal(409, `ledger item ${a.ledger_id} was superseded; re-approve and re-answer`)
+          qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'ledger', text: `Their approved brief states: "${item.text}"` })
+          continue
+        }
+        // drafted: store the raw (human view) AND the airlock extraction (structured).
+        // The extractor sees ONLY {answer, question, schema}; its output carries no
+        // free text from the answer, so nothing crosses into a policy-bearing planner.
+        const raw = cleaned.get(a.dimension)!
+        const extraction = airlockExtract({ answer: raw, question: questionFor(a.dimension)!, schema: { dimension: a.dimension } })
+        qaDb.upsertQa({ intro_id: introId, dimension: a.dimension, answerer_key: public_key, mode: 'drafted', text: raw, extraction_json: JSON.stringify(extraction) })
+      }
+      // Recorded as weak, and never as a canonical authorization. The bound list names the
+      // SUBMITTED answers rather than the stored text, because this lane still cleans and still
+      // wraps, and it writes no connection_authorizations row: a legacy fit answer is not a
+      // continuation, because nothing in those bytes says which answers were authorized.
+      recordLegacyEvidence({
+        actorKey: public_key, operation: 'fit_answers',
+        resourceType: 'intro', resourceId: introId, signature: String(signature ?? ''),
+      })
+    })()
+  } catch (e) {
+    if (e instanceof LegacyFitRefusal) { res.status(e.status).json({ error: e.message }); return }
+    throw e
   }
-  // Recorded as weak, and never as a canonical authorization. The bound list names the
-  // SUBMITTED answers rather than the stored text, because this lane still cleans and still
-  // wraps, and it writes no connection_authorizations row: a legacy fit answer is not a
-  // continuation, because nothing in those bytes says which answers were authorized.
-  recordLegacyEvidence({
-    actorKey: public_key, operation: 'fit_answers',
-    resourceType: 'intro', resourceId: introId, signature: String(signature ?? ''),
-  })
   res.json({ ok: true, answered: answers.length })
 })
 

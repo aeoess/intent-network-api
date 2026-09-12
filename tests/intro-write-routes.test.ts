@@ -878,3 +878,47 @@ test('READ SIDE: the column and the derivation agree after every canonical write
   }
   assert.equal(checked, rows.length)
 })
+
+test('TTL RULING: a REAL canonical withdrawal sets the interested basis, end to end', async () => {
+  // The check the ruling's own tests could not make. They build the evidence row and flip
+  // `live` themselves, so if withdrawAuthorization stopped storing write.writeRef, or a route
+  // stopped calling recordCanonicalEvidence, or the join lost its predicate, all of them would
+  // still pass while production silently reverted to the pre-ruling basis. This drives the
+  // whole chain through the HTTP route and asserts the derived deadline against the evidence
+  // row the route itself wrote.
+  const f = await intro('connecting')
+  // Age the interest well past its own 30 day window, which is the scene the ruling is about.
+  // Before the ruling this intro would read `expired` the moment the contact was withdrawn.
+  const interestAt = new Date(Date.now() - 40 * 864e5).toISOString()
+  db.getDb().prepare(
+    "UPDATE connection_authorizations SET created_at = ? WHERE intro_id = ? AND operation = 'express_interest'",
+  ).run(interestAt, f.id)
+  assert.equal(facts.stateOf(f.id), 'connecting')
+
+  const res = await post('withdraw-contact', forIntro('withdraw_contact', f.id, f.from.keys).body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.state, 'interested',
+    'a stale interest plus a fresh withdrawal is interested, not expired')
+
+  // The basis is the withdrawal's own accepted time, read from the evidence row the ROUTE
+  // wrote, joined through the withdrawn_by the ROUTE stored.
+  const row = authRow(f.id, f.from.keys.publicKey, 'share_contact')
+  assert.equal(row.live, 0)
+  assert.equal(row.withdrawn_by, res.json.write_ref, 'the route stores the withdrawing write ref')
+  const ev = db.getDb().prepare('SELECT recorded_at FROM write_evidence WHERE write_ref = ?').get(row.withdrawn_by) as any
+  assert.ok(ev, 'and the same act recorded evidence, which is what the join reads')
+
+  const authFacts = facts.introFacts(f.id)!
+  const share = authFacts.authorizations.find(a => a.operation === 'share_contact' && a.actor_key === f.from.keys.publicKey)!
+  assert.equal(share.withdrawn_at, ev.recorded_at, 'the join resolves to that evidence row')
+  assert.equal(state.expiryOf(authFacts), new Date(Date.parse(ev.recorded_at) + 30 * 864e5).toISOString(),
+    'so the deadline is the withdrawal plus 30 days, not the stale interest plus 30')
+  // And the pre-ruling answer, for contrast: the interest alone would already be past.
+  assert.ok(Date.parse(interestAt) + 30 * 864e5 < Date.now(),
+    'the interest basis is expired, which is what made this the KNOWN GAP')
+  assert.equal(facts.stateOf(f.id), 'interested')
+
+  // The materialization agrees, which is the ordering invariant holding: the route records
+  // evidence before it materializes, so the column is written from the post-ruling basis.
+  assert.equal(statusOf(f.id), 'accepted', 'and not withdrawn, which is what a null basis would have written')
+})

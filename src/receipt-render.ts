@@ -132,7 +132,12 @@ function isRow(w: Warrant): w is EvidenceRow {
  *  the side signed a legacy message. Absent means no claim is available, not a weak claim. */
 export function isAbsent(w: Warrant): boolean {
   if (!w) return true
-  if (isRow(w)) return false
+  // A ROW WHOSE BOUND LIST IS EMPTY OR UNPARSEABLE IS ABSENT TOO. boundFieldsOf fails closed
+  // to an empty list, and treating that as present-but-weak would let the mixed sentence
+  // assert that a counterparty "used a legacy authorization form" about a row whose evidence
+  // column says canonical. The renderer never reads that column, so a claim about FORM has to
+  // rest on a list it can actually read.
+  if (isRow(w)) return boundFieldsOf(w).length === 0
   return (w as readonly string[]).length === 0
 }
 

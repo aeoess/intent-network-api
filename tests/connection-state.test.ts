@@ -251,7 +251,12 @@ test('MATERIALIZATION: a released pair derives connected regardless of what a st
 
 // ── The 104 cell guard matrix ─────────────────────────────────────────────
 
-test('GUARDS: the full matrix of thirteen operations against eight states', () => {
+test('GUARDS: the full matrix of TWENTY operations against eight states', () => {
+  // It was thirteen by thirteen product actions when the vocabulary was thirteen. The
+  // vocabulary is now twenty, so 56 of the 160 cells isWriteAllowedInState answers were
+  // asserted nowhere, including every cell the non-intro early return decides. The file's own
+  // comment calls this matrix "how a route that forgot a guard is found", so it has to cover
+  // every operation the function accepts rather than the subset it used to.
   const expected: Record<string, IntroState[]> = {
     request_intro: [],
     withdraw_request: ['requested', 'interested'],
@@ -266,16 +271,39 @@ test('GUARDS: the full matrix of thirteen operations against eight states', () =
     release_exact: ['interested', 'connecting', 'connected'],
     first_step_propose: ['interested', 'connecting', 'connected'],
     first_step_approve: ['interested', 'connecting', 'connected'],
+    // The protocol sub-actions. fit_round2 and fit_answers name an INTRO and are
+    // continuations, so they sit with the other fit acts. The five whose resource is a fit
+    // exchange or a card name no intro at all, so there is no intro state in which they may
+    // be written and every one of their cells is a refusal.
+    fit_round2: ['interested', 'connecting', 'connected'],
+    fit_answers: ['interested', 'connecting', 'connected'],
+    fit_exchange_round2: [],
+    fit_exchange_custom: [],
+    fit_exchange_answers: [],
+    fit_exchange_close: [],
+    autonomy_pause: [],
   }
+  const ALL_OPERATIONS = [...s.OPERATIONS, ...s.PROTOCOL_OPERATIONS]
+  assert.equal(ALL_OPERATIONS.length, 20)
+  assert.deepEqual(Object.keys(expected).sort(), [...ALL_OPERATIONS].sort(),
+    'every operation the vocabulary has must have a row here, and nothing else may')
   let cells = 0
-  for (const op of s.OPERATIONS) {
+  for (const op of ALL_OPERATIONS) {
     for (const st of s.INTRO_STATES) {
       cells++
       const want = expected[op].includes(st)
       assert.equal(s.isWriteAllowedInState(op, st), want, `${op} in ${st} should be ${want ? 'allowed' : 'refused'}`)
     }
   }
-  assert.equal(cells, 104, 'thirteen operations against eight states')
+  assert.equal(cells, 160, 'twenty operations against eight states')
+  // And the five non-intro operations are refused in EVERY state, which is the early return
+  // being a decision rather than a missing switch case returning undefined.
+  for (const op of s.NON_INTRO_OPERATIONS) {
+    for (const st of s.INTRO_STATES) {
+      assert.equal(s.isWriteAllowedInState(op, st), false, `${op} in ${st}`)
+      assert.equal(typeof s.isWriteAllowedInState(op, st), 'boolean')
+    }
+  }
 })
 
 test('GUARDS: every continuation requires mutual interest, so none is allowed in requested', () => {
@@ -286,7 +314,7 @@ test('GUARDS: every continuation requires mutual interest, so none is allowed in
 
 test('GUARDS: no action writes on a terminal intro except block_pair', () => {
   for (const st of ['declined', 'withdrawn', 'blocked', 'expired'] as IntroState[]) {
-    for (const op of s.OPERATIONS) {
+    for (const op of [...s.OPERATIONS, ...s.PROTOCOL_OPERATIONS]) {
       const want = op === 'block_pair'
       assert.equal(s.isWriteAllowedInState(op, st), want, `${op} in ${st}`)
     }
