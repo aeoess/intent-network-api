@@ -20,8 +20,24 @@ import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
 import { recomputeAllMatches } from './matches-db.js'
 import { runWeeklyDigest } from './weekly.js'
+import { assertReceiptKeyConfigured } from './server-key.js'
 
 const PORT = parseInt(process.env.PORT || '3100')
+
+// ── Receipt key, before anything else ──
+// A receipt signed by a key this process invented stops verifying at the next
+// restart, silently, which makes every server observation worthless as evidence.
+// So the key is a startup requirement rather than a runtime fallback: refuse to
+// serve, and say which variable is wrong, instead of booting into a state where
+// receipts look fine and are not.
+try {
+  const key = assertReceiptKeyConfigured()
+  console.log(`[receipt key] issuer ${key.issuerKeyId}`)
+} catch (e) {
+  console.error(`[receipt key] refusing to start: ${(e as Error).message}`)
+  process.exit(1)
+}
+
 const app = createApp()
 
 // ── Initialize DB and start ──

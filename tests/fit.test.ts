@@ -24,6 +24,14 @@ process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
 // suite exercises the v3 fit exchange.
 process.env.MINGLE_FIT_ENABLED = '1'
 
+// The receipt key is required and src carries no fallback that invents one, so
+// the harness injects an explicit test-only pair before any src module loads.
+// This is the only way a test gets a signing key, which is the point: a suite
+// that passes without one would mean the startup requirement is not enforced.
+const receiptTestKey = generateKeyPair()
+process.env.MINGLE_RECEIPT_PRIVKEY = receiptTestKey.privateKey
+process.env.MINGLE_RECEIPT_PUBKEY = receiptTestKey.publicKey
+
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')
 const { cardContentHash } = await import('../src/v3-cards.js')
