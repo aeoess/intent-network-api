@@ -40,7 +40,11 @@ import { canonicalWriteRoute, canonicalDispatch, refuseWrite } from './write-pip
 import type { CanonicalContext } from './write-pipeline.js'
 import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
 import { recordAuthMode, createMapRow, claimCreate } from './write-db.js'
-import { recordAuthorization, materializeStatus, stateOf } from './connection-facts.js'
+import {
+  recordAuthorization, materializeStatus, stateOf, authorizationOf,
+  claimRelease, writeRefOfAuthorization,
+} from './connection-facts.js'
+import { writeArtifact } from './private-artifacts.js'
 import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
 import { checkLegacyWrite, checkLegacyCreate, refuseLegacy } from './legacy-write-gate.js'
 
@@ -428,6 +432,123 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
   res.json({ id, status: 'declined' })
 }))
 
+// ── POST /share-contact, the canonical lane ───────────────────────────────
+// Symmetric by decision, which is the change from today: the target shares at accept
+// time (intros-routes.ts:105) and the requester shares at complete time (:168), two
+// different routes with two different preimages and two different guards. One operation
+// replaces both, and the actor is whichever party signed.
+//
+// The contact is never in the signed payload. The payload carries a commitment; the value
+// travels in the opening beside it. So no copy of a signed payload is a copy of the
+// contact, and the payload is safe to store in evidence and to reference in a shared
+// receipt. What it is NOT is end to end encrypted: the server stores the opening.
+
+/** The contact rules. Rejection, never repair, measured on the string as sent.
+ *
+ *  The gate in the pipeline already refused a control character, a lone surrogate and
+ *  leading or trailing whitespace inside the opening, so this adds only what needs the
+ *  operation's own schema. The control character rule earns its place: a contact line is
+ *  interpolated raw into a plain text email body at notifications.ts:95, with no escaping
+ *  and no newline handling, so a contact carrying a newline can add lines to a message
+ *  somebody else reads. */
+function gateContact(value: unknown): string {
+  if (typeof value !== 'string') refuseWrite(400, 'malformed_opening', 'the contact line must be a string')
+  const v = value as string
+  if (v.length === 0) refuseWrite(400, 'contact_empty', 'a contact line is required, and an empty one is refused rather than dropped')
+  // Today both routes measure the UNTRIMMED string at intros-routes.ts:104 and :159 and
+  // store the trimmed one, so a 201 character string with a trailing space is refused
+  // while a 200 character one with a trailing space is stored as 199. Here the string as
+  // sent is the string stored, so one measurement answers both questions.
+  if (v.length > MAX_CONTACT) refuseWrite(400, 'contact_too_long', `contact is longer than ${MAX_CONTACT} characters`)
+  return v
+}
+
+const canonicalShareContact = canonicalWriteRoute({
+  operations: ['share_contact'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    const introId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+
+    const keys = Object.keys(write.payload)
+    if (keys.length !== 1 || keys[0] !== 'private_value_commitment') {
+      refuseWrite(400, 'malformed_payload', 'share_contact carries exactly private_value_commitment')
+    }
+    // The opening recomputed to the commitment in step 7 of the pipeline, before this ran,
+    // so by here the value is the value the principal committed to.
+    const contact = gateContact(write.opening!.value)
+
+    const facts = factsOrRefuse(introId)
+    requireParty(facts, actorKey, 'either', 'only a party to this introduction may share a contact')
+    guardState('share_contact', facts, now)
+
+    // A live authorization already exists, so this is a second share with a fresh
+    // envelope. A byte identical resend never reaches here: the nonce store answers it.
+    const existing = authorizationOf(introId, actorKey, 'share_contact')
+    if (existing !== null && existing.live === 1) {
+      refuseWrite(409, 'contact_already_shared', 'this key has already authorized a contact line on this introduction')
+    }
+
+    const row = introsDb.getIntro(introId)!
+    const isRequester = actorKey === row.from_key
+    const recipientKey = isRequester ? row.to_key : row.from_key
+
+    const evidenceId = recordCanonicalEvidence(write)
+    // An UPSERT, not an insert. After a withdrawal the row still exists with live = 0,
+    // because the withdrawal flips a column rather than deleting a row, so a plain insert
+    // would make withdraw_contact a permanent dead end for that principal. Evidence rows
+    // are append only, so the withdrawn authorization's history survives regardless.
+    recordAuthorization({ introId, actorKey, operation: 'share_contact', evidenceId, evidence: 'canonical' })
+    writeArtifact({ write, introId, recipientKey })
+    // The column the legacy reader needs. isComplete at intros-db.ts:129 is a three term
+    // conjunction, so this write alone is never enough: the status came from
+    // express_interest and the two columns come from the two shares.
+    getDb().prepare(`UPDATE v3_intros SET ${isRequester ? 'from_contact' : 'to_contact'} = ? WHERE id = ?`)
+      .run(contact, introId)
+
+    // Now, and only now, look for the other side. At the time the FIRST share reads this,
+    // the other row is absent, so it writes no release. The second share sees both and
+    // claims it.
+    const other = authorizationOf(introId, recipientKey, 'share_contact')
+    let released = false
+    if (other !== null && other.live === 1) {
+      released = claimRelease(
+        introId,
+        writeRefOfAuthorization(introId, row.from_key, 'share_contact'),
+        writeRefOfAuthorization(introId, row.to_key, 'share_contact'),
+      )
+    }
+    const state = materializeStatus(introId, now)
+    return { intro_id: introId, state, released, shared_by: isRequester ? 'requester' : 'target' }
+  },
+  afterCommit: async (ctx, result) => {
+    const r = result as { intro_id: string; released: boolean }
+    if (!r.released) return
+    const row = introsDb.getIntro(r.intro_id)
+    if (row === null) return
+    // The release effect: each party learns the other's line. After the commit and best
+    // effort, as today, so a thrown mailer cannot undo a connection that happened. A crash
+    // between the commit and the send loses the email and the release row is the durable
+    // fact, which is already true of every mail call in this repo.
+    const fromHeadline = liveNetworkHeadline(row.from_card)?.headline ?? ''
+    const toHeadline = liveNetworkHeadline(row.to_card)?.headline ?? ''
+    const attempts = [
+      email.notifyIntroCompleted({
+        recipientKey: row.from_key, introId: r.intro_id,
+        counterpartyHeadline: toHeadline, counterpartyContact: row.to_contact ?? '',
+      }),
+      email.notifyIntroCompleted({
+        recipientKey: row.to_key, introId: r.intro_id,
+        counterpartyHeadline: fromHeadline, counterpartyContact: row.from_contact ?? '',
+      }),
+    ]
+    // Settled rather than awaited in sequence, so one failing side does not skip the other.
+    await Promise.allSettled(attempts)
+  },
+})
+
+router.post('/share-contact', canonicalShareContact)
+
 // ── POST /:id/complete {contact} ──────────────────────────────────────────
 
 router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async (req, res) => {
@@ -440,24 +561,61 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async
   if (!intro) { res.status(404).json({ error: 'intro not found' }); return }
   if (!checkSig(`intro-complete:${id}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
   if (intro.from_key !== public_key) { res.status(403).json({ error: 'only the requester may complete' }); return }
+  // Anti-downgrade then the cutoff, before the state checks for the reason given on
+  // /respond. THIS is where anti-downgrade actually bites: a requester who created the
+  // intro canonically holds a mode row on `intro_request/<request_id>`, and
+  // resolveAuthMode walks write_create_map back to it, so the legacy completion of a
+  // canonically created intro is refused without any row having been pre-written for a
+  // resource nobody had acted on.
+  const gate = checkLegacyWrite({ resourceType: 'intro', resourceId: id, actorKey: public_key, introId: id })
+  if (gate !== null) { refuseLegacy(res, 'share_contact', id, gate); return }
+
   if (intro.status !== 'accepted') { res.status(409).json({ error: 'intro is not accepted' }); return }
   if (intro.from_contact) { res.status(409).json({ error: 'intro already complete' }); return }
 
-  introsDb.completeIntro(id, contact.trim())
+  // One transaction around the group. The contact column, the authorization, the evidence
+  // and the release either all land or none do. Today the single UPDATE is alone, so there
+  // was nothing to be atomic with.
+  const released = getDb().transaction((): boolean => {
+    introsDb.completeIntro(id, contact.trim())
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'share_contact', resourceType: 'intro', resourceId: id, signature,
+    })
+    // bound_fields_json omits `contact`, because the preimage is intro-complete:${id}:${nonce}
+    // and the contact is attached outside it at build/index.js. This is the action where
+    // today's gap is worst: the first ever complete for an intro accepts ANY contact the
+    // holder of that one signature supplies, and the canonical lane closes it by covering
+    // the value through payload_digest.
+    recordAuthorization({ introId: id, actorKey: public_key, operation: 'share_contact', evidenceId, evidence: 'legacy_unbound' })
+    recordAuthMode('intro', id, public_key, 'legacy_unbound')
+    // The release, on the same rule the canonical lane uses: both sides hold a live
+    // share_contact authorization. A mixed pair reaches it too, each side at its own
+    // strength, and no receipt promotes the legacy half.
+    const other = authorizationOf(id, intro.to_key, 'share_contact')
+    if (other === null || other.live !== 1) return false
+    return claimRelease(
+      id,
+      writeRefOfAuthorization(id, intro.from_key, 'share_contact'),
+      writeRefOfAuthorization(id, intro.to_key, 'share_contact'),
+    )
+  })()
   const final = introsDb.getIntro(id)!
 
-  // Now complete: release each party's contact to the other, by email. This is
-  // its own delivery type, so the acceptance email the requester already got
-  // does not dedupe it away.
-  try {
-    const fromHeadline = liveNetworkHeadline(intro.from_card)?.headline ?? ''
-    const toHeadline = liveNetworkHeadline(intro.to_card)?.headline ?? ''
-    // requester learns the target's contact; target learns the requester's.
-    await email.notifyIntroCompleted({ recipientKey: intro.from_key, introId: id, counterpartyHeadline: toHeadline, counterpartyContact: final.to_contact ?? '' })
-    await email.notifyIntroCompleted({ recipientKey: intro.to_key, introId: id, counterpartyHeadline: fromHeadline, counterpartyContact: final.from_contact ?? '' })
-  } catch { /* notification failure never affects completion */ }
+  // The release emails, gated on the intro actually being complete rather than fired
+  // unconditionally. Today's accept always stored a contact, so the two were the same
+  // thing; a canonical target who expressed interest without sharing makes them differ,
+  // and an ungated send would mail "How to reach them:" with nothing after it.
+  if (introsDb.isComplete(final)) {
+    try {
+      const fromHeadline = liveNetworkHeadline(intro.from_card)?.headline ?? ''
+      const toHeadline = liveNetworkHeadline(intro.to_card)?.headline ?? ''
+      // requester learns the target's contact; target learns the requester's.
+      await email.notifyIntroCompleted({ recipientKey: intro.from_key, introId: id, counterpartyHeadline: toHeadline, counterpartyContact: final.to_contact ?? '' })
+      await email.notifyIntroCompleted({ recipientKey: intro.to_key, introId: id, counterpartyHeadline: fromHeadline, counterpartyContact: final.from_contact ?? '' })
+    } catch { /* notification failure never affects completion */ }
+  }
 
-  res.json({ id, status: 'accepted', complete: true })
+  res.json({ id, status: 'accepted', complete: true, released })
 }))
 
 // ── GET /mine (signed) ────────────────────────────────────────────────────

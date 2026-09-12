@@ -157,6 +157,36 @@ export function withdrawAuthorization(args: {
   return r.changes === 1
 }
 
+/** Claim the release for one intro. Returns true for the transaction that wrote it and
+ *  false for one that found it already written.
+ *
+ *  A bare INSERT whose primary key conflict means "another transaction released", which
+ *  is the notify-db.ts:135-140 pattern. The exactly once property rests on the primary
+ *  key and NOT on the ordering: if both sides somehow read before either wrote, both
+ *  attempt the insert, the loser catches the conflict and still commits its own
+ *  authorization. A SELECT then INSERT would have a window between them that is exactly
+ *  the double release. */
+export function claimRelease(introId: string, aWriteRef: string | null, bWriteRef: string | null): boolean {
+  try {
+    d().prepare('INSERT INTO connection_release (intro_id, a_write_ref, b_write_ref) VALUES (?, ?, ?)')
+      .run(introId, aWriteRef, bWriteRef)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The write_ref of the envelope behind one authorization, or null when the act was
+ *  legacy and had no envelope. Used to name the two acts a release rests on. */
+export function writeRefOfAuthorization(introId: string, actorKey: string, operation: Operation, subject = ''): string | null {
+  const row = d().prepare(`
+    SELECT e.write_ref AS write_ref FROM connection_authorizations a
+    JOIN write_evidence e ON e.evidence_id = a.evidence_id
+    WHERE a.intro_id = ? AND a.actor_key = ? AND a.operation = ? AND a.subject = ?
+  `).get(introId, actorKey, operation, subject) as { write_ref: string | null } | undefined
+  return row?.write_ref ?? null
+}
+
 /** Mark every private artifact this actor authored for one operation on this intro
  *  as withdrawn. A no-op until share_contact writes artifacts, and correct then. */
 export function withdrawArtifacts(introId: string, authorKey: string, operation: Operation): number {

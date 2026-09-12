@@ -126,6 +126,7 @@ export type EnvelopeRejection =
   | 'unexpected_opening'
   | 'missing_opening'
   | 'malformed_opening'
+  | 'commitment_mismatch'
   // Forwarded from the payload gate, so a caller sees which rule refused.
   | 'null_in_payload'
   | 'non_finite_number'
@@ -351,7 +352,10 @@ export function verifyOpening(write: VerifiedWrite, commitmentField = 'private_v
     write.envelope.operation, write.envelope.resource, write.opening.salt, write.opening.value,
   )
   if (recomputed !== claimed) {
-    return bad(400, 'payload_digest_mismatch', 'the opening does not recompute to the commitment in the signed payload')
+    // Its OWN code, not payload_digest_mismatch. The payload digest matched: what failed is
+    // the commitment, and a caller that cannot tell those apart cannot tell a proxy that
+    // rewrote the value from a client that built the envelope wrong.
+    return bad(400, 'commitment_mismatch', 'the opening does not recompute to the commitment in the signed payload')
   }
   return null
 }

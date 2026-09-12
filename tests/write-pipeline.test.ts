@@ -237,7 +237,7 @@ test('PIPELINE: share_contact requires an opening that recomputes, and a tampere
 
   const tampered = await post(signedBody({ operation: 'share_contact', payload, opening: { value: 'attacker@evil.example', salt } }).body)
   assert.equal(tampered.status, 400)
-  assert.equal(tampered.json.code, 'payload_digest_mismatch', 'the opening did not recompute to the commitment')
+  assert.equal(tampered.json.code, 'commitment_mismatch', 'the opening did not recompute to the commitment')
   assert.equal(handlerRuns, 0, 'and the handler never saw it')
 
   const good = await post(signedBody({ operation: 'share_contact', payload, opening: { value: 'alice@example.com', salt } }).body)

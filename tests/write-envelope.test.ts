@@ -229,10 +229,10 @@ test('OPENING: a tampered value or salt fails the commitment recomputation', () 
   assert.equal(e.verifyOpening(good), null)
 
   const swappedValue = ok(e.verifyWriteBody(bodyFor({ operation: 'share_contact', payload, opening: { value: 'attacker@evil.example', salt } }).body))
-  assert.equal(e.verifyOpening(swappedValue)!.code, 'payload_digest_mismatch', 'a proxy that rewrites the value is caught before any write')
+  assert.equal(e.verifyOpening(swappedValue)!.code, 'commitment_mismatch', 'a proxy that rewrites the value is caught before any write')
 
   const swappedSalt = ok(e.verifyWriteBody(bodyFor({ operation: 'share_contact', payload, opening: { value: 'alice@example.com', salt: 'C'.repeat(43) } }).body))
-  assert.equal(e.verifyOpening(swappedSalt)!.code, 'payload_digest_mismatch', 'and so is one that rewrites the salt')
+  assert.equal(e.verifyOpening(swappedSalt)!.code, 'commitment_mismatch', 'and so is one that rewrites the salt')
 })
 
 test('OPENING: a malformed salt is refused on shape', () => {
