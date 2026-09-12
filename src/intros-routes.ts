@@ -43,7 +43,7 @@ import { recordAuthMode, createMapRow, claimCreate } from './write-db.js'
 import {
   recordAuthorization, materializeStatus, stateOf, authorizationOf,
   claimRelease, writeRefOfAuthorization, bridgePre2AIntro,
-  introProjection, hasAuthorizations,
+  introProjection, hasRequestAntecedent,
 } from './connection-facts.js'
 import { writeArtifact } from './private-artifacts.js'
 import { factsForWrite, guardState, requireParty } from './intro-guards.js'
@@ -698,8 +698,12 @@ router.get('/mine', rateLimited('intro_mine', 60), (req, res) => {
     // The counterparty contact is released ONLY when complete, and only to the
     // two parties (this row already belongs to the caller).
     const counterpartyContact = complete ? (iAmFrom ? r.to_contact : r.from_contact) : null
-    // Derived per caller, never stored, and never for a row whose facts are absent.
-    const projection = hasAuthorizations(r.id) ? introProjection(r.id, public_key) : null
+    // Derived per caller, never stored, and never for a row whose facts cannot describe it.
+    // The gate is the request_intro ANTECEDENT and not "any authorization row": a pre-2A intro
+    // completed on the legacy lane carries a share_contact row and no request, and serving a
+    // derivation over that fact set answered `requested` beside `complete: true` and offered
+    // express_interest and decline on a released connection.
+    const projection = hasRequestAntecedent(r.id) ? introProjection(r.id, public_key) : null
     return {
       id: r.id,
       direction: iAmFrom ? 'outgoing' : 'incoming',

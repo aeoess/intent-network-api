@@ -253,6 +253,27 @@ export function hasAuthorizations(introId: string): boolean {
   return !!d().prepare('SELECT 1 FROM connection_authorizations WHERE intro_id = ? LIMIT 1').get(introId)
 }
 
+/** Is the lifecycle DERIVABLE for this intro: does its request_intro fact exist?
+ *
+ *  This is the question, and "does any row exist" is not it. `request_intro` is the
+ *  antecedent of every rule in the derivation: without it deriveIntroState answers
+ *  `requested` no matter what else is recorded, because there is no request to have been
+ *  answered. Any other row can exist without it and leaves the fact set incomplete.
+ *
+ *  WHY THIS EXISTS AS A SEPARATE PREDICATE. The bridge and the read projection both used
+ *  `hasAuthorizations`, and the legacy `POST /:id/complete` handler writes a `share_contact`
+ *  row of its own. So a pre-2A intro that a published client accepted and completed ended up
+ *  with exactly one row, no `request_intro`, and `hasAuthorizations` true. That disarmed the
+ *  `not_bridgeable` refusal, the derivation answered `requested` for a released connection,
+ *  and a canonical `decline` was then admitted and made it `declined`, which is terminal.
+ *  Reproduced end to end before this fix: HTTP 201 on the decline, and the released contact
+ *  gone from both sides' reads. */
+export function hasRequestAntecedent(introId: string): boolean {
+  return !!d().prepare(
+    "SELECT 1 FROM connection_authorizations WHERE intro_id = ? AND operation = 'request_intro' LIMIT 1",
+  ).get(introId)
+}
+
 /** Was this intro created before this build's write subsystem existed?
  *
  *  The grandfathering predicate. A pre-2A intro was authorized entirely on the legacy
@@ -308,7 +329,10 @@ export type BridgeOutcome = 'not_needed' | 'bridged' | 'not_bridgeable'
  *  the truth. */
 export function bridgePre2AIntro(introId: string): BridgeOutcome {
   if (!isPre2AIntro(introId)) return 'not_needed'
-  if (hasAuthorizations(introId)) return 'not_needed'
+  // The antecedent, not "any row". A pre-2A intro completed on the legacy lane carries a
+  // share_contact row and no request_intro, and answering 'not_needed' for it let a canonical
+  // write proceed against a fact set that could not describe the intro's real history.
+  if (hasRequestAntecedent(introId)) return 'not_needed'
   const row = d().prepare('SELECT from_key, created_at, status FROM v3_intros WHERE id = ?').get(introId) as
     { from_key: string; created_at: string; status: string } | undefined
   if (row === undefined) return 'not_needed'

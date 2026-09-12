@@ -119,8 +119,11 @@ recomputation that re-derives an existing pair never notifies again.
   come from one derivation over the durable authorization facts and are stored
   nowhere, so two clients cannot disagree about what a principal may do next.
   `status` remains the compatibility materialization and keeps its exact meaning.
-  A row whose authorization facts are absent carries `state: null` and an empty
-  `pending_actions` rather than a guessed state.
+  A row whose `request_intro` fact is absent carries `state: null` and an empty
+  `pending_actions` rather than a guessed state. That antecedent is the gate, not
+  "any authorization row": a pre-2A introduction completed on the legacy lane
+  carries a `share_contact` row and no request, and a derivation over that fact
+  set answers `requested` for a released connection.
 
 ### Notifications and abuse
 - `POST /api/v3/notifications/subscribe|unsubscribe`, `GET /confirm/:token`,

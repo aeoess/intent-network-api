@@ -266,6 +266,66 @@ test('BRIDGE: anything past a request is NOT bridgeable, and the canonical lane 
   }
 })
 
+test('BRIDGE: a LEGACY ACT\'s own row does not make a pre-2A intro bridgeable', async () => {
+  // THE DEFECT THIS CLOSES, reproduced end to end before the fix.
+  //
+  // The bridge and the read projection both asked hasAuthorizations, meaning "does any row
+  // exist". The legacy POST /:id/complete handler writes a share_contact row of its own. So a
+  // pre-2A intro that a published client accepted and then completed ended up with exactly one
+  // authorization row, no request_intro, and hasAuthorizations true. That answered
+  // 'not_needed' instead of 'not_bridgeable', the derivation answered `requested` because
+  // nothing recorded a request to have been answered, and the canonical decline the projection
+  // then advertised returned 201 and set the column to `declined`, which is terminal. A
+  // released connection, destroyed.
+  //
+  // The gate is now the request_intro ANTECEDENT, which is what every rule in the derivation
+  // rests on, so no other row can stand in for it.
+  const p = await pre2A('accepted', null, 'b@old.example', 5)
+
+  // The requester completes on the legacy lane, exactly as a published 3.2.2 install does.
+  const nonce = 'c' + rid()
+  const comp = await post(`${base}/api/v3/intros/${p.id}/complete`, {
+    contact: 'a@old.example', public_key: p.from.keys.publicKey, nonce,
+    signature: sign(`intro-complete:${p.id}:${nonce}`, p.from.keys.privateKey),
+  })
+  assert.equal(comp.status, 200, JSON.stringify(comp.json))
+  assert.equal(comp.json.complete, true, 'the legacy lane considers this connection finished')
+
+  // Exactly one row, and it is not the antecedent.
+  assert.equal(facts.hasAuthorizations(p.id), true, 'the legacy complete wrote its own row')
+  assert.equal(facts.hasRequestAntecedent(p.id), false, 'and it is not a request_intro')
+  assert.equal(facts.bridgePre2AIntro(p.id), 'not_bridgeable',
+    'so the intro is still not bridgeable, which is what one row used to hide')
+
+  // Both destructive canonical acts are refused.
+  for (const operation of ['express_interest', 'decline'] as const) {
+    const r = await post(`${base}/api/v3/intros/${p.id}/respond`, signedBody({
+      operation, resource: { type: 'intro', id: p.id }, keys: p.to.keys,
+    }).body)
+    assert.equal(r.status, 409, `${operation}: ${JSON.stringify(r.json)}`)
+    assert.equal(r.json.code, 'legacy_intro_not_upgradable', operation)
+  }
+
+  // And the connection is intact, on the column and on both contacts.
+  assert.equal(statusOf(p.id), 'accepted', 'the released connection survived')
+  const row = introsDb.getIntro(p.id)!
+  assert.equal(row.from_contact, 'a@old.example')
+  assert.equal(row.to_contact, 'b@old.example')
+  assert.equal(introsDb.isComplete(row), true)
+
+  // The read surface withholds the projection rather than serving a derivation over a fact set
+  // that cannot describe this intro, while every field the published client reads is correct.
+  for (const who of [p.from, p.to]) {
+    const served = (await mine(who.keys)).find(r => r.id === p.id)
+    assert.equal(served.state, null, 'no derived state for a row whose antecedent is absent')
+    assert.deepEqual(served.pending_actions, [], 'and nothing is offered')
+    assert.equal(served.expires_at, null)
+    assert.equal(served.status, 'accepted', 'while the compatibility fields answer as they did')
+    assert.equal(served.complete, true)
+    assert.ok(served.counterparty_contact, 'and the released contact is still readable')
+  }
+})
+
 test('BRIDGE: a legacy accept on a pre-2A pending intro leaves a pair that CAN complete canonically', async () => {
   // The defect this closes: with no request_intro antecedent, hasMutualInterest was false
   // forever, so the requester's canonical share_contact was refused wrong_state and the
