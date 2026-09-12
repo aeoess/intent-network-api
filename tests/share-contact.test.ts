@@ -191,6 +191,7 @@ test('SHARE: the first share derives connecting, writes no release, and disclose
   assert.equal(r.json.state, 'connecting')
   assert.equal(r.json.released, false)
   assert.equal(r.json.shared_by, 'requester')
+  assert.equal(r.json.counterparty_contact, null, 'nothing is released, so nothing is answered')
   assert.equal(releaseRows(L.introId).length, 0)
 
   const row = introRow(L.introId)
@@ -219,6 +220,10 @@ test('SHARE: the second share writes exactly one release row and derives connect
   assert.equal(second.status, 201, JSON.stringify(second.json))
   assert.equal(second.json.released, true)
   assert.equal(second.json.state, 'connected')
+  // The release effect, in the call that caused it. The second sharer is the target, so the
+  // line they receive is the requester's. A null here would make the client poll for a value
+  // the very same transaction already released to this key.
+  assert.equal(second.json.counterparty_contact, 'alice@example.com')
 
   const rows = releaseRows(L.introId)
   assert.equal(rows.length, 1)

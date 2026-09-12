@@ -858,6 +858,88 @@ test('READ SIDE: connected reads as complete with the contact released, all thre
   assert.equal(row.counterparty_contact, 'b@example.com')
 })
 
+// ══════════════════════════════════════════════════════════════
+// The owner side projection, served over HTTP
+// ══════════════════════════════════════════════════════════════
+// The derivation had no HTTP surface, so a client that wanted to know what its principal
+// could do next had to re-derive the six ordered rules. These pin the served projection to
+// the in-process one, so the two can never answer differently.
+
+test('PROJECTION: /mine answers the derived state, expiry and pending actions, per caller', async () => {
+  const f = await intro('interested')
+  facts.materializeStatus(f.id)
+
+  const target = (await mine(f.to.keys)).find(r => r.id === f.id)
+  const requester = (await mine(f.from.keys)).find(r => r.id === f.id)
+
+  // The state is the DERIVED one, not the column. The column says accepted here.
+  assert.equal(target.state, 'interested')
+  assert.equal(requester.state, 'interested')
+  assert.equal(statusOf(f.id), 'accepted', 'while the compatibility column still says accepted')
+
+  // Identical to what the in-process projection answers for the same key, which is the
+  // whole point: one derivation, one answer, two readers.
+  for (const who of [f.from, f.to]) {
+    const served = (await mine(who.keys)).find(r => r.id === f.id)
+    const inProcess = facts.introProjection(f.id, who.keys.publicKey)!
+    assert.equal(served.state, inProcess.state)
+    assert.equal(served.expires_at, inProcess.expires_at)
+    assert.deepEqual(served.pending_actions, inProcess.pending_actions)
+  }
+
+  // And the lists differ BY CALLER, because pending_actions is per actor.
+  assert.notDeepEqual(target.pending_actions, requester.pending_actions,
+    'the two parties owe different things at interested, so one list for both would be wrong')
+  assert.ok(requester.pending_actions.includes('share_contact'))
+  assert.ok(requester.pending_actions.includes('withdraw_request'))
+  assert.equal(requester.pending_actions.includes('express_interest'), false,
+    'the requester cannot express interest in their own request')
+  assert.ok(target.pending_actions.includes('share_contact'))
+  assert.ok(target.pending_actions.includes('withdraw_interest'))
+  assert.ok(typeof requester.expires_at === 'string' && Date.parse(requester.expires_at) > Date.now())
+})
+
+test('PROJECTION: a terminal intro offers nothing, which is what makes an empty list mean finished', async () => {
+  const f = await intro('requested')
+  await post('withdraw-request', forIntro('withdraw_request', f.id, f.from.keys).body)
+  for (const who of [f.from, f.to]) {
+    const row = (await mine(who.keys)).find(r => r.id === f.id)
+    assert.equal(row.state, 'withdrawn')
+    assert.deepEqual(row.pending_actions, [], 'nothing is available on a terminal intro, to either party')
+  }
+})
+
+test('PROJECTION: a connected intro still offers what a connection can do, and reads as complete', async () => {
+  const f = await intro('connected')
+  facts.materializeStatus(f.id)
+  const row = (await mine(f.from.keys)).find(r => r.id === f.id)
+  assert.equal(row.state, 'connected')
+  // NOT empty, and this is the point worth pinning: a released connection is where a first
+  // step is proposed and where a pair is blocked, so a client that treated an empty pending
+  // list as "finished" would hide every connection it just made. `complete` is the finished
+  // predicate; pending_actions answers a different question.
+  assert.deepEqual(row.pending_actions, ['fit_request', 'first_step_propose', 'block_pair'])
+  assert.equal(row.complete, true, 'and every field the published client reads is untouched')
+  assert.equal(row.status, 'accepted')
+  assert.equal(row.counterparty_contact, 'b@example.com')
+})
+
+test('PROJECTION: a row the derivation cannot see reports nothing rather than guessing', async () => {
+  // A pre-2A intro whose column says accepted has NO authorization facts. Deriving it would
+  // answer `requested` and offer express_interest, which every guard would then refuse. So
+  // the projection is withheld, on the same line the bridge draws: only `pending` is
+  // bridgeable and everything else refuses rather than guessing.
+  const f = await intro('requested')
+  db.getDb().prepare('DELETE FROM connection_authorizations WHERE intro_id = ?').run(f.id)
+  db.getDb().prepare("UPDATE v3_intros SET status = 'accepted' WHERE id = ?").run(f.id)
+  const row = (await mine(f.from.keys)).find(r => r.id === f.id)
+  assert.equal(row.state, null, 'no facts, no derived state')
+  assert.equal(row.expires_at, null)
+  assert.deepEqual(row.pending_actions, [])
+  assert.equal(row.status, 'accepted', 'while the legacy fields answer exactly as they did before')
+  assert.equal(row.direction, 'outgoing')
+})
+
 test('READ SIDE: the column and the derivation agree after every canonical write in this suite', async () => {
   // The general rule from 14.3: if v3_intros.status and deriveIntroState ever
   // disagree, the column is wrong by definition. This walks every intro the suite

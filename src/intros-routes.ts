@@ -43,6 +43,7 @@ import { recordAuthMode, createMapRow, claimCreate } from './write-db.js'
 import {
   recordAuthorization, materializeStatus, stateOf, authorizationOf,
   claimRelease, writeRefOfAuthorization, bridgePre2AIntro,
+  introProjection, hasAuthorizations,
 } from './connection-facts.js'
 import { writeArtifact } from './private-artifacts.js'
 import { factsForWrite, guardState, requireParty } from './intro-guards.js'
@@ -536,7 +537,23 @@ const canonicalShareContact = canonicalWriteRoute({
       )
     }
     const state = materializeStatus(introId, now)
-    return { intro_id: introId, state, released, shared_by: isRequester ? 'requester' : 'target' }
+    // The release effect, answered to the acting party in the same call that caused it.
+    // Read AFTER the column write above, so the second sharer sees the first sharer's line.
+    //
+    // This discloses nothing the caller cannot already read: the release happened, GET /mine
+    // answers this exact value to this exact key from here on, and the notification mails it.
+    // Withholding it only forced a second round trip that would return the same string, and
+    // a tool that says both contacts are now available while handing back null is a tool that
+    // has to lie or poll. Gated on `released`, and on this caller being a party, which
+    // requireParty settled above.
+    const releasedRow = released ? introsDb.getIntro(introId) : null
+    const counterpartyContact = releasedRow === null
+      ? null
+      : (isRequester ? releasedRow.to_contact : releasedRow.from_contact) ?? null
+    return {
+      intro_id: introId, state, released, shared_by: isRequester ? 'requester' : 'target',
+      counterparty_contact: counterpartyContact,
+    }
   },
   afterCommit: async (ctx, result) => {
     const r = result as { intro_id: string; released: boolean }
@@ -647,6 +664,25 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async
 
 // ── GET /mine (signed) ────────────────────────────────────────────────────
 // Signed via query params so a GET can carry the caller's proof.
+//
+// THE OWNER SIDE PROJECTION IS SERVED HERE, and this is the only place it is served.
+// `state`, `expires_at` and `pending_actions` come from introProjection, which derives
+// them from the durable facts for THIS caller and stores nothing. Before this the
+// derivation existed and no HTTP surface answered with it, so a client that wanted to
+// know what a principal could do next had to re-derive the six ordered rules itself.
+// Two clients that both guessed would eventually disagree with each other and with the
+// guards that actually refuse a write, which is the disagreement this closes.
+//
+// EVERY FIELD THE PUBLISHED CLIENT READS IS UNCHANGED. `status`, `complete`, `awaiting`
+// and `counterparty_contact` keep their exact meaning and position, because 3.2.2 filters
+// on `status === 'pending'` and on `complete`. The three new members are additive, which
+// is the only kind of change a read surface with a published reader can carry.
+//
+// A ROW THE DERIVATION CANNOT SEE REPORTS NOTHING RATHER THAN GUESSING. A pre-2A intro
+// whose column says `accepted` has no authorization facts, so the derivation would answer
+// `requested` and the pending list would offer actions the guards refuse. Those rows carry
+// state: null and an empty pending list, on the same line the bridge draws: only `pending`
+// is bridgeable, and everything else refuses rather than guessing.
 
 router.get('/mine', rateLimited('intro_mine', 60), (req, res) => {
   const public_key = String(req.query.public_key ?? '')
@@ -662,6 +698,8 @@ router.get('/mine', rateLimited('intro_mine', 60), (req, res) => {
     // The counterparty contact is released ONLY when complete, and only to the
     // two parties (this row already belongs to the caller).
     const counterpartyContact = complete ? (iAmFrom ? r.to_contact : r.from_contact) : null
+    // Derived per caller, never stored, and never for a row whose facts are absent.
+    const projection = hasAuthorizations(r.id) ? introProjection(r.id, public_key) : null
     return {
       id: r.id,
       direction: iAmFrom ? 'outgoing' : 'incoming',
@@ -671,6 +709,9 @@ router.get('/mine', rateLimited('intro_mine', 60), (req, res) => {
       created_at: r.created_at, responded_at: r.responded_at,
       counterparty_contact: counterpartyContact,
       awaiting: r.status === 'accepted' && !r.from_contact ? (iAmFrom ? 'your_contact' : 'their_contact') : undefined,
+      state: projection?.state ?? null,
+      expires_at: projection?.expires_at ?? null,
+      pending_actions: projection?.pending_actions ?? [],
     }
   })
   res.json({ count: out.length, intros: out })
