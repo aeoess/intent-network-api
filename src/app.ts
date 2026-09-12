@@ -21,6 +21,8 @@ import fitV4Routes from './fit-v4-routes.js'
 import matchRoutes, { v3RateHeaders } from './match-routes.js'
 import { v2Enabled, V2_INDEX_KEYS } from './v2-gate.js'
 import { initWriteSchema } from './write-db.js'
+import { legacyWindowClosed, legacyWriteCutoffAt } from './db.js'
+import { WRITE_DOMAIN } from './write-envelope.js'
 
 export function createApp() {
   // The write subsystem tables, created here as well as at server boot. server.ts is not
@@ -92,6 +94,20 @@ export function createApp() {
     if (!v2Enabled()) {
       for (const key of V2_INDEX_KEYS) delete endpoints[key]
       body.legacy_v2 = { available: false }
+    }
+    // The capability a client reads to decide which lane to use. Always present, because a
+    // client has to be able to tell "this server does not know about canonical writes" from
+    // "this server has not answered yet", and an absent field cannot make that distinction.
+    //
+    // `legacy_accepted` is derived from the marker and NEVER from an unset value. A null
+    // cutoff means the window is open, because a fresh database has no marker and reading
+    // that as a cutoff in the past would refuse every legacy client the moment the table is
+    // empty.
+    body.write_authorization = {
+      domain: WRITE_DOMAIN,
+      preferred: true,
+      legacy_accepted: !legacyWindowClosed(),
+      legacy_cutoff_at: legacyWriteCutoffAt(),
     }
     res.json(body)
   })

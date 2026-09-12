@@ -98,6 +98,17 @@ const TODAYS_ROOT = {
     'GET /api/digest/:agentId': 'Personalized digest',
     'GET /api/stats': 'Network statistics',
   },
+  // ADDED DELIBERATELY in 2B step 14. The capability a client reads to decide which lane to
+  // use, and it is ALWAYS present: a client has to be able to tell "this server does not
+  // know about canonical writes" from "this server has not answered yet", and an absent
+  // field cannot make that distinction. legacy_cutoff_at is null on a database with no
+  // marker, and null means the window is OPEN rather than closed.
+  write_authorization: {
+    domain: 'mingle-write-v1',
+    preferred: true,
+    legacy_accepted: true,
+    legacy_cutoff_at: null,
+  },
 }
 
 test('V2 GATE: the replay exploit is refused while v2 is off, and the card survives', async () => {
@@ -194,6 +205,10 @@ test('V2 GATE: the root index hides legacy v2 when off and is byte-identical whe
     assert.equal(r.status, 200)
     assert.deepEqual(r.json.legacy_v2, { available: false })
     assert.deepEqual(r.json.endpoints, { 'GET /api/stats': 'Network statistics' }, 'no legacy path is advertised')
+    // The write capability is present in BOTH v2 states, because it is orthogonal to v2.
+    assert.deepEqual(r.json.write_authorization, {
+      domain: 'mingle-write-v1', preferred: true, legacy_accepted: true, legacy_cutoff_at: null,
+    })
   })
   await withV2('1', async () => {
     const res = await fetch(`${base}/`)
