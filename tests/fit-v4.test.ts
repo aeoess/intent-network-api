@@ -572,18 +572,42 @@ test('a pair without policies falls back to the v3 fit exchange, unchanged', asy
 
 // ── RECEIPTS ──
 
-test('the receipt verifies and binds both policy hashes, predicates, purpose, and expiry', async () => {
+test('the receipt verifies and binds predicates, purpose and expiry, and the two policy hashes are GONE', async () => {
+  // UPDATED DELIBERATELY in 2B step 13. The two policy hashes have left the shared receipt,
+  // because policyHash is an unsalted SHA-256 over the normalized dimension set and that set
+  // includes the private value of every dimension. Every field in it draws from a small
+  // enum, so anyone holding a hash who can bound expires_at recovers the whole private set
+  // offline. Salted commitments replace them, and the deterministic hash stays internal for
+  // version lookup. A stored receipt from before this change keeps its own shape and stays
+  // verifiable against its own digest.
   const a = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
   const b = [dim('cadence', 'mixed', 'reveal_overlap', 'essential')]
   const hs = await openHandshake('cofound', a, b)
   await hsRequest(hs.alice, hs.introId, ['cadence'], ['cadence'], a)
   const cm = await hsCommit(hs.bob, hs.introId, ['cadence'], ['cadence'], b)
   const rc = cm.body.receipt_content
-  assert.equal(rc.policy_hash_a, policyHash(a))
-  assert.equal(rc.policy_hash_b, policyHash(b))
+
+  assert.equal('policy_hash_a' in rc, false, 'the enumerable value does not leave the server')
+  assert.equal('policy_hash_b' in rc, false)
+  assert.equal(JSON.stringify(rc).includes(policyHash(a)), false, 'and it is nowhere else in the receipt either')
+  // This pair registered no commitment, so the keys are OMITTED rather than set to null: the
+  // APS canonicalize drops null members, so a null would be absent from the digest anyway.
+  assert.equal('policy_commitment_a' in rc, false)
+
   assert.equal(rc.purpose, 'cofound')
   assert.ok(rc.requested_predicates.includes('cadence'))
   assert.ok(typeof rc.expiry === 'string')
+
+  // `proves` is now RENDERED from the evidence rather than hand written. Both sides here are
+  // legacy, so the only supportable sentence is the blunt one, and the old sentence whose
+  // four unwarranted clauses this replaces is gone.
+  assert.equal(rc.proves.includes('Acting keys A and B each sent a signed fit message naming this introduction.'), true)
+  assert.equal(rc.proves.includes('at the listed disclosure levels'), false,
+    'the clause warranted by a server side computation no longer claims to be an authorization')
+  assert.equal(rc.proves.includes('under their stated policy hash'), false)
+  assert.deepEqual(rc.warrants.request, ['intro_id'], 'and the receipt carries the warrant, not just the conclusion')
+  assert.deepEqual(rc.warrants.commit, ['intro_id'])
+
   // The digest binds the content, and the server receipt verifies over it.
   assert.equal(sha(canonicalize(rc)), cm.body.receipt_digest)
   assert.equal(serverKey.verifyReceipt(cm.body.receipt_digest, cm.body.receipt), true)

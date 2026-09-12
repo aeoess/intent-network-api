@@ -176,6 +176,26 @@ export function claimRelease(introId: string, aWriteRef: string | null, bWriteRe
   }
 }
 
+/** The bound field list of the signature behind one authorization, or null when there is no
+ *  such authorization.
+ *
+ *  What a receipt renderer asks for: the list is the warrant, and a clause is emitted only
+ *  when the field it names is in it. */
+export function boundFieldsOfAuthorization(introId: string, actorKey: string, operation: Operation, subject = ''): string[] | null {
+  const row = d().prepare(`
+    SELECT e.bound_fields_json AS bound FROM connection_authorizations a
+    JOIN write_evidence e ON e.evidence_id = a.evidence_id
+    WHERE a.intro_id = ? AND a.actor_key = ? AND a.operation = ? AND a.subject = ?
+  `).get(introId, actorKey, operation, subject) as { bound: string } | undefined
+  if (row === undefined) return null
+  try {
+    const parsed = JSON.parse(row.bound)
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+
 /** The write_ref of the envelope behind one authorization, or null when the act was
  *  legacy and had no envelope. Used to name the two acts a release rests on. */
 export function writeRefOfAuthorization(introId: string, actorKey: string, operation: Operation, subject = ''): string | null {

@@ -33,11 +33,13 @@ import { canonicalWriteRoute, canonicalDispatch, refuseWrite } from './write-pip
 import type { CanonicalContext } from './write-pipeline.js'
 import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
 import { recordAuthMode } from './write-db.js'
-import { recordAuthorization, materializeStatus, writeRefOfAuthorization } from './connection-facts.js'
+import { recordAuthorization, materializeStatus, writeRefOfAuthorization, boundFieldsOfAuthorization } from './connection-facts.js'
 import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
 import { checkLegacyWrite, refuseLegacy } from './legacy-write-gate.js'
 import { writeArtifact } from './private-artifacts.js'
-import { policyHashForCommitment, commitmentIsCurrent, registerPolicyCommitment } from './policy-commitment.js'
+import { policyHashForCommitment, commitmentIsCurrent, registerPolicyCommitment, commitmentForPolicyHash } from './policy-commitment.js'
+import { renderFitHandshake, warrantList } from './receipt-render.js'
+import { boundFieldsFor } from './write-evidence.js'
 
 const router = Router()
 
@@ -314,9 +316,15 @@ function evaluateAndReceipt(args: {
   accept: string[]
   comReciprocal: string[]
   autonomous: boolean
+  /** Which lane this commit arrived on. The commit's own evidence row does not exist yet
+   *  when the receipt is rendered, so the bound field list is computed from the same
+   *  function the recorder uses rather than read back from a row that is not there. */
+  commitEvidenceKind: 'canonical' | 'legacy_unbound'
   refuse: Refuse
 }): EvaluationResult {
   const { hs, actorKey, introId, committerCard, comPolicyHash, accept, comReciprocal, autonomous, refuse } = args
+  const requestEvidence = boundFieldsOfAuthorization(introId, hs.requester_key!, 'fit_request')
+  const commitEvidence = boundFieldsFor('fit_commit', args.commitEvidenceKind)
   const requesterCard = cardOfKey(hs, hs.requester_key!)!
   const policyReq = dimMapFor(requesterCard, hs.req_policy_hash!, hs.intent)
   const policyCom = dimMapFor(committerCard, comPolicyHash, hs.intent)
@@ -361,20 +369,53 @@ function evaluateAndReceipt(args: {
     else if (e.result === 'bucket' || e.result === 'exact_available') autonomyDb.recordActivity(actorKey, introId, 'bucket_disclosed', e.dimension, otherKey(hs, actorKey), autonomous)
   }
 
-  // Receipt: binds both policy hashes, requested predicates, purpose, each authorized
-  // disclosure level, outcome, expiry. Attests authorization only. Step 13 replaces the
-  // two policy hashes with the two commitments and the `proves` string with a rendered
-  // sentence, for both lanes at once.
+  // ── The receipt, reshaped ──
+  //
+  // TWO POLICY HASHES LEAVE. policyHash at fit-policy-db.ts:96-101 is an unsalted SHA-256
+  // over the normalized dimension set, and that set includes the private `value` of every
+  // dimension. The domains are small enough to enumerate offline: the widest dimension enum
+  // is 7 values, disclosure_state 5, sensitivity 3, importance 4, allowed_intents draws from
+  // 5, the tag sets from 16, and weekly_commitment is a pair of integers in 0 to 168. The
+  // only high entropy field is expires_at. So anyone holding a policy hash who can bound
+  // expires_at recovers the whole private dimension set, and today those hashes are returned
+  // to both parties and stored. The salted commitments replace them, and the deterministic
+  // hash stays internal for version lookup.
+  //
+  // A commitment is resolved back from (card, policy_hash), because the handshake stores the
+  // hash and no column can be added to it at this revision. An owner who never registered a
+  // commitment has none to name, and the field is then null rather than silently falling
+  // back to the hash: a receipt that degrades to the enumerable value on a missing
+  // registration would be the whole problem again.
+  const commitmentA = commitmentForPolicyHash(requesterCard, hs.req_policy_hash!)
+  const commitmentB = commitmentForPolicyHash(committerCard, comPolicyHash)
+
   const disclosures = dims.filter(dd => policyReq.get(dd) && policyCom.get(dd))
     .map(dd => ({ dimension: dd, level: levelName(policyReq.get(dd)!, policyCom.get(dd)!) }))
+
+  // `proves` is no longer a hand written sentence. It is rendered from the two evidence
+  // rows, so a clause appears only when the field it names is inside that row's
+  // bound_fields_json. Four of today's six content clauses are warranted by nothing, and
+  // this is what stops a seventh being added by someone editing a string.
+  const rendered = renderFitHandshake({
+    request: requestEvidence, commit: commitEvidence, standingScope: autonomous,
+  })
+  // The keys are OMITTED when there is no registered commitment, never set to null. The APS
+  // canonicalize deletes null-valued members, so a null would be dropped from the digest and
+  // a receipt carrying `policy_commitment_a: null` would digest identically to one with the
+  // key absent. Omitting says the same thing and says it in the bytes.
+  const commitmentFields: Record<string, string> = {}
+  if (commitmentA !== null) commitmentFields.policy_commitment_a = commitmentA
+  if (commitmentB !== null) commitmentFields.policy_commitment_b = commitmentB
+
   const receiptContent = {
     intro_id: introId, purpose: hs.intent, predicate_version: PREDICATE_VERSION,
-    policy_hash_a: hs.req_policy_hash, policy_hash_b: comPolicyHash,
+    ...commitmentFields,
     requested_predicates: dims,
     disclosures,
     outcome: overlapMap.map((e: OverlapEntry) => ({ dimension: e.dimension, result: e.result })),
     expiry: hs.expires_at,
-    proves: 'Each party authorized the listed dimensions at the listed disclosure levels under their stated policy hash, for the stated purpose. This attests authorization, not the truth of any value.',
+    proves: rendered.sentences.join(' '),
+    warrants: { request: warrantList(requestEvidence), commit: warrantList(commitEvidence) },
   }
   const receiptDigest = createHash('sha256').update(canonicalize(receiptContent), 'utf8').digest('hex')
   return { overlapMap, receipt: signReceipt(receiptDigest), receiptDigest, receiptContent }
@@ -510,7 +551,7 @@ const canonicalFitCommit = canonicalWriteRoute({
 
     const evaluated = evaluateAndReceipt({
       hs, actorKey, introId, committerCard: resolved.card, comPolicyHash: resolved.policyHash,
-      accept, comReciprocal, autonomous, refuse: refuseWrite,
+      accept, comReciprocal, autonomous, commitEvidenceKind: 'canonical', refuse: refuseWrite,
     })
     handshakeDb.setCommitResult(introId, actorKey, accept, comReciprocal, resolved.policyHash,
       JSON.stringify(evaluated.overlapMap), evaluated.receipt, evaluated.receiptDigest,
@@ -744,7 +785,7 @@ router.post('/:introId/commit', fitGate, canonicalDispatch(canonicalFitCommit), 
     evaluated = evaluateAndReceipt({
       hs, actorKey: public_key, introId, committerCard, comPolicyHash: policy_hash,
       accept: accept_dimensions, comReciprocal, autonomous: req.body?.autonomous === true,
-      refuse: legacyRefuse,
+      commitEvidenceKind: 'legacy_unbound', refuse: legacyRefuse,
     })
   } catch (e) {
     if (e instanceof LegacyFitRefusal) { res.status(e.status).json({ error: e.message }); return }
