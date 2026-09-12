@@ -14,7 +14,8 @@
 // ══════════════════════════════════════════════════════════════
 
 import { createApp } from './app.js'
-import { getDb, purgeExpired, closeDb } from './db.js'
+import { getDb, purgeExpired, closeDb, stampCanonicalMcpReleaseOnce } from './db.js'
+import { initWriteSchema } from './write-db.js'
 import { warmupModel } from './embeddings.js'
 import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
@@ -42,6 +43,15 @@ const app = createApp()
 
 // ── Initialize DB and start ──
 getDb() // Ensures schema is created
+// Eagerly, at boot, never lazily on first use. A lazily created table's CREATE
+// can land inside whatever transaction touches it first and be rolled back with a
+// failed business write, and a nonce table that sometimes does not exist is worse
+// than none. v3-routes.ts:231 already shows that shape reaching DDL inside a
+// transaction.
+initWriteSchema()
+// The compatibility clock. A no op unless MINGLE_CANONICAL_MCP_RELEASED_AT names
+// an explicit instant, and nothing here infers one from deploy or build time.
+stampCanonicalMcpReleaseOnce()
 
 // Purge expired cards every 5 minutes
 setInterval(() => { purgeExpired() }, 5 * 60 * 1000)

@@ -153,6 +153,7 @@ function initSchema(): void {
   `)
 
   stampDeployMarkerOnce()
+  stamp2ADeployMarkerOnce()
 }
 
 export const V3_2_MARKER_KEY = 'v3_2_deployed_at'
@@ -168,6 +169,59 @@ export const V3_2_MARKER_KEY = 'v3_2_deployed_at'
 export function stampDeployMarkerOnce(): void {
   getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
     .run(V3_2_MARKER_KEY, new Date().toISOString())
+}
+
+export const MINGLE_2A_MARKER_KEY = 'mingle_2a_deployed_at'
+export const CANONICAL_MCP_RELEASED_KEY = 'canonical_mcp_released_at'
+export const LEGACY_WRITE_CUTOFF_KEY = 'legacy_write_cutoff_at'
+
+/** Stamp when this build first opened this database. Grandfathering reads it: a
+ *  v3_intros row created before this instant ran under the old accept-with-contact
+ *  semantics, and there is no production-id specific code anywhere, so the rule
+ *  covers the one live intro and any other row that happens to be in flight. */
+export function stamp2ADeployMarkerOnce(): void {
+  getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
+    .run(MINGLE_2A_MARKER_KEY, new Date().toISOString())
+}
+
+/** The compatibility clock, and it stays unset until 2C.
+ *
+ *  Nothing derives the cutoff from deploy time, build time or a first request. It
+ *  is stamped only when MINGLE_CANONICAL_MCP_RELEASED_AT names an explicit
+ *  instant, because the window runs from the first public release of the canonical
+ *  MCP and no server can infer that. The env var SEEDS the marker and the marker is
+ *  the authority, so the cutoff survives restarts, redeploys and process moves and
+ *  does not depend on a variable staying set.
+ *
+ *  INSERT OR IGNORE, so an early or repeated stamp cannot move a cutoff that is
+ *  already recorded. Setting it is a 2C release action. */
+export function stampCanonicalMcpReleaseOnce(env: { MINGLE_CANONICAL_MCP_RELEASED_AT?: string } = process.env): void {
+  const at = env.MINGLE_CANONICAL_MCP_RELEASED_AT
+  if (!at) return
+  const released = new Date(at)
+  if (Number.isNaN(released.getTime())) {
+    throw new Error(`MINGLE_CANONICAL_MCP_RELEASED_AT is not a parseable instant: ${at}`)
+  }
+  const cutoff = new Date(released.getTime() + 30 * 24 * 3600 * 1000)
+  const ins = getDb().prepare('INSERT OR IGNORE INTO schema_markers (key, value) VALUES (?, ?)')
+  ins.run(CANONICAL_MCP_RELEASED_KEY, released.toISOString())
+  ins.run(LEGACY_WRITE_CUTOFF_KEY, cutoff.toISOString())
+}
+
+/** The absolute cutoff, or null when it has never been stamped.
+ *
+ *  Null means the legacy lane is OPEN. It must never be read as a cutoff in the
+ *  past, because that would refuse every legacy client the moment the table is
+ *  empty, which is exactly the state a fresh database is in. */
+export function legacyWriteCutoffAt(): string | null {
+  return getSchemaMarker(LEGACY_WRITE_CUTOFF_KEY)
+}
+
+/** Has the legacy write window closed? False when unstamped, by the rule above. */
+export function legacyWindowClosed(now: Date = new Date()): boolean {
+  const cutoff = legacyWriteCutoffAt()
+  if (cutoff === null) return false
+  return now.getTime() >= Date.parse(cutoff)
 }
 
 /** A recorded marker, or null when this database has never had one written.
