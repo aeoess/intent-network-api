@@ -24,6 +24,16 @@ const cardB = createIntentCard({
 const API = 'http://localhost:3100'
 
 async function test() {
+  // This script drives the legacy v2 surface, which is off unless the server
+  // runs with MINGLE_V2_ENABLED=1. Say so plainly instead of failing later on a
+  // 503 body that has no matches in it.
+  const index = await (await fetch(`${API}/`)).json()
+  if (index.legacy_v2 && index.legacy_v2.available === false) {
+    console.error('Legacy v2 is disabled on this server, so this smoke script has nothing to drive.')
+    console.error('Start the server with MINGLE_V2_ENABLED=1 to run it. Do not do that in production.')
+    process.exit(1)
+  }
+
   // Publish Alice
   let res = await fetch(`${API}/api/cards`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

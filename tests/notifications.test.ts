@@ -17,6 +17,9 @@ import { generateKeyPair, sign, canonicalize, createIntentCard } from 'agent-pas
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-email-test-'))
 process.env.DB_PATH = join(tmpDir, 'email.db')
 process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
+// The legacy intro tests below drive the v2 routes, which run only when
+// MINGLE_V2_ENABLED is exactly "1".
+process.env.MINGLE_V2_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')

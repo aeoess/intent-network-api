@@ -4,6 +4,7 @@
 
 import { Router } from 'express'
 import { requireSignature, identifyAgent } from './auth.js'
+import { v2Gate } from './v2-gate.js'
 import type { AuthenticatedRequest } from './auth.js'
 import * as db from './db.js'
 import { embed, embedBatch } from './embeddings.js'
@@ -61,7 +62,7 @@ function rateLimit(action: string, limit: number) {
 // POST /api/cards — Publish IntentCard
 // ══════════════════════════════════════
 
-router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), async (req: AuthenticatedRequest, res) => {
+router.post('/cards', v2Gate, requireSignature, rateLimit('publish', LIMITS.publish), async (req: AuthenticatedRequest, res) => {
   const card = req.body.card || req.body as IntentCard
 
   // Validate the card structure
@@ -170,7 +171,7 @@ router.post('/cards', requireSignature, rateLimit('publish', LIMITS.publish), as
 // GET /api/cards/:agentId — Get card
 // ══════════════════════════════════════
 
-router.get('/cards/:agentId', (req, res) => {
+router.get('/cards/:agentId', v2Gate, (req, res) => {
   const card = db.getCard(String(req.params.agentId))
   if (!card) {
     res.status(404).json({ error: 'No active card for this agent' })
@@ -183,7 +184,7 @@ router.get('/cards/:agentId', (req, res) => {
 // DELETE /api/cards/:cardId — Remove card
 // ══════════════════════════════════════
 
-router.delete('/cards/:cardId', requireSignature, (req: AuthenticatedRequest, res) => {
+router.delete('/cards/:cardId', v2Gate, requireSignature, (req: AuthenticatedRequest, res) => {
   // NW-006: Use verifiedPublicKey (cryptographically proven) for ownership check
   const removed = db.removeCard(String(req.params.cardId), req.verifiedPublicKey || '')
   if (!removed) {
@@ -197,7 +198,7 @@ router.delete('/cards/:cardId', requireSignature, (req: AuthenticatedRequest, re
 // GET /api/matches/:agentId — Ranked matches
 // ══════════════════════════════════════
 
-router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search), async (req: AuthenticatedRequest, res) => {
+router.get('/matches/:agentId', v2Gate, identifyAgent, rateLimit('search', LIMITS.search), async (req: AuthenticatedRequest, res) => {
   const agentId = String(req.params.agentId)
   const myCard = db.getCard(agentId)
   if (!myCard) {
@@ -252,7 +253,7 @@ router.get('/matches/:agentId', identifyAgent, rateLimit('search', LIMITS.search
 // POST /api/matches/ghost — Ghost mode: search without a published card
 // ══════════════════════════════════════
 
-router.post('/matches/ghost', rateLimit('search', LIMITS.search), async (req, res) => {
+router.post('/matches/ghost', v2Gate, rateLimit('search', LIMITS.search), async (req, res) => {
   const { needs, offers } = req.body || {}
   if ((!needs || needs.length === 0) && (!offers || offers.length === 0)) {
     res.status(400).json({ error: 'Provide at least one need or offer to search' })
@@ -291,7 +292,7 @@ router.post('/matches/ghost', rateLimit('search', LIMITS.search), async (req, re
 // POST /api/intros — Request introduction
 // ══════════════════════════════════════
 
-router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), async (req: AuthenticatedRequest, res) => {
+router.post('/intros', v2Gate, requireSignature, rateLimit('intro', LIMITS.intro), async (req: AuthenticatedRequest, res) => {
   const { matchId, targetAgentId, message, fieldsToDisclose } = req.body
   const requestedBy = req.verifiedAgentId
 
@@ -352,7 +353,7 @@ router.post('/intros', requireSignature, rateLimit('intro', LIMITS.intro), async
 // PUT /api/intros/:introId — Respond to intro
 // ══════════════════════════════════════
 
-router.put('/intros/:introId', requireSignature, async (req: AuthenticatedRequest, res) => {
+router.put('/intros/:introId', v2Gate, requireSignature, async (req: AuthenticatedRequest, res) => {
   const intro = db.getIntro(String(req.params.introId))
   if (!intro) {
     res.status(404).json({ error: 'Intro not found' })
@@ -410,7 +411,7 @@ router.put('/intros/:introId', requireSignature, async (req: AuthenticatedReques
 // GET /api/digest/:agentId — Personalized digest
 // ══════════════════════════════════════
 
-router.get('/digest/:agentId', identifyAgent, rateLimit('digest', LIMITS.digest), async (req: AuthenticatedRequest, res) => {
+router.get('/digest/:agentId', v2Gate, identifyAgent, rateLimit('digest', LIMITS.digest), async (req: AuthenticatedRequest, res) => {
   const agentId = String(req.params.agentId)
   const myCard = db.getCard(agentId)
 
@@ -622,7 +623,7 @@ router.get('/health', (_req, res) => {
 // POST /api/feedback/:introId — Submit intro feedback
 // ══════════════════════════════════════
 
-router.post('/feedback/:introId', identifyAgent, (req: AuthenticatedRequest, res) => {
+router.post('/feedback/:introId', v2Gate, identifyAgent, (req: AuthenticatedRequest, res) => {
   const { rating, comment } = req.body || {}
   if (!rating || !['useful', 'neutral', 'not_useful'].includes(rating)) {
     res.status(400).json({ error: 'Rating must be useful, neutral, or not_useful' })
@@ -640,7 +641,7 @@ router.post('/feedback/:introId', identifyAgent, (req: AuthenticatedRequest, res
 // GET /api/trust/:agentId — Trust signals
 // ══════════════════════════════════════
 
-router.get('/trust/:agentId', (req, res) => {
+router.get('/trust/:agentId', v2Gate, (req, res) => {
   const trust = db.getTrustSignals(String(req.params.agentId))
   res.json({ agentId: String(req.params.agentId), ...trust })
 })

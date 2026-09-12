@@ -18,6 +18,7 @@ import introsRoutes from './intros-routes.js'
 import fitRoutes from './fit-routes.js'
 import fitV4Routes from './fit-v4-routes.js'
 import matchRoutes, { v3RateHeaders } from './match-routes.js'
+import { v2Enabled, V2_INDEX_KEYS } from './v2-gate.js'
 
 export function createApp() {
   const app = express()
@@ -57,21 +58,29 @@ export function createApp() {
 
   // ── Root ──
   app.get('/', (_req, res) => {
-    res.json({
+    const endpoints: Record<string, string> = {
+      'POST /api/cards': 'Publish an IntentCard (signature verified)',
+      'GET /api/cards/:agentId': 'Get an agent\'s card',
+      'DELETE /api/cards/:cardId': 'Remove a card (signature verified)',
+      'GET /api/matches/:agentId': 'Get ranked matches',
+      'POST /api/intros': 'Request an introduction (signature verified)',
+      'PUT /api/intros/:introId': 'Respond to an intro (signature verified)',
+      'GET /api/digest/:agentId': 'Personalized digest',
+      'GET /api/stats': 'Network statistics',
+    }
+    const body: Record<string, unknown> = {
       name: 'AEOESS Intent Network API',
       version: '0.4.0',
       docs: 'https://aeoess.com/llms-full.txt',
-      endpoints: {
-        'POST /api/cards': 'Publish an IntentCard (signature verified)',
-        'GET /api/cards/:agentId': 'Get an agent\'s card',
-        'DELETE /api/cards/:cardId': 'Remove a card (signature verified)',
-        'GET /api/matches/:agentId': 'Get ranked matches',
-        'POST /api/intros': 'Request an introduction (signature verified)',
-        'PUT /api/intros/:introId': 'Respond to an intro (signature verified)',
-        'GET /api/digest/:agentId': 'Personalized digest',
-        'GET /api/stats': 'Network statistics',
-      },
-    })
+      endpoints,
+    }
+    // With legacy v2 off the index advertises none of it, so a half-live product
+    // cannot be discovered and invoked. With v2 on this response is unchanged.
+    if (!v2Enabled()) {
+      for (const key of V2_INDEX_KEYS) delete endpoints[key]
+      body.legacy_v2 = { available: false }
+    }
+    res.json(body)
   })
 
   return app

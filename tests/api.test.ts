@@ -22,6 +22,10 @@ import { createIntentCard, generateKeyPair, sign, canonicalize } from 'agent-pas
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'intent-net-api-test-'))
 process.env.DB_PATH = join(tmpDir, 'api-test.db')
+// The legacy v2 surface runs only when MINGLE_V2_ENABLED is exactly "1". This
+// suite is the v2 surface, so it runs with the flag on. The gate itself is
+// covered in tests/v2-gate.test.ts, which defaults to off.
+process.env.MINGLE_V2_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
 const db = await import('../src/db.js')
