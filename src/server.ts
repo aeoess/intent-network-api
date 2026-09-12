@@ -15,7 +15,8 @@
 
 import { createApp } from './app.js'
 import { getDb, purgeExpired, closeDb, stampCanonicalMcpReleaseOnce } from './db.js'
-import { initWriteSchema } from './write-db.js'
+import { initWriteSchema, purgeWriteNonces } from './write-db.js'
+import { sweepExpiredIntros } from './connection-facts.js'
 import { warmupModel } from './embeddings.js'
 import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
@@ -65,6 +66,19 @@ setInterval(() => {
 setInterval(() => {
   try { sweepExpiredV3Cards() } catch (e) { console.error('[v3 sweep]', (e as Error).message) }
   try { recomputeAllMatches() } catch (e) { console.error('[match sweep]', (e as Error).message) }
+  // The intro lifecycle sweep. It writes NOTHING except v3_intros.status, from the
+  // derivation, for rows that lapsed without anyone writing to them. It stores no expiry
+  // and inserts no authorization, so it cannot move a deadline: that is the whole reason
+  // expiry is derived from authorization timestamps rather than kept in a column a
+  // background job could touch by accident.
+  try {
+    const swept = sweepExpiredIntros()
+    if (swept.length > 0) console.log(`[intro sweep] materialized ${swept.length} expired intro(s)`)
+  } catch (e) { console.error('[intro sweep]', (e as Error).message) }
+  // Nonce retention is at least 24 hours, which is what makes post-expiry replay
+  // impossible: the freshness window is 10 minutes, so a nonce row always outlives every
+  // envelope that could carry it.
+  try { purgeWriteNonces() } catch (e) { console.error('[nonce purge]', (e as Error).message) }
 }, 60 * 60 * 1000)
 
 // Weekly digest. The week key dedupes, so at most one email per subscriber per

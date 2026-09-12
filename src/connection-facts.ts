@@ -304,3 +304,52 @@ export function materializeStatus(introId: string, now: Date = new Date()): Intr
   d().prepare('UPDATE v3_intros SET status = ? WHERE id = ?').run(materializedStatus(state), introId)
   return state
 }
+
+// ── The expiry sweep ──────────────────────────────────────────────────────
+
+/** The shortest TTL, which is what makes the candidate filter both sound and complete.
+ *
+ *  Every expiry basis is at or after the intro's own created_at: `requested` measures from
+ *  it directly, `interested` from an authorization inserted no earlier, and `connecting`
+ *  from a continuation inserted later still. So the EARLIEST any intro can expire is
+ *  created_at plus 14 days, and an intro younger than that cannot be expired whatever its
+ *  facts say. That argument is why the filter can be one comparison rather than a scan. */
+const SHORTEST_TTL_DAYS = 14
+
+/** Bring v3_intros.status into line for rows that expired without anyone writing to them.
+ *
+ *  THE SWEEP WRITES NOTHING EXCEPT THE MATERIALIZATION. It does not compute or store an
+ *  expiry, because deriveIntroState already answers `expired` for any row past its derived
+ *  deadline. What it exists for is the legacy reader: a row that lapsed with no write would
+ *  otherwise keep showing `pending` or `accepted` to a 3.2.x client forever. If the
+ *  materialization were dropped, this could be dropped with it.
+ *
+ *  It writes no authorization row, so it cannot move a deadline. That is the point of
+ *  deriving expiry rather than storing it: a background job that touched a
+ *  last_activity_at column is exactly the accident the design removes the column to prevent.
+ *
+ *  Returns the ids it materialized, so a caller can log a count rather than guess at one. */
+export function sweepExpiredIntros(now: Date = new Date()): string[] {
+  const earliest = new Date(now.getTime() - SHORTEST_TTL_DAYS * 24 * 3600 * 1000).toISOString()
+  // The comparison is ISO string against ISO string, both in the shape SQL_NOW_ISO writes.
+  // Comparing against datetime('now') instead would be lexically broken, because 'T' > ' '
+  // makes such a comparison always true, which is the live bug db.ts:20-25 documents. This
+  // binds a parameter rather than calling a SQL clock at all.
+  const candidates = d().prepare(`
+    SELECT id FROM v3_intros
+    WHERE status IN ('pending', 'accepted') AND created_at < ?
+    ORDER BY created_at
+  `).all(earliest) as { id: string }[]
+
+  const swept: string[] = []
+  for (const { id } of candidates) {
+    const facts = introFacts(id)
+    if (facts === null) continue
+    if (deriveIntroState(facts, now) !== 'expired') continue
+    // One derived write, through the same function every canonical write uses, so the sweep
+    // cannot disagree with the derivation about what the column should say.
+    materializeStatus(id, now)
+    swept.push(id)
+  }
+  return swept
+}
