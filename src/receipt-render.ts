@@ -79,6 +79,14 @@ export const SENTENCES = {
   /** 6.5 always allowed on a First Step record. */
   first_step_finality: 'The plan is final only when both keys have approved the same merged digest. Changing either half clears both approvals.',
 
+  /** 10.1 the withdrawal record, first sentence. What the actor did, and nothing about
+   *  what the counterparty thought of it. */
+  withdrawal_actor: 'Acting key K withdrew from this introduction.',
+  /** 10.2 the withdrawal record, second sentence, emitted only when the withdrawal actually
+   *  closed something unfinished. Mingle closed it, which is a server act, so the sentence
+   *  attributes it to Mingle and not to either party. */
+  withdrawal_closed_continuation: 'Mingle closed the unfinished continuation at T.',
+
   /** 8.1a the shared receipt line for a contact release. */
   share_contact_shared: 'Acting key K authorized the release of a contact line on this introduction, committed to as C. The line itself is held for the counterparty and is not in this receipt. Mingle recorded the authorization at R.',
   /** 8.1c what the recipient may be told. */
@@ -109,6 +117,10 @@ export const FORBIDDEN_SENTENCES: readonly string[] = [
   'B used an older client, so this evidence is weaker.',
   // 8.1b
   'The contact line is D.',
+  // 10.3, 10.4. A withdrawal is one party's act. Nothing may say the other agreed to it,
+  // accepted it, or was consulted, because no signature anywhere warrants any of that.
+  'The counterparty agreed to the withdrawal.',
+  'Both parties agreed to end the introduction.',
 ] as const
 
 // ── The predicate every clause passes through ─────────────────────────────
@@ -274,6 +286,25 @@ export function renderIntroRequest(row: Warrant): RenderedReceipt {
   const out = build([
     ['request_canonical', bound],
     ['request_legacy', !bound && !absent],
+  ])
+  return absent ? { ...out, missing_warrant: true } : out
+}
+
+/** The withdrawal record, from the withdrawing act's own evidence row.
+ *
+ *  Both sentences rest on envelope level facts. `operation` and `resource.id` are always in
+ *  a canonical bound list, so a warrant that covers them warrants "this key withdrew from
+ *  this introduction", and the time is the row's own recorded_at. Nothing here needs a
+ *  payload field, which is why withdraw_request and withdraw_interest carry none.
+ *
+ *  The second sentence is emitted only when something unfinished was actually closed, so a
+ *  withdrawal that closed nothing does not claim to have closed anything. */
+export function renderWithdrawal(args: { withdrawal: Warrant; closedContinuation: boolean }): RenderedReceipt {
+  const bound = warrants(args.withdrawal, ['operation', 'resource.id'])
+  const absent = isAbsent(args.withdrawal)
+  const out = build([
+    ['withdrawal_actor', bound],
+    ['withdrawal_closed_continuation', bound && args.closedContinuation],
   ])
   return absent ? { ...out, missing_warrant: true } : out
 }

@@ -266,18 +266,21 @@ test('WITHDRAW_REQUEST: the target cannot withdraw the requester\'s request, and
   assert.equal(facts.stateOf(f.id), 'requested')
 })
 
-test('WITHDRAW_REQUEST: allowed from interested, refused once a continuation is live', async () => {
+test('WITHDRAW_REQUEST: allowed from interested AND from connecting, per the closure ruling', async () => {
   const i = await intro('interested')
   const okr = await post('withdraw-request', forIntro('withdraw_request', i.id, i.from.keys).body)
   assert.equal(okr.status, 201, 'a target expressing interest does not commit the requester to anything')
   assert.equal(okr.json.state, 'withdrawn')
 
+  // Until an intro is connected, either party always has a ONE ACTION exit. This used to be
+  // refused with "withdraw the contact rather than the interest", which told a party who had
+  // shared no contact to do the one thing they could not.
   const c = await intro('connecting')
   assert.equal(facts.stateOf(c.id), 'connecting')
-  const refused = await post('withdraw-request', forIntro('withdraw_request', c.id, c.from.keys).body)
-  assert.equal(refused.status, 409)
-  assert.equal(refused.json.code, 'connection_in_progress')
-  assert.equal(facts.stateOf(c.id), 'connecting', 'and the state did not move')
+  const out = await post('withdraw-request', forIntro('withdraw_request', c.id, c.from.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.state, 'withdrawn', 'one act, and the intro is over')
+  assert.equal(facts.stateOf(c.id), 'withdrawn')
 })
 
 test('WITHDRAW_REQUEST: an identical resend returns the stored result, and a fresh envelope is already_withdrawn', async () => {
@@ -419,50 +422,38 @@ test('WITHDRAW_INTEREST: a resend returns the stored result', async () => {
   assert.equal(again.json.idempotent, true)
 })
 
-test('WITHDRAW_INTEREST: refused in connecting, where the remedy is to withdraw the contact first', async () => {
-  // A contradiction inside the design, resolved here and recorded. Item 6 of
-  // withdraw_interest says that if the target shared and no release happened, the
-  // withdrawal "also needs the contact authorization gone, so the transaction sets
-  // live = 0 on both rows". Section 14.4 rule 3 says the opposite: withdraw_interest
-  // is refused in connecting with 409 connection_in_progress, and appears only in the
-  // requested and interested rows.
+test('WITHDRAW_INTEREST: ONE act exits connecting, revoking the actor\'s own unreleased contact', async () => {
+  // The closure ruling, and the reversal of what this test used to assert. The design
+  // contradicted itself: item 6 of withdraw_interest described a cascade, and section 14.4
+  // rule 3 refused the act in connecting with "withdraw the contact rather than the
+  // interest". 14.4 used to win, on the reasoning that a live share_contact IS a live
+  // continuation so the two described the same situation.
   //
-  // 14.4 wins, and not by seniority. A live share_contact IS a live continuation, so
-  // the state whenever the target has shared is connecting, which means item 6's case
-  // and 14.4's refusal describe the same situation. Allowing the cascade would let an
-  // intro derive withdrawn by rule 3 while continuations are still live, so rule 5
-  // could never be reached and the derivation would contradict its own facts. That is
-  // the coherence item 2 means by "the guard section 14.1 relies on to keep branch 3
-  // of the derivation safe".
-  //
-  // The product path is two narrow acts rather than one wide one, which is what
-  // designing the thirteen independently produces.
+  // What that reasoning missed, and what the 2B.2 review found: a party can be IN connecting
+  // without having shared anything, because the counterparty's fit act reaches it too. Those
+  // parties were told to withdraw a contact they had never shared, and had nothing but
+  // block_pair until expiry. The ruling makes the withdrawal one atomic terminal operation
+  // instead, and the cascade item 6 described is now the normal path.
   const f = await intro('connecting')
   seedAuth(f.id, f.to.keys.publicKey, 'share_contact')
   db.getDb().prepare("UPDATE v3_intros SET to_contact = 'b@example.com' WHERE id = ?").run(f.id)
 
-  const refused = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
-  assert.equal(refused.status, 409)
-  assert.equal(refused.json.code, 'connection_in_progress')
-  assert.equal(refused.json.error, 'this connection is already in progress, so withdraw the contact rather than the interest',
-    'and the refusal says which act to send instead')
-
-  // Act one: the contact. Only the withdrawer's own column is blanked.
-  const one = await post('withdraw-contact', forIntro('withdraw_contact', f.id, f.to.keys).body)
-  assert.equal(one.status, 201, JSON.stringify(one.json))
+  const out = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.state, 'withdrawn', 'one act, and the intro is over')
+  assert.equal(out.json.contact_authorization_withdrawn, true, 'the actor\'s own contact went with it')
   const row = db.getDb().prepare('SELECT from_contact, to_contact FROM v3_intros WHERE id = ?').get(f.id) as any
   assert.equal(row.to_contact, null, 'the withdrawer\'s own contact is blanked')
-  assert.equal(row.from_contact, 'a@example.com', 'and the counterparty\'s is not')
-  assert.equal(one.json.state, 'connecting', 'the requester\'s contact is still a live continuation')
+  assert.equal(row.from_contact, 'a@example.com', 'and the counterparty\'s is not, because it was theirs to give')
+  assert.equal(authRow(f.id, f.to.keys.publicKey, 'share_contact').live, 0)
+  // The counterparty never receives it: no release row exists and none can be made now.
+  assert.equal(facts.isReleased(f.id), false)
+  assert.equal(facts.stateOf(f.id), 'withdrawn')
 
-  // Act two: the requester withdraws theirs as well, so no continuation is live.
-  assert.equal((await post('withdraw-contact', forIntro('withdraw_contact', f.id, f.from.keys).body)).status, 201)
-  assert.equal(facts.stateOf(f.id), 'interested')
-
-  // And now the interest can go.
-  const two = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
-  assert.equal(two.status, 201, JSON.stringify(two.json))
-  assert.equal(two.json.state, 'withdrawn')
+  // Every later continuation write is refused by the terminal state guard.
+  const late = await post('withdraw-contact', forIntro('withdraw_contact', f.id, f.from.keys).body)
+  assert.equal(late.status, 409)
+  assert.equal(late.json.code, 'intro_terminal')
 })
 
 test('WITHDRAW_INTEREST: no accepted withdrawal ever leaves a live contact authorization behind', async () => {
@@ -484,14 +475,27 @@ test('WITHDRAW_INTEREST: no accepted withdrawal ever leaves a live contact autho
   }
 })
 
-test('WITHDRAW_INTEREST: after a release it is contact_already_released, and writes nothing', async () => {
-  const f = await intro('connected')
-  const before = counts()
-  const r = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
-  assert.equal(r.status, 409)
-  assert.equal(r.json.code, 'contact_already_released')
-  assert.deepEqual(counts(), before)
-  assert.equal(facts.stateOf(f.id), 'connected', 'Mingle does not pretend a released contact can be unshared')
+test('WITHDRAW_INTEREST and WITHDRAW_REQUEST are refused once connected, and the refusal names block_pair', async () => {
+  // Where the one action exit stops. A released contact is never retracted by anything, so
+  // there is nothing left to withdraw, and the refusal points at the act that IS available
+  // for future pair activity rather than at one that is not.
+  for (const who of ['to', 'from'] as const) {
+    const f = await intro('connected')
+    const before = counts()
+    const op = who === 'to' ? 'withdraw_interest' : 'withdraw_request'
+    const path = who === 'to' ? 'withdraw-interest' : 'withdraw-request'
+    const r = await post(path, forIntro(op, f.id, f[who].keys).body)
+    assert.equal(r.status, 409, JSON.stringify(r.json))
+    assert.equal(r.json.code, 'already_connected')
+    assert.match(r.json.error, /block_pair/)
+    assert.deepEqual(counts(), before, 'and nothing was written')
+    assert.equal(facts.stateOf(f.id), 'connected')
+    // Both contacts are still readable by both parties, which is the point of never
+    // retracting a released contact.
+    const row = db.getDb().prepare('SELECT from_contact, to_contact FROM v3_intros WHERE id = ?').get(f.id) as any
+    assert.ok(row.from_contact, 'the requester\'s contact survives')
+    assert.ok(row.to_contact, 'and so does the target\'s')
+  }
 })
 
 // ══════════════════════════════════════════════════════════════
@@ -921,4 +925,230 @@ test('TTL RULING: a REAL canonical withdrawal sets the interested basis, end to 
   // The materialization agrees, which is the ordering invariant holding: the route records
   // evidence before it materializes, so the column is written from the post-ruling basis.
   assert.equal(statusOf(f.id), 'accepted', 'and not withdrawn, which is what a null basis would have written')
+})
+
+// ══════════════════════════════════════════════════════════════
+// The closure ruling: withdrawal from connecting is ONE ATOMIC TERMINAL OPERATION
+// ══════════════════════════════════════════════════════════════
+// Until an intro is connected, either party always has a one action exit. Each case below is
+// one of the seven steps the ruling specifies, driven through the real route.
+
+const fitDb = await import('../src/fit-db.js')
+const handshakeDb = await import('../src/fit-handshake-db.js')
+const firstStepDb = await import('../src/fit-firststep-db.js')
+const continuations = await import('../src/continuation-close.js')
+
+/** An intro in `connecting` caused ONLY by the counterparty's fit act. The actor has shared
+ *  nothing, which is the case the old refusal could not answer. */
+async function connectingByCounterpartyFit(): Promise<Fixture> {
+  const f = await intro('interested')
+  seedAuth(f.id, f.from.keys.publicKey, 'fit_request')
+  assert.equal(facts.stateOf(f.id), 'connecting')
+  return f
+}
+
+test('CLOSURE: connecting caused only by the counterparty, actor never shared, one act exits', async () => {
+  const f = await connectingByCounterpartyFit()
+  assert.equal(authRow(f.id, f.to.keys.publicKey, 'share_contact'), undefined,
+    'the actor holds no contact authorization, which is exactly why the old refusal was wrong')
+
+  const out = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.state, 'withdrawn')
+  assert.equal(out.json.contact_authorization_withdrawn, false, 'there was none to revoke')
+  assert.equal(facts.stateOf(f.id), 'withdrawn')
+  assert.equal(statusOf(f.id), 'withdrawn', 'and the legacy column is materialized from the derivation')
+})
+
+test('CLOSURE: a live v3 fit exchange is cancelled by the withdrawal, sealing nothing', async () => {
+  const f = await connectingByCounterpartyFit()
+  fitDb.initFitSchema()
+  const exId = `fit-closure-${Math.random().toString(36).slice(2)}`
+  fitDb.createExchange({
+    id: exId, intro_id: f.id, card_a: f.fromCard, card_b: f.toCard,
+    key_a: f.from.keys.publicKey, key_b: f.to.keys.publicKey, intent: 'collaborate',
+    expires_at: new Date(Date.now() + fitDb.FIT_WINDOW_MS).toISOString(),
+    ledger_version_a: 0, ledger_version_b: 0,
+  })
+  assert.equal(fitDb.getExchange(exId)!.state, 'answering')
+  assert.equal(continuations.hasUnfinishedContinuations(f.id), true)
+
+  const out = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.continuations_closed.exchange, exId)
+  const ex = fitDb.getExchange(exId)!
+  assert.equal(ex.state, 'cancelled', 'cancelled, not closed')
+  assert.equal(ex.record_json, null, 'and nothing was sealed, because there was no record to seal')
+  assert.equal(ex.receipt, null, 'so no server signature was produced by a withdrawal')
+  // And the sweep will not reseal it, which would undo the cancellation.
+  assert.equal(fitDb.expiredOpenExchanges().some(e => e.id === exId), false)
+})
+
+test('CLOSURE: a live v4 handshake is cancelled by the withdrawal, and a committed one is not', async () => {
+  handshakeDb.initHandshakeSchema()
+  // Unfinished: cancelled.
+  const f = await connectingByCounterpartyFit()
+  handshakeDb.createHandshake({
+    intro_id: f.id, card_a: f.fromCard, card_b: f.toCard,
+    key_a: f.from.keys.publicKey, key_b: f.to.keys.publicKey, intent: 'collaborate',
+    expires_at: new Date(Date.now() + 72 * 3600 * 1000).toISOString(),
+  })
+  handshakeDb.setRequest(f.id, f.from.keys.publicKey, ['cadence'], ['cadence'], 'h'.repeat(64), 3)
+  assert.equal(handshakeDb.getHandshake(f.id)!.state, 'requested')
+  const out = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.continuations_closed.handshake, true)
+  assert.equal(handshakeDb.getHandshake(f.id)!.state, 'cancelled')
+
+  // Committed: left exactly as it is, because the evaluation happened and is a fact.
+  const g = await connectingByCounterpartyFit()
+  handshakeDb.createHandshake({
+    intro_id: g.id, card_a: g.fromCard, card_b: g.toCard,
+    key_a: g.from.keys.publicKey, key_b: g.to.keys.publicKey, intent: 'collaborate',
+    expires_at: new Date(Date.now() + 72 * 3600 * 1000).toISOString(),
+  })
+  handshakeDb.setRequest(g.id, g.from.keys.publicKey, ['cadence'], ['cadence'], 'h'.repeat(64), 3)
+  handshakeDb.setCommitResult(g.id, g.to.keys.publicKey, ['cadence'], ['cadence'], 'i'.repeat(64), '[]', 'sig', 'dig', '{}')
+  const out2 = await post('withdraw-interest', forIntro('withdraw_interest', g.id, g.to.keys).body)
+  assert.equal(out2.status, 201, JSON.stringify(out2.json))
+  assert.equal(out2.json.continuations_closed.handshake, false)
+  assert.equal(handshakeDb.getHandshake(g.id)!.state, 'committed', 'a finished evaluation is a fact')
+})
+
+test('CLOSURE: an unfinished First Step is cancelled, and a finalized one is left alone', async () => {
+  firstStepDb.initFirstStepSchema()
+  const half = {
+    purpose: 'compare notes', next_action: 'a call', meeting_length: '30m',
+    agenda: ['scope'], each_wants: 'clarity', boundaries: ['no recording'],
+    expiry: new Date(Date.now() + 7 * 864e5).toISOString(),
+  }
+  // Unfinished: one side approved, so the approvals are cleared.
+  const f = await connectingByCounterpartyFit()
+  firstStepDb.proposeHalf(f.id, true, f.from.keys.publicKey, half)
+  firstStepDb.proposeHalf(f.id, false, f.to.keys.publicKey, half)
+  firstStepDb.approve(f.id, true)
+  assert.equal(firstStepDb.isFinalized(firstStepDb.getFirstStep(f.id)!), false)
+  const out = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(out.status, 201, JSON.stringify(out.json))
+  assert.equal(out.json.continuations_closed.first_step, true)
+  const row = firstStepDb.getFirstStep(f.id)!
+  assert.equal(row.a_approved, 0)
+  assert.equal(row.b_approved, 0)
+  assert.equal(firstStepDb.isFinalized(row), false, 'and it can never read as finalized')
+  assert.ok(row.half_a_json, 'the halves are left, because they are what was proposed')
+
+  // Finalized: both approved the same digest, which happened, so nothing is touched.
+  const g = await connectingByCounterpartyFit()
+  firstStepDb.proposeHalf(g.id, true, g.from.keys.publicKey, half)
+  firstStepDb.proposeHalf(g.id, false, g.to.keys.publicKey, half)
+  firstStepDb.approve(g.id, true)
+  firstStepDb.approve(g.id, false)
+  assert.equal(firstStepDb.isFinalized(firstStepDb.getFirstStep(g.id)!), true)
+  const out2 = await post('withdraw-interest', forIntro('withdraw_interest', g.id, g.to.keys).body)
+  assert.equal(out2.status, 201)
+  assert.equal(out2.json.continuations_closed.first_step, false)
+  assert.equal(firstStepDb.isFinalized(firstStepDb.getFirstStep(g.id)!), true, 'a finalized plan is a fact')
+})
+
+test('CLOSURE: the cascade is ATOMIC, so a refusal leaves no continuation cancelled', async () => {
+  // The whole operation is inside the transaction that reserved the nonce. A withdrawal that
+  // refuses must leave the exchange, the handshake and the plan exactly as they were.
+  const f = await intro('connected')
+  fitDb.initFitSchema()
+  const exId = `fit-atomic-${Math.random().toString(36).slice(2)}`
+  fitDb.createExchange({
+    id: exId, intro_id: f.id, card_a: f.fromCard, card_b: f.toCard,
+    key_a: f.from.keys.publicKey, key_b: f.to.keys.publicKey, intent: 'collaborate',
+    expires_at: new Date(Date.now() + fitDb.FIT_WINDOW_MS).toISOString(),
+    ledger_version_a: 0, ledger_version_b: 0,
+  })
+  const before = counts()
+  const r = await post('withdraw-interest', forIntro('withdraw_interest', f.id, f.to.keys).body)
+  assert.equal(r.status, 409)
+  assert.equal(r.json.code, 'already_connected')
+  assert.equal(fitDb.getExchange(exId)!.state, 'answering', 'the refusal rolled the cancellation back')
+  assert.deepEqual(counts(), before)
+})
+
+test('CLOSURE: withdrawal versus the final contact release, both orderings, exactly one wins', async () => {
+  // RELEASE FIRST. The release commits, the intro becomes connected, and the withdrawal then
+  // refuses atomically and changes nothing.
+  const a = await intro('connecting')
+  db.getDb().prepare('INSERT INTO connection_release (intro_id) VALUES (?)').run(a.id)
+  seedAuth(a.id, a.to.keys.publicKey, 'share_contact')
+  db.getDb().prepare("UPDATE v3_intros SET to_contact = 'b@example.com' WHERE id = ?").run(a.id)
+  assert.equal(facts.stateOf(a.id), 'connected')
+  const lost = await post('withdraw-interest', forIntro('withdraw_interest', a.id, a.to.keys).body)
+  assert.equal(lost.status, 409)
+  assert.equal(lost.json.code, 'already_connected')
+  assert.equal(facts.stateOf(a.id), 'connected', 'the connection stands')
+  assert.equal(authRow(a.id, a.to.keys.publicKey, 'express_interest').live, 1, 'and the interest is untouched')
+
+  // WITHDRAWAL FIRST. The withdrawal commits, and the later share that would have completed
+  // the release is refused by the terminal guard, so no release row is ever written.
+  const b = await intro('connecting')
+  const won = await post('withdraw-interest', forIntro('withdraw_interest', b.id, b.to.keys).body)
+  assert.equal(won.status, 201, JSON.stringify(won.json))
+  assert.equal(facts.stateOf(b.id), 'withdrawn')
+  // The later act is refused by the terminal state guard, on a real write path.
+  const late = await post('withdraw-contact', forIntro('withdraw_contact', b.id, b.from.keys).body)
+  assert.equal(late.status, 409)
+  assert.equal(late.json.code, 'intro_terminal')
+  // And no release row exists, so the counterparty can never complete a connection this
+  // actor exited: every continuation, share_contact included, is refused in `withdrawn`.
+  assert.equal(facts.isReleased(b.id), false)
+  for (const op of state.CONTINUATIONS) {
+    assert.equal(state.isWriteAllowedInState(op, 'withdrawn'), false, `${op} in withdrawn`)
+  }
+})
+
+test('CLOSURE: the cancellation is idempotent and reports nothing the second time', async () => {
+  const f = await connectingByCounterpartyFit()
+  fitDb.initFitSchema()
+  const exId = `fit-idem-${Math.random().toString(36).slice(2)}`
+  fitDb.createExchange({
+    id: exId, intro_id: f.id, card_a: f.fromCard, card_b: f.toCard,
+    key_a: f.from.keys.publicKey, key_b: f.to.keys.publicKey, intent: 'collaborate',
+    expires_at: new Date(Date.now() + fitDb.FIT_WINDOW_MS).toISOString(),
+    ledger_version_a: 0, ledger_version_b: 0,
+  })
+  assert.equal(continuations.closeUnfinishedContinuations(f.id).exchange, exId)
+  assert.equal(continuations.closeUnfinishedContinuations(f.id).exchange, null, 'nothing unfinished is left')
+  assert.equal(continuations.hasUnfinishedContinuations(f.id), false)
+})
+
+test('CLOSURE: the two orderings across SEPARATE CONNECTIONS, which is where the race is real', async () => {
+  // The sequential test above proves the state transitions. This proves the visibility: the
+  // withdrawal's guard reads what another connection COMMITTED, so a release that wins the
+  // write lock is seen by the withdrawal that arrives after it, and the reverse.
+  const Database = (await import('better-sqlite3')).default
+
+  // Ordering one: another connection commits the final release first.
+  const a = await intro('connecting')
+  const other = new Database(DB_FILE)
+  try {
+    other.prepare('INSERT INTO connection_release (intro_id) VALUES (?)').run(a.id)
+    other.prepare(`
+      INSERT INTO connection_authorizations (intro_id, actor_key, operation, subject, evidence_id, evidence, live)
+      VALUES (?, ?, 'share_contact', '', 'ev-other', 'canonical', 1)
+    `).run(a.id, a.to.keys.publicKey)
+  } finally { other.close() }
+  const lost = await post('withdraw-interest', forIntro('withdraw_interest', a.id, a.to.keys).body)
+  assert.equal(lost.status, 409, JSON.stringify(lost.json))
+  assert.equal(lost.json.code, 'already_connected', 'the guard saw another connection\'s commit')
+  assert.equal(facts.stateOf(a.id), 'connected')
+
+  // Ordering two: the withdrawal commits first, and another connection reading afterwards
+  // sees a terminal intro with no release row, so it cannot complete one.
+  const b = await intro('connecting')
+  assert.equal((await post('withdraw-interest', forIntro('withdraw_interest', b.id, b.to.keys).body)).status, 201)
+  const reader = new Database(DB_FILE, { readonly: true })
+  try {
+    const rel = reader.prepare('SELECT COUNT(*) AS n FROM connection_release WHERE intro_id = ?').get(b.id) as any
+    assert.equal(rel.n, 0, 'no release row, from a separate connection')
+    const interest = reader.prepare(
+      "SELECT live FROM connection_authorizations WHERE intro_id = ? AND operation = 'express_interest'").get(b.id) as any
+    assert.equal(interest.live, 0, 'and the terminal fact is visible outside the writing connection')
+  } finally { reader.close() }
+  assert.equal(facts.stateOf(b.id), 'withdrawn')
 })

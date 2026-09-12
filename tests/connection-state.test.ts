@@ -259,11 +259,11 @@ test('GUARDS: the full matrix of TWENTY operations against eight states', () => 
   // every operation the function accepts rather than the subset it used to.
   const expected: Record<string, IntroState[]> = {
     request_intro: [],
-    withdraw_request: ['requested', 'interested'],
+    withdraw_request: ['requested', 'interested', 'connecting'],
     express_interest: ['requested'],
     decline: ['requested'],
     block_pair: [...s.INTRO_STATES],
-    withdraw_interest: ['interested'],
+    withdraw_interest: ['interested', 'connecting'],
     share_contact: ['interested', 'connecting'],
     withdraw_contact: ['connecting'],
     fit_request: ['interested', 'connecting', 'connected'],
@@ -322,7 +322,22 @@ test('GUARDS: no action writes on a terminal intro except block_pair', () => {
 })
 
 test('GUARDS: each refusal carries a code whose remedy differs', () => {
-  assert.equal(s.guardRefusal('withdraw_request', 'connecting').code, 'connection_in_progress')
+  // Both withdrawals now SUCCEED in connecting, so `connected` is the only state left to
+  // refuse, and the refusal names block_pair rather than an act that is not available.
+  assert.equal(s.isWriteAllowedInState('withdraw_request', 'connecting'), true)
+  assert.equal(s.isWriteAllowedInState('withdraw_interest', 'connecting'), true)
+  assert.equal(s.guardRefusal('withdraw_request', 'connected').code, 'already_connected')
+  assert.equal(s.guardRefusal('withdraw_interest', 'connected').code, 'already_connected')
+  assert.match(s.guardRefusal('withdraw_interest', 'connected').error, /block_pair/)
+  // The deleted copy appears nowhere, in any cell.
+  for (const op of [...s.OPERATIONS, ...s.PROTOCOL_OPERATIONS]) {
+    for (const st of s.INTRO_STATES) {
+      assert.equal(s.guardRefusal(op, st).code === 'connection_in_progress', false,
+        `${op} in ${st} still carries the deleted refusal`)
+      assert.equal(/withdraw the contact rather than the interest/.test(s.guardRefusal(op, st).error), false,
+        `${op} in ${st} still carries the deleted copy`)
+    }
+  }
   assert.equal(s.guardRefusal('withdraw_contact', 'connected').code, 'contact_already_released')
   assert.equal(s.guardRefusal('express_interest', 'declined').code, 'intro_terminal')
   assert.equal(s.guardRefusal('express_interest', 'connecting').code, 'wrong_state')

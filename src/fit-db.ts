@@ -17,7 +17,11 @@ export const BANKED_INTENTS = ['cofound', 'team_up', 'collaborate', 'meet', 'adv
 export const BANK_VERSION = 1
 export const FIT_WINDOW_MS = 72 * 3600 * 1000
 
-export type FitState = 'answering' | 'round2' | 'closed'
+/** `cancelled` is the state an UNFINISHED exchange reaches when the introduction it
+ *  belongs to is withdrawn. It is not `closed`: closing seals a signed record, and there
+ *  is no record to seal for a conversation that never finished. The column has no CHECK
+ *  constraint, so this is a new value rather than a schema change. */
+export type FitState = 'answering' | 'round2' | 'closed' | 'cancelled'
 export type AnswerMode = 'ledger' | 'drafted' | 'skip'
 
 // ── The seeded banks (bank_version 1), verbatim from the spec ─────────────
@@ -280,13 +284,30 @@ export function setState(id: string, state: FitState): void {
   d().prepare('UPDATE v3_fit_exchanges SET state = ? WHERE id = ?').run(state, id)
 }
 
+/** The exchange belonging to one intro, or null. */
+export function exchangeForIntro(introId: string): ExchangeRow | null {
+  return (d().prepare('SELECT * FROM v3_fit_exchanges WHERE intro_id = ?').get(introId) as any) ?? null
+}
+
+/** Cancel an unfinished exchange, sealing nothing. Returns false when there was nothing
+ *  unfinished to cancel, which includes an exchange already closed or already cancelled. */
+export function cancelExchange(id: string): boolean {
+  return d().prepare(
+    "UPDATE v3_fit_exchanges SET state = 'cancelled', closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND state NOT IN ('closed', 'cancelled')",
+  ).run(id).changes === 1
+}
+
 export function closeExchange(id: string, recordJson: string, recordDigest: string, receipt: string): void {
   d().prepare(`UPDATE v3_fit_exchanges SET state = 'closed', closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), record_json = ?, record_digest = ?, receipt = ? WHERE id = ?`)
     .run(recordJson, recordDigest, receipt, id)
 }
 
 export function expiredOpenExchanges(): ExchangeRow[] {
-  return d().prepare(`SELECT * FROM v3_fit_exchanges WHERE state != 'closed' AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).all() as ExchangeRow[]
+  // A cancelled exchange is excluded as well as a closed one. The sweep seals what it
+  // finds, so without this it would seal a record for an exchange a withdrawal had just
+  // cancelled, which would undo the cancellation and produce the artifact the cancellation
+  // exists to avoid.
+  return d().prepare(`SELECT * FROM v3_fit_exchanges WHERE state NOT IN ('closed', 'cancelled') AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')`).all() as ExchangeRow[]
 }
 
 // ── Answers ────────────────────────────────────────────────────────────────

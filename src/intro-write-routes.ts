@@ -33,6 +33,7 @@ import {
   PRE_2A_ANTECEDENT,
 } from './connection-facts.js'
 import { factsForWrite, guardState, requireParty } from './intro-guards.js'
+import { closeUnfinishedContinuations } from './continuation-close.js'
 import { deriveIntroState } from './connection-state.js'
 import type { IntroFacts } from './connection-state.js'
 
@@ -89,6 +90,15 @@ router.post('/withdraw-request', canonicalWriteRoute({
     if (antecedent!.live !== 1) {
       refuseWrite(409, 'already_withdrawn', 'this request was already withdrawn')
     }
+    // Read the release inside this transaction. A concurrent final contact release that
+    // commits first makes the intro `connected`, and the guard below then refuses this
+    // withdrawal atomically, so nothing changes. If this commits first, the later release is
+    // refused by the terminal guard. Exactly one of the two wins and neither leaves a partial
+    // state. A released contact is never retracted by anything.
+    if (isReleased(introId)) {
+      refuseWrite(409, 'already_connected',
+        'contacts were released on this introduction, so there is nothing left to withdraw. Use block_pair to stop future activity between these two cards.')
+    }
     guardState('withdraw_request', facts, now)
 
     recordCanonicalEvidence(write)
@@ -98,8 +108,23 @@ router.post('/withdraw-request', canonicalWriteRoute({
     if (!withdrawAuthorization({ introId, actorKey, operation: 'request_intro', withdrawnBy: write.writeRef })) {
       throw new Error(`withdraw_request found no live request_intro row after its checks passed: ${introId}`)
     }
+    // ONE ATOMIC TERMINAL OPERATION, per the closure ruling. Permitted in `connecting` now,
+    // so the cascade is the normal path rather than defence in depth: the actor's own
+    // unreleased contact authorization goes with the withdrawal, and every unfinished
+    // continuation is cancelled. All of it is in the transaction that reserved the nonce.
+    const alsoContact = withdrawAuthorization({ introId, actorKey, operation: 'share_contact', withdrawnBy: write.writeRef })
+    if (alsoContact) {
+      blankOwnContact(facts, actorKey)
+      withdrawArtifacts(introId, actorKey, 'share_contact')
+    }
+    const closed = closeUnfinishedContinuations(introId)
     const state = materializeStatus(introId, now)
-    return { intro_id: introId, state, bridged_from_legacy: antecedent!.evidence_id === PRE_2A_ANTECEDENT }
+    return {
+      intro_id: introId, state,
+      contact_authorization_withdrawn: alsoContact,
+      continuations_closed: closed,
+      bridged_from_legacy: antecedent!.evidence_id === PRE_2A_ANTECEDENT,
+    }
   },
 }))
 
@@ -117,9 +142,13 @@ router.post('/withdraw-interest', canonicalWriteRoute({
     // Read the release inside this transaction, which is what makes the race in
     // section 14.2 answerable. Once contacts are released Mingle never pretends they
     // can be unshared.
+    // A concurrent final contact release that commits first makes the intro `connected`, and
+    // the guard below then refuses this withdrawal atomically, so nothing changes. If this
+    // commits first, the later release is refused by the terminal guard. Exactly one of the
+    // two wins. A released contact is never retracted by anything.
     if (isReleased(introId)) {
-      refuseWrite(409, 'contact_already_released',
-        'contacts were released, and Mingle does not pretend a released contact can be unshared')
+      refuseWrite(409, 'already_connected',
+        'contacts were released on this introduction, so there is nothing left to withdraw. Use block_pair to stop future activity between these two cards.')
     }
     guardState('withdraw_interest', facts, now)
     // Read before writing, so every refusal precedes every side effect. The guard above
@@ -132,26 +161,25 @@ router.post('/withdraw-interest', canonicalWriteRoute({
     if (!withdrawAuthorization({ introId, actorKey, operation: 'express_interest', withdrawnBy: write.writeRef })) {
       throw new Error(`withdraw_interest found no live express_interest row after its checks passed: ${introId}`)
     }
-    // The contact authorization goes with it, as defence in depth rather than as a
-    // reachable path. The guard above already refuses withdraw_interest in connecting
-    // with connection_in_progress, and a live share_contact IS a live continuation, so
-    // under the current matrix this cannot fire. It stays because the invariant it
-    // protects has to hold structurally: a live contact authorization under a withdrawn
-    // interest would let the other side's share complete a connection this actor had
-    // backed out of, and that must not depend on a guard table staying exactly as it is.
+    // ONE ATOMIC TERMINAL OPERATION, per the closure ruling. This cascade used to be
+    // unreachable defence in depth, because the guard refused the act in `connecting` and a
+    // live share_contact IS a live continuation. The ruling permits the act in `connecting`,
+    // so it is now the normal path: the actor's own unreleased contact authorization goes
+    // with the withdrawal, and every unfinished continuation is cancelled, in the transaction
+    // that reserved the nonce.
     //
-    // Item 6 of withdraw_interest describes the cascade as the normal path and section
-    // 14.4 rule 3 refuses the act outright. 14.4 wins: allowing it would let an intro
-    // derive withdrawn by rule 3 while continuations are live, so rule 5 could never be
-    // reached. The product path is withdraw_contact, then withdraw_interest.
+    // The invariant it protects is unchanged and is why it was written before it could fire:
+    // a live contact authorization under a withdrawn interest would let the other side's
+    // share complete a connection this actor had backed out of.
     const alsoContact = withdrawAuthorization({ introId, actorKey, operation: 'share_contact', withdrawnBy: write.writeRef })
     if (alsoContact) {
       blankOwnContact(facts, actorKey)
       withdrawArtifacts(introId, actorKey, 'share_contact')
     }
+    const closed = closeUnfinishedContinuations(introId)
     recordCanonicalEvidence(write)
     const state = materializeStatus(introId, now)
-    return { intro_id: introId, state, contact_authorization_withdrawn: alsoContact }
+    return { intro_id: introId, state, contact_authorization_withdrawn: alsoContact, continuations_closed: closed }
   },
 }))
 

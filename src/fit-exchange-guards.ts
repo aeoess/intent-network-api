@@ -54,6 +54,9 @@ export function exchangeForWrite(
   const row = ex as fitDb.ExchangeRow
   if (!fitDb.isParty(row, actorKey)) refuseWrite(403, 'not_a_party', 'not a party to this exchange')
   if (row.state === 'closed') refuseWrite(409, 'exchange_closed', 'this exchange is closed and accepts no further writes')
+  if (row.state === 'cancelled') {
+    refuseWrite(409, 'exchange_cancelled', 'this exchange was cancelled when the introduction was withdrawn')
+  }
   if (requireOpenWindow && Date.parse(row.expires_at) <= now.getTime()) {
     refuseWrite(409, 'exchange_expired', 'this exchange window has expired')
   }

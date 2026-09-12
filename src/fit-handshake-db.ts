@@ -68,7 +68,10 @@ export interface HandshakeRow {
   intro_id: string
   card_a: string; card_b: string; key_a: string; key_b: string
   intent: string
-  state: 'open' | 'requested' | 'committed'
+  /** `cancelled` is where an UNFINISHED handshake goes when its introduction is
+   *  withdrawn. A committed handshake is left alone: its evaluation happened and is a
+   *  fact, and the intro's own terminal guard already refuses every further act on it. */
+  state: 'open' | 'requested' | 'committed' | 'cancelled'
   requester_key: string | null
   requested_json: string | null
   req_reciprocal_json: string | null
@@ -122,6 +125,14 @@ export function setCommitResult(introId: string, committerKey: string, accept: s
 
 /** Parse the stored release map. Anything that is not a JSON object reads as
  *  no releases at all, so a damaged row never exposes an exact value. */
+/** Cancel an unfinished handshake. Returns false when there was nothing unfinished,
+ *  which includes a committed handshake and one already cancelled. */
+export function cancelHandshake(introId: string): boolean {
+  return d().prepare(
+    "UPDATE v4_fit_handshakes SET state = 'cancelled' WHERE intro_id = ? AND state IN ('open', 'requested')",
+  ).run(introId).changes === 1
+}
+
 export function parseReleased(json: string | null | undefined): Record<string, unknown> {
   try {
     const v = JSON.parse(json || '{}')

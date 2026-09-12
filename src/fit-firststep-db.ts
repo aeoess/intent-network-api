@@ -98,6 +98,25 @@ export function approve(introId: string, isA: boolean): void {
   d().prepare(`UPDATE v4_fit_first_step SET ${col} = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE intro_id = ?`).run(introId)
 }
 
+/** Cancel an UNFINISHED plan by clearing both approvals, so it can never read as
+ *  finalized. Returns false when there is no plan or the plan is already finalized.
+ *
+ *  Clearing an approval erases no fact. proposeHalf already resets both approvals
+ *  whenever either half changes, so this table holds CURRENT state rather than history,
+ *  and the durable record of what each key signed is its own row in write_evidence with
+ *  its own signature. A finalized plan is left alone: both keys approved the same digest
+ *  and that happened.
+ *
+ *  There is no cancelled column and none can be added at this revision, so cancellation
+ *  is the absence of an approval rather than a flag. */
+export function cancelUnfinished(introId: string): boolean {
+  return d().prepare(`
+    UPDATE v4_fit_first_step SET a_approved = 0, b_approved = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE intro_id = ? AND NOT (half_a_json IS NOT NULL AND half_b_json IS NOT NULL AND a_approved = 1 AND b_approved = 1)
+      AND (a_approved = 1 OR b_approved = 1)
+  `).run(introId).changes === 1
+}
+
 export function isFinalized(row: FirstStepRow): boolean {
   return !!row.half_a_json && !!row.half_b_json && row.a_approved === 1 && row.b_approved === 1
 }

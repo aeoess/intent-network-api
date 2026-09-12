@@ -33,6 +33,8 @@ process.on('exit', () => { try { db.closeDb() } catch { /* already closed */ } r
  *  function rather than a literal is the point: if boundFieldsFor changes, these tests move
  *  with it and the receipt cannot silently start claiming more. */
 const bound = (op: any, kind: 'canonical' | 'legacy_unbound') => evidence.boundFieldsFor(op, kind)
+/** The canonical bound list for one operation, which is the common case. */
+const bound2 = (op: any) => evidence.boundFieldsFor(op, 'canonical')
 
 // ══════════════════════════════════════════════════════════════
 // 1. The golden copy
@@ -84,6 +86,10 @@ test('GOLDEN: every approved sentence matches the decided text character for cha
       "This contact line was signed by the other side's acting key. You can check that signature yourself, without trusting Mingle.",
     artifact_plaintext_limit:
       'Mingle holds the contact line in plain text on its server. This is not end to end encryption.',
+    withdrawal_actor:
+      'Acting key K withdrew from this introduction.',
+    withdrawal_closed_continuation:
+      'Mingle closed the unfinished continuation at T.',
   }
   for (const [key, text] of Object.entries(approved)) {
     assert.equal((render.SENTENCES as Record<string, string>)[key], text, key)
@@ -107,11 +113,43 @@ test('GOLDEN: no approved sentence claims a human act, a truth or an outcome Min
   }
 })
 
+test('GOLDEN: the withdrawal record says what the actor did and nothing about the counterparty', () => {
+  // The closure ruling's receipt rule. It may state that the actor key withdrew and that
+  // Mingle closed the unfinished continuation at T. It must not state that the counterparty
+  // agreed to the withdrawal, because no signature anywhere warrants that.
+  const bound = bound2('withdraw_interest')
+  const closed = render.renderWithdrawal({ withdrawal: bound, closedContinuation: true })
+  assert.deepEqual(closed.keys, ['withdrawal_actor', 'withdrawal_closed_continuation'])
+  assert.equal(closed.sentences[0], render.SENTENCES.withdrawal_actor)
+  assert.equal(closed.sentences[1], render.SENTENCES.withdrawal_closed_continuation)
+
+  // A withdrawal that closed nothing does not claim to have closed anything.
+  const nothing = render.renderWithdrawal({ withdrawal: bound, closedContinuation: false })
+  assert.deepEqual(nothing.keys, ['withdrawal_actor'])
+
+  // An absent warrant emits nothing at all, on the same rule as every other renderer.
+  const missing = render.renderWithdrawal({ withdrawal: null, closedContinuation: true })
+  assert.deepEqual(missing.keys, [])
+  assert.equal(missing.missing_warrant, true)
+
+  // Neither sentence mentions the counterparty, agreement, consent or acceptance.
+  for (const text of [render.SENTENCES.withdrawal_actor, render.SENTENCES.withdrawal_closed_continuation]) {
+    for (const banned of [/counterpart/i, /\bagreed\b/i, /\bconsent/i, /\baccepted\b/i, /both/i]) {
+      assert.equal(banned.test(text), false, `${text} matches ${banned}`)
+    }
+  }
+  // And the two forbidden withdrawal sentences are on the NEVER list.
+  assert.ok(render.FORBIDDEN_SENTENCES.includes('The counterparty agreed to the withdrawal.'))
+  assert.ok(render.FORBIDDEN_SENTENCES.includes('Both parties agreed to end the introduction.'))
+})
+
 test('GOLDEN: not one NOT-ALLOWED sentence appears in any rendered receipt', () => {
   const every = [
     render.renderConnection(bound('share_contact', 'canonical'), bound('share_contact', 'canonical')),
     render.renderConnection(bound('share_contact', 'canonical'), bound('share_contact', 'legacy_unbound')),
     render.renderConnection(null, null),
+    render.renderWithdrawal({ withdrawal: bound2('withdraw_interest'), closedContinuation: true }),
+    render.renderWithdrawal({ withdrawal: bound2('withdraw_request'), closedContinuation: false }),
     render.renderFitHandshake({ request: bound('fit_request', 'canonical'), commit: bound('fit_commit', 'canonical'), standingScope: false }),
     render.renderFitHandshake({ request: bound('fit_request', 'canonical'), commit: bound('fit_commit', 'canonical'), standingScope: true }),
     render.renderFitHandshake({ request: bound('fit_request', 'legacy_unbound'), commit: bound('fit_commit', 'legacy_unbound'), standingScope: false }),

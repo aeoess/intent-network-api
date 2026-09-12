@@ -293,10 +293,22 @@ export function isWriteAllowedInState(operation: Operation, state: IntroState): 
 
   switch (operation) {
     case 'request_intro': return false
-    case 'withdraw_request': return state === 'requested' || state === 'interested'
+    // UNTIL AN INTRO IS CONNECTED, EITHER PARTY ALWAYS HAS A ONE ACTION EXIT. Both
+    // withdrawals are permitted in `connecting` as well, per the closure ruling, and both
+    // are then one atomic terminal operation: the route records the terminal fact, revokes
+    // the actor's own unreleased contact authorization if one exists, and cancels every
+    // unfinished continuation, in the transaction that also reserves the nonce.
+    //
+    // What this replaces: both were refused in `connecting` with "withdraw the contact
+    // rather than the interest", which told a party who had shared no contact to do the one
+    // thing they could not, and left them nothing but block_pair until expiry.
+    //
+    // `connected` is where they stop. A released contact is never retracted, so there is
+    // nothing left to withdraw, and the refusal names block_pair instead.
+    case 'withdraw_request': return state === 'requested' || state === 'interested' || state === 'connecting'
     case 'express_interest': return state === 'requested'
     case 'decline': return state === 'requested'
-    case 'withdraw_interest': return state === 'interested'
+    case 'withdraw_interest': return state === 'interested' || state === 'connecting'
     case 'share_contact': return state === 'interested' || state === 'connecting'
     case 'withdraw_contact': return state === 'connecting'
     case 'fit_request':
@@ -317,8 +329,15 @@ export function guardRefusal(operation: Operation, state: IntroState): { code: s
   if (isTerminalState(state)) {
     return { code: 'intro_terminal', error: `this introduction is ${state} and accepts no further ${operation}` }
   }
-  if ((operation === 'withdraw_request' || operation === 'withdraw_interest') && (state === 'connecting' || state === 'connected')) {
-    return { code: 'connection_in_progress', error: 'this connection is already in progress, so withdraw the contact rather than the interest' }
+  // Both withdrawals now succeed in `connecting`, so the only state left to refuse is
+  // `connected`, and the refusal names the act that IS available rather than one that is
+  // not. The old copy, "withdraw the contact rather than the interest", is deleted: it told
+  // a party who had shared no contact to do something they could not do.
+  if ((operation === 'withdraw_request' || operation === 'withdraw_interest') && state === 'connected') {
+    return {
+      code: 'already_connected',
+      error: 'contacts were released on this introduction, so there is nothing left to withdraw. Use block_pair to stop future activity between these two cards.',
+    }
   }
   if (operation === 'withdraw_contact' && state === 'connected') {
     return { code: 'contact_already_released', error: 'contacts were released, and Mingle does not pretend a released contact can be unshared' }
