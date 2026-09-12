@@ -44,7 +44,7 @@ import { boundFieldsFor } from './write-evidence.js'
 // "an unknown payload key is refused rather than dropped" would be two places for that
 // rule to drift.
 import { gateStringList as gateDimensionList, gateHex64, gatePayloadKeys } from './write-payload-gates.js'
-import { requireAntecedent } from './write-antecedent.js'
+import { requireAntecedent, canonicalActsOn, V4_FIT_ANTECEDENTS } from './write-antecedent.js'
 
 const router = Router()
 
@@ -864,7 +864,14 @@ router.get('/:introId', rateLimited('fitv4_get', 60), (req, res) => {
   if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
   if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
 
-  const base: Record<string, unknown> = { intro_id: introId, intent: hs.intent, state: hs.state, expires_at: hs.expires_at }
+  const base: Record<string, unknown> = {
+    intro_id: introId, intent: hs.intent, state: hs.state, expires_at: hs.expires_at,
+    // The canonical fit acts on this intro, so a party can NAME one as an antecedent. Without
+    // this a canonical escalation was unreachable as a first act, because the only refs that
+    // resolve are canonical write_refs and the only place one appeared was in the response to
+    // the party who made that write. In `base`, so it is readable in every handshake state.
+    canonical_acts: canonicalActsOn('intro', introId, V4_FIT_ANTECEDENTS),
+  }
   if (hs.state !== 'committed' || !hs.result_json) { res.json(base); return }
 
   // Merge human-tap-released exact values into the map for the two parties.
@@ -1074,10 +1081,23 @@ interface SignedQaAnswer { dimension: string; mode: 'ledger' | 'drafted' | 'skip
 /** The answers a principal signed, sorted by dimension with exactly the keys each mode
  *  needs.
  *
- *  SORTED BY DIMENSION IS A PROTOCOL RULE, for the same reason as the v3 side: the repair is
- *  that the stored record recomputes to the signed payload_digest, JCS keeps array order, and
- *  v4_fit_qa has one row per (intro, dimension, answerer) with no sequence column, so
- *  dimension order is the only order storage preserves. */
+ *  SORTED BY DIMENSION IS A PROTOCOL RULE, for the same reason as the v3 side: a rebuild from
+ *  storage has to be able to recover the order the principal signed, JCS keeps array order,
+ *  and v4_fit_qa has one row per (intro, dimension, answerer) with no sequence column, so
+ *  dimension order is the only order storage preserves.
+ *
+ *  WHAT THE REBUILD ACTUALLY GIVES, stated narrowly because the review found the broader
+ *  claim false in two ways. For ONE write by one party, the drafted and skip rows rebuild to
+ *  exactly that write's signed payload. A SECOND write merges into the same row set, because
+ *  upsertQa is keyed on (intro, dimension, answerer), so the composite matches no single
+ *  signature and nothing stored says which write covered which answer. And a LEDGER answer
+ *  cannot be rebuilt at all on this side: v4_fit_qa has no ledger_id column and none can be
+ *  added at this revision, so the signed ledger_id is not recoverable from storage. The v3
+ *  table does store it.
+ *
+ *  What IS true in every case, and is what matrix row 34 actually complained about: the stored
+ *  text is the signed text, byte for byte, with no cleaning and no server composed wrap. Per
+ *  answer attribution would need a new table and is recorded for 2C rather than invented here. */
 function gateQaAnswers(value: unknown): SignedQaAnswer[] {
   if (!Array.isArray(value) || value.length === 0) {
     refuseWrite(400, 'malformed_payload', 'answers must be a non empty array')
@@ -1114,7 +1134,7 @@ function gateQaAnswers(value: unknown): SignedQaAnswer[] {
       refuseWrite(400, 'malformed_payload', `answers carries dimension ${out[i].dimension} twice`)
     }
     if (out[i - 1].dimension > out[i].dimension) {
-      refuseWrite(400, 'malformed_payload', 'answers must be sorted by dimension, so the stored record recomputes to the signed digest')
+      refuseWrite(400, 'malformed_payload', 'answers must be sorted by dimension, so a rebuild from storage recovers the order you signed')
     }
   }
   return out
@@ -1262,7 +1282,7 @@ const canonicalFitRound2 = canonicalWriteRoute({
     const dimensionIds = gateDimensionList(write.payload.dimension_ids, 'dimension_ids', MAX_QA_ROUND2)
     const antecedent = gateHex64(write.payload.antecedent_write_ref, 'antecedent_write_ref')
     const { hs, introId, actorKey } = fitPreamble(ctx, null)
-    requireAntecedent('intro', introId, antecedent)
+    requireAntecedent('intro', introId, antecedent, V4_FIT_ANTECEDENTS)
     // EVERY id is checked before the FIRST is written, and an unknown one is REFUSED. The
     // legacy loop below silently drops a dimension with no canonical question, so a signer
     // could be told their escalation was accepted while half of it was discarded.

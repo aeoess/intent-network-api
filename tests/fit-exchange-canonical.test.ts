@@ -911,3 +911,101 @@ test('EXCHANGE CLOSE: the legacy lane still closes and is recorded as weak', asy
     "SELECT COUNT(*) AS n FROM card_events WHERE event = 'handshake_closed'").get() as any
   assert.ok(events.n >= 2, 'one for each side')
 })
+
+// ══════════════════════════════════════════════════════════════
+// What the antecedent proves, and what a rebuild from storage proves
+// ══════════════════════════════════════════════════════════════
+
+test('EXCHANGE ROUND2: the antecedent is reachable, because the read surface publishes the refs', async () => {
+  // The defect this closes. The only refs that resolve are canonical write_refs, and the only
+  // place one appeared was in the response to the party who made that write, so a party who
+  // had not yet written canonically could not escalate at all. Escalating BEFORE answering is
+  // the natural first move on this route.
+  const ex = await exchange()
+  const ans = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'drafted', text: 'Three evenings.' }] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), ans.body)).status, 201)
+
+  // Alice reads the exchange and finds Bob's act, without having written anything herself.
+  const nonce = 'ga' + rid()
+  const q = new URLSearchParams({
+    public_key: ex.alice.keys.publicKey, nonce,
+    signature: sign(`fit-get:${ex.id}:${nonce}`, ex.alice.keys.privateKey),
+  })
+  const view: any = await (await fetch(`${exUrl(ex.id, '')}?${q}`)).json()
+  assert.ok(Array.isArray(view.canonical_acts), JSON.stringify(Object.keys(view)))
+  assert.equal(view.canonical_acts.length, 1)
+  assert.equal(view.canonical_acts[0].write_ref, ans.built.writeRef)
+  assert.equal(view.canonical_acts[0].operation, 'fit_exchange_answers')
+  assert.equal(view.canonical_acts[0].actor_key, ex.bob.keys.publicKey)
+
+  // And it works as her antecedent, which is the whole point: a round two answers the
+  // COUNTERPARTY's act, so naming theirs is the natural form and no actor check applies.
+  const r2 = signedBody({
+    operation: 'fit_exchange_round2', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { question_ids: ['cofound-1'], antecedent_write_ref: view.canonical_acts[0].write_ref },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/round2'), r2.body)).status, 201)
+})
+
+test('EXCHANGE ANSWERS: KNOWN LIMIT, a second write merges and the composite matches no signature', async () => {
+  // The recompute property, stated exactly. ONE write by one party rebuilds to that write's
+  // signed payload. A second write MERGES, because upsertAnswer is keyed on
+  // (exchange, question, answerer), so the composite matches neither signature and nothing
+  // stored says which write covered which answer.
+  //
+  // Not a regression: the old lane stored a cleaned string that matched nothing at all. What
+  // IS true in every case is that the stored text is the signed text byte for byte, which is
+  // what matrix row 39 complained about. Pinned here so the limit is known rather than
+  // discovered, with per answer attribution recorded for 2C.
+  const ex = await exchange()
+  const first = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'drafted', text: 'Three evenings a week.' }] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), first.body)).status, 201)
+  assert.equal(digestOfStoredAnswers(ex.id, ex.bob.keys.publicKey, 'fit_exchange_answers'), first.built.payloadDigest,
+    'one write rebuilds exactly')
+
+  const second = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-2', mode: 'drafted', text: 'Mostly remote.' }] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), second.body)).status, 201)
+  const rebuilt = digestOfStoredAnswers(ex.id, ex.bob.keys.publicKey, 'fit_exchange_answers')
+  assert.notEqual(rebuilt, first.built.payloadDigest)
+  assert.notEqual(rebuilt, second.built.payloadDigest)
+  // But every stored answer is still byte identical to the text its own signature covered.
+  const rows = fitDb.answersForExchange(ex.id)
+  assert.equal(rows.find(r => r.question_id === 'cofound-1')!.text, 'Three evenings a week.')
+  assert.equal(rows.find(r => r.question_id === 'cofound-2')!.text, 'Mostly remote.')
+  // And both acts are recorded, so a reader knows two signed writes happened even though the
+  // rows do not say which covered which.
+  const ev = evidence.evidenceForResource('fit_exchange', ex.id).filter(e => e.operation === 'fit_exchange_answers')
+  assert.equal(ev.length, 2)
+  assert.deepEqual(ev.map(e => e.write_ref).sort(), [first.built.writeRef, second.built.writeRef].sort())
+})
+
+test('EXCHANGE ROUND2: an act from outside the fit conversation is not an antecedent', async () => {
+  // The antecedent used to accept any canonical act on the resource. On the v4 side that let
+  // an express_interest write_ref, signed before any handshake existed, unblock an escalation.
+  // On the exchange there are no lifecycle acts, so this drives the same check directly.
+  const ex = await exchange()
+  const ref = randomBytes(32).toString('hex')
+  db.getDb().prepare(`
+    INSERT INTO write_evidence
+      (evidence_id, write_ref, actor_key, operation, resource_type, resource_id,
+       evidence, envelope_json, signature, payload_digest, bound_fields_json, legacy_preimage)
+    VALUES (?, ?, ?, 'share_contact', 'fit_exchange', ?, 'canonical', '{}', ?, NULL, '[]', NULL)
+  `).run('ev-out-' + rid(), ref, ex.bob.keys.publicKey, ex.id, 'b'.repeat(128))
+  const { body } = signedBody({
+    operation: 'fit_exchange_round2', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { question_ids: ['cofound-1'], antecedent_write_ref: ref },
+  })
+  const res = await postJson(exUrl(ex.id, '/round2'), body)
+  assert.equal(res.status, 400)
+  assert.equal(res.json.code, 'antecedent_not_a_fit_act')
+  assert.deepEqual(fitDb.round2ForExchange(ex.id), [])
+})

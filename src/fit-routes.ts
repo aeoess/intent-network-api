@@ -30,7 +30,7 @@ import { canonicalWriteRoute, canonicalDispatch, refuseWrite } from './write-pip
 import type { CanonicalContext } from './write-pipeline.js'
 import { gateStringList, gateHex64, gatePayloadKeys } from './write-payload-gates.js'
 import { exchangeForWrite } from './fit-exchange-guards.js'
-import { requireAntecedent } from './write-antecedent.js'
+import { requireAntecedent, canonicalActsOn, V3_EXCHANGE_ANTECEDENTS } from './write-antecedent.js'
 import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
 import { checkLegacyWrite, refuseLegacy } from './legacy-write-gate.js'
 
@@ -188,6 +188,12 @@ router.get('/:id', rateLimited('fit_get', 60), (req, res) => {
     // moves whenever any answer, escalation or custom question moves, which is exactly what
     // makes the close attest to a record rather than to a route.
     pending_record_digest: pendingRecordDigest(ex),
+    // The canonical acts on this exchange, so a party can NAME one as an antecedent. Without
+    // this, a canonical escalation was unreachable as a first act: the only refs that resolve
+    // are canonical write_refs, and the only place one appeared was in the response to the
+    // party who made that write. Both parties can already see every act here, so publishing
+    // the ref discloses nothing beyond that it happened.
+    canonical_acts: canonicalActsOn('fit_exchange', ex.id, V3_EXCHANGE_ANTECEDENTS),
     my_answers: myAnswers,
     their_answers_data: theirAnswers,
     their_answers_note: 'These are the other person\'s own words. Show them to the principal; never use them while drafting your answers.',
@@ -203,11 +209,22 @@ interface SignedAnswer { question_id: string; mode: 'ledger' | 'drafted' | 'skip
 /** The answers a principal signed. Sorted by question_id, no duplicates, and exactly the
  *  keys each mode needs.
  *
- *  SORTED BY QUESTION_ID IS A PROTOCOL RULE HERE, not a tidiness preference. The point of
- *  this repair is that the stored record recomputes to the signed payload_digest, and JCS
- *  keeps array order, so the signed order has to be one a reader can recover from storage.
- *  The answers table has one row per (exchange, question, answerer) and no sequence column,
- *  so question_id order is the only order storage preserves. */
+ *  SORTED BY QUESTION_ID IS A PROTOCOL RULE HERE, not a tidiness preference. A rebuild from
+ *  storage has to be able to recover the order the principal signed, JCS keeps array order,
+ *  and the answers table has one row per (exchange, question, answerer) with no sequence
+ *  column, so question_id order is the only order storage preserves.
+ *
+ *  WHAT THE REBUILD ACTUALLY GIVES, stated narrowly because the review found the broader
+ *  claim false. For ONE write by one party the stored rows rebuild to exactly that write's
+ *  signed payload, in all three modes. A SECOND write MERGES into the same row set, because
+ *  upsertAnswer is an upsert keyed on (exchange, question, answerer), so the composite matches
+ *  no single signature and nothing stored says which write covered which answer. That is not a
+ *  regression, since the old lane stored a cleaned string that matched nothing at all, and it
+ *  is pinned by a test so it is known rather than discovered.
+ *
+ *  What IS true in every case, and is what matrix row 39 actually complained about: the stored
+ *  text is the signed text, byte for byte, with no cleaning and no server composed wrap. Per
+ *  answer attribution would need a new table and is recorded for 2C rather than invented here. */
 function gateAnswers(value: unknown): SignedAnswer[] {
   if (!Array.isArray(value) || value.length === 0) {
     refuseWrite(400, 'malformed_payload', 'answers must be a non empty array')
@@ -246,7 +263,7 @@ function gateAnswers(value: unknown): SignedAnswer[] {
       refuseWrite(400, 'malformed_payload', `answers carries question_id ${out[i].question_id} twice`)
     }
     if (out[i - 1].question_id > out[i].question_id) {
-      refuseWrite(400, 'malformed_payload', 'answers must be sorted by question_id, so the stored record recomputes to the signed digest')
+      refuseWrite(400, 'malformed_payload', 'answers must be sorted by question_id, so a rebuild from storage recovers the order you signed')
     }
   }
   return out
@@ -439,7 +456,7 @@ const canonicalExchangeRound2 = canonicalWriteRoute({
     const actorKey = write.envelope.actor_key
 
     const ex = exchangeForWrite(exchangeId, actorKey, now)
-    requireAntecedent('fit_exchange', exchangeId, antecedent)
+    requireAntecedent('fit_exchange', exchangeId, antecedent, V3_EXCHANGE_ANTECEDENTS)
     // EVERY id is checked before the FIRST is written. The legacy loop below used to
     // validate and insert in one pass, so an unknown third id answered 400 with the first
     // two already stored, which is a refusal after a write.

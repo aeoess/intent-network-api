@@ -1060,14 +1060,22 @@ test('AGREEMENT: every canonical fit act renews the connecting window and the co
 // post-gate cleaned string. So the record could not be recomputed from the signature in
 // either mode, and the quoted words were warranted by nothing.
 
-/** Recompute the payload digest from what the DATABASE holds, the way a later reader would. */
+/** Recompute the payload digest from what the DATABASE holds, the way a later reader would.
+ *
+ *  It rebuilds ONLY from columns v4_fit_qa actually has. A ledger answer signs a ledger_id and
+ *  that column does not exist on this table, so a ledger answer is not rebuildable here and
+ *  this function does not pretend otherwise: it throws rather than accepting a value the test
+ *  supplied. An earlier version of this helper took the id from a variable the test itself had
+ *  set, which made the recompute assertion pass by feeding it the missing input. */
 function digestOfStoredQa(introId: string, answererKey: string): string {
   const rows = qaDb.qaForIntro(introId)
     .filter(r => r.answerer_key === answererKey)
     .sort((a, b) => (a.dimension < b.dimension ? -1 : 1))
   const answers = rows.map(r => {
     if (r.mode === 'skip') return { dimension: r.dimension, mode: r.mode }
-    if (r.mode === 'ledger') return { dimension: r.dimension, ledger_id: ledgerIdOf(r), mode: r.mode, text: r.text }
+    if (r.mode === 'ledger') {
+      throw new Error('v4_fit_qa stores no ledger_id, so a ledger answer cannot be rebuilt from storage')
+    }
     return { dimension: r.dimension, mode: r.mode, text: r.text }
   })
   return env.buildEnvelope({
@@ -1076,9 +1084,6 @@ function digestOfStoredQa(introId: string, answererKey: string): string {
     issuedAt: '2026-01-01T00:00:00.000Z', nonce: 'y'.repeat(22), payload: { answers },
   }).payloadDigest
 }
-/** v4_fit_qa has no ledger_id column, so the test carries the id it signed. */
-let signedLedgerId = ''
-function ledgerIdOf(_row: unknown): string { return signedLedgerId }
 
 async function setLedgerFor(who: any, cardId: string, texts: string[]): Promise<{ id: string; text: string }> {
   const approved_hash = (await import('../src/fit-db.js')).ledgerHash(texts)
@@ -1095,7 +1100,7 @@ async function setLedgerFor(who: any, cardId: string, texts: string[]): Promise<
   return { id: r.items[0].id, text: r.items[0].text }
 }
 
-test('FIT ANSWERS: the stored answer recomputes to the signed payload digest, in all three modes', async () => {
+test('FIT ANSWERS: drafted and skip rebuild to the signed digest, and a LEDGER answer cannot', async () => {
   const p = await pair([
     dim('cadence', 'mixed', 'reveal_overlap'),
     dim('weekly_commitment', { min: 20, max: 40 }, 'reveal_exact'),
@@ -1109,28 +1114,39 @@ test('FIT ANSWERS: the stored answer recomputes to the signed payload digest, in
   // the one act that opens one, and answering is not it.
   assert.equal((await canonicalFitRequest(p)).status, 201)
   const item = await setLedgerFor(p.bob, p.bobCard, ['I can give three evenings and one weekend day.'])
-  signedLedgerId = item.id
 
+  // Drafted and skip only, so the rebuild uses nothing the table does not store.
   const answers = [
     { dimension: 'cadence', mode: 'drafted', text: 'Mixed, with one live day a week.' },
     { dimension: 'start_window', mode: 'skip' },
-    { dimension: 'weekly_commitment', ledger_id: item.id, mode: 'ledger', text: item.text },
   ]
   const s = signedBody({
     operation: 'fit_answers', resource: { type: 'intro', id: p.introId }, payload: { answers }, keys: p.bob.keys,
   })
   const res = await postJson(fitUrl(p.introId, '/answers'), s.body)
   assert.equal(res.status, 201, JSON.stringify(res.json))
-  assert.equal(res.json.answered, 3)
-
+  assert.equal(res.json.answered, 2)
   assert.equal(digestOfStoredQa(p.introId, p.bob.keys.publicKey), s.built.payloadDigest,
-    'the stored rows must rebuild the exact payload the principal signed')
+    'the stored rows rebuild the exact payload the principal signed')
 
+  // The ledger answer, in its own write. Its TEXT is stored verbatim with no wrap, which is
+  // what matrix row 34 complained about. Its ledger_id is NOT recoverable from storage,
+  // because v4_fit_qa has no such column and none can be added at this revision, so the
+  // rebuild refuses rather than being handed the missing value. The v3 table does store it.
+  const ledgerWrite = signedBody({
+    operation: 'fit_answers', resource: { type: 'intro', id: p.introId },
+    payload: { answers: [{ dimension: 'weekly_commitment', ledger_id: item.id, mode: 'ledger', text: item.text }] },
+    keys: p.bob.keys,
+  })
+  assert.equal((await postJson(fitUrl(p.introId, '/answers'), ledgerWrite.body)).status, 201)
   const rows = qaDb.qaForIntro(p.introId)
   const ledgerRow = rows.find(r => r.dimension === 'weekly_commitment')!
   assert.equal(ledgerRow.text, item.text)
   assert.equal(ledgerRow.text!.includes('Their approved brief states'), false,
     'no server composed wrap around words the principal signed')
+  assert.equal((ledgerRow as any).ledger_id, undefined, 'the column does not exist on this table')
+  assert.throws(() => digestOfStoredQa(p.introId, p.bob.keys.publicKey), /no ledger_id/,
+    'so a reader holding only storage cannot rebuild a ledger answer, and this says so')
   assert.equal(rows.find(r => r.dimension === 'start_window')!.text, null)
   // The airlock extraction is still stored for a drafted answer, derived from the signed
   // text by a deterministic function, so it asserts nothing the signature does not cover.
