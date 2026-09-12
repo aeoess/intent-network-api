@@ -494,3 +494,54 @@ test('the v3 sweep route allows 6 calls an hour per client, then answers 429', a
   for (let i = 0; i < 7; i++) codes.push((await fetch(`${base}/api/v3/sweep`, { method: 'POST' })).status)
   assert.deepEqual(codes, [200, 200, 200, 200, 200, 200, 429])
 })
+
+// ══════════════════════════════════════════════════════════════
+// No score reaches a caller, and that is a shape property
+// ══════════════════════════════════════════════════════════════
+
+test('INVARIANT: a search result carries no score, similarity, rank or confidence, under any name', async () => {
+  // The doctrine line at the top of PROTOCOL.md is "Mingle transports; it never evaluates.
+  // Results carry no scores", and the README calls it a protocol invariant with a conformance
+  // test. The publish-time BANNED_TOKENS gate covers what a CARD may contain. Nothing covered
+  // the shape of a search RESPONSE, which is where a similarity would leak if the route ever
+  // spread a row instead of building the view key by key.
+  //
+  // So this asserts the shape rather than the absence of one field: every key of every result,
+  // at every depth, must be a field the card format defines, and no key may name a judgment.
+  const a = makeCard('Someone who builds distributed systems', ['collaborate'])
+  await publish(a)
+  const res = await fetch(`${base}/api/v3/cards/search`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ intents: ['collaborate'], limit: 5 }),
+  })
+  const body: any = await res.json()
+  assert.equal(res.status, 200, JSON.stringify(body))
+  assert.ok(Array.isArray(body.results) && body.results.length > 0, 'the search returned something to inspect')
+
+  const JUDGMENT = /score|similarity|rank|confidence|rating|distance|percentile|grade|match_strength|weight/i
+  const keysAtEveryDepth = (value, path = '') => {
+    const out = []
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => out.push(...keysAtEveryDepth(v, `${path}[${i}]`)))
+    } else if (value !== null && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) {
+        out.push({ key: k, path: path ? `${path}.${k}` : k })
+        out.push(...keysAtEveryDepth(v, path ? `${path}.${k}` : k))
+      }
+    }
+    return out
+  }
+  for (const { key, path } of keysAtEveryDepth(body.results)) {
+    assert.equal(JUDGMENT.test(key), false, `a search result carries ${path}, which names a judgment of a person`)
+  }
+  // And no numeric value in the 0 to 1 band sits directly on a result, which is what a
+  // similarity looks like when somebody names it something else.
+  for (const r of body.results) {
+    for (const [k, v] of Object.entries(r)) {
+      if (typeof v === 'number') {
+        assert.equal(v >= 0 && v <= 1 && !Number.isInteger(v), false,
+          `result field ${k} is the unit interval value ${v}, which is what a similarity looks like under another name`)
+      }
+    }
+  }
+})

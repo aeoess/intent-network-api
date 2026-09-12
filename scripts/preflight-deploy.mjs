@@ -131,20 +131,30 @@ console.log(`\n2. schema is additive (${BASE}..HEAD)`)
       'pass --base <ref> naming the commit production is running. Without a base, nothing below compares anything.')
   }
 
-  // No ALTER TABLE anywhere in the tree, added or otherwise.
+  // No ALTER TABLE in any file that can run against a live database. src/ is the server, and
+  // the repo root carries migrate-embeddings.mjs, which is a script an operator can run by hand
+  // and therefore exactly as able to alter a table. The comment used to claim the whole tree
+  // while the scan read only src/.
   const srcFiles = readdirSync(join(repo, 'src')).filter(f => f.endsWith('.ts'))
+  const rootScripts = readdirSync(repo).filter(f => f.endsWith('.mjs'))
+  // This file is excluded from its own scan, because it necessarily contains the pattern it
+  // searches for. Named rather than filtered by a clever regex, so the exemption is visible.
+  const SELF = 'preflight-deploy.mjs'
+  const scriptFiles = readdirSync(join(repo, 'scripts')).filter(f => f.endsWith('.mjs') && f !== SELF)
   // Comments are stripped FIRST. Several files carry a comment explaining that this revision
   // has no ALTER TABLE, and a scan that matched those would fail on its own documentation.
   const stripComments = t => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   const alters = []
-  for (const f of srcFiles) {
-    const body = stripComments(readFileSync(join(repo, 'src', f), 'utf8'))
-    if (/ALTER\s+TABLE/i.test(body)) alters.push(f)
+  for (const [dir, files] of [['src', srcFiles], ['', rootScripts], ['scripts', scriptFiles]]) {
+    for (const f of files) {
+      const body = stripComments(readFileSync(join(repo, dir, f), 'utf8'))
+      if (/ALTER\s+TABLE/i.test(body)) alters.push(dir ? `${dir}/${f}` : f)
+    }
   }
   if (alters.length > 0) {
     bad(`ALTER TABLE appears in ${alters.join(', ')}`,
       'this revision has no migration runner, so an ALTER never runs against a deployed database. Use a new table.')
-  } else ok('no ALTER TABLE anywhere in src/')
+  } else ok(`no ALTER TABLE in src/, in scripts/ except this one, or in the ${rootScripts.length} root script(s)`)
 
   // Added lines inside a CREATE TABLE body that look like a column declaration. A new table
   // brings its own columns, so only additions to a table that ALREADY EXISTS at BASE matter.

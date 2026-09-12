@@ -220,9 +220,14 @@ test('PIPELINE: a canonical write records the mode for the signer only, and make
     'this actor has used canonical authorization on this resource')
   assert.equal(pipe.isDowngrade('intro', INTRO.id, generateKeyPair().publicKey), false,
     'and the counterparty is untouched, because a mode row is written only for the signer')
-  assert.equal(pipe.DOWNGRADE_REFUSAL.status, 426)
-  assert.equal(pipe.DOWNGRADE_REFUSAL.error, 'Update Mingle to continue this connection.')
-  assert.equal(pipe.DOWNGRADE_REFUSAL.logReason, 'downgrade prevention')
+  // Asserted against the LIVE constant, which is the one every refusal actually answers with.
+  // This used to read a duplicate in write-pipeline.ts that no production path consumed.
+  const gate = await import('../src/legacy-write-gate.js')
+  assert.equal(gate.LEGACY_REFUSAL.status, 426)
+  assert.equal(gate.LEGACY_REFUSAL.code, 'client_upgrade_required')
+  assert.equal(gate.LEGACY_REFUSAL.error, 'Update Mingle to continue this connection.')
+  assert.equal(gate.checkLegacyWrite({ resourceType: 'intro', resourceId: INTRO.id, actorKey: actor.publicKey })!.logReason,
+    'downgrade prevention', 'and the downgrade case is expressed there too')
 })
 
 // ── The opening reaches the handler verified ──────────────────────────────

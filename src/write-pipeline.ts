@@ -198,18 +198,13 @@ async function runRoute<T>(route: CanonicalRoute<T>, req: Request, res: Response
   }
 }
 
-/** The refusal an adapter answers when a legacy body arrives from an actor who has
- *  already used canonical authorization on this resource.
- *
- *  Same status and same user text as the cutoff refusal, deliberately: the caller's
- *  remedy is identical, which is to update, so two codes to handle would be noise.
- *  The distinction lives in the internal log reason, where it is actually useful. */
-export const DOWNGRADE_REFUSAL = {
-  status: 426,
-  code: 'client_upgrade_required',
-  error: 'Update Mingle to continue this connection.',
-  logReason: 'downgrade prevention',
-} as const
+// THE DOWNGRADE REFUSAL LIVES IN ONE PLACE, and it is not here.
+//
+// This module used to export a DOWNGRADE_REFUSAL constant carrying the approved 426 sentence,
+// and nothing in production read it: the live refusal is LEGACY_REFUSAL in legacy-write-gate.ts,
+// spread with logReason 'downgrade prevention'. Only a test read the copy here. Two homes for one
+// approved string is drift waiting, and the dead one is the one that drifts, because nothing
+// exercises it. Removed, and the test now asserts against the live constant.
 
 /** Would a legacy write on this resource by this actor be a downgrade? */
 export function isDowngrade(resourceType: string, resourceId: string, actorKey: string): boolean {
