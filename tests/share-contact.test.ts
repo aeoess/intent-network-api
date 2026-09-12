@@ -247,6 +247,59 @@ test('SHARE: the second share writes exactly one release row and derives connect
   }
 })
 
+test('SHARE: the released contact reaches the caller and is in NO new place in the schema', async () => {
+  // runCanonicalWrite persists the handler's whole return value into write_nonces.result_json
+  // so an idempotent replay can be answered with the same bytes. So a released contact
+  // returned FROM THE HANDLER landed in the nonce table for the 24 hours before the purge,
+  // which falsified the schema's own statement that opening_json is the only place a private
+  // value lives. It is a response-only field now, recomputed after the transaction.
+  const L = await interested()
+  await share(L.introId, L.from.keys, 'needle-from@example.com')
+  const second = await share(L.introId, L.to.keys, 'needle-to@example.com')
+  assert.equal(second.json.released, true)
+  assert.equal(second.json.counterparty_contact, 'needle-from@example.com',
+    'the caller still learns the line in the call that released it')
+
+  // Where each line actually lives, column by column, across every table.
+  const where = (needle: string): string[] => {
+    const d = db.getDb()
+    const hits: string[] = []
+    for (const { name } of d.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as any[]) {
+      let cols: any[] = []
+      try { cols = d.prepare(`PRAGMA table_info("${name}")`).all() as any[] } catch { continue }
+      for (const c of cols) {
+        try {
+          const n = (d.prepare(`SELECT COUNT(*) AS n FROM "${name}" WHERE CAST("${c.name}" AS TEXT) LIKE ?`)
+            .get(`%${needle}%`) as any).n
+          if (n > 0) hits.push(`${name}.${c.name}`)
+        } catch { /* a virtual table column that cannot be scanned */ }
+      }
+    }
+    return hits.sort()
+  }
+  // THE TWO DESIGNED HOMES, AND NOTHING ELSE. private_artifacts.opening_json is where the
+  // schema says a private value lives, and v3_intros holds the plaintext the legacy reader
+  // needs. Any third place is a widening, and this names it rather than counting.
+  const ALLOWED = ['private_artifacts.opening_json', 'v3_intros.from_contact', 'v3_intros.to_contact']
+  for (const needle of ['needle-from@example.com', 'needle-to@example.com']) {
+    const places = where(needle)
+    assert.ok(places.length > 0, `${needle} is in no table at all, so this test proved nothing`)
+    assert.equal(places.includes('write_nonces.result_json'), false,
+      `${needle} reached the nonce table: ${places.join(', ')}`)
+    assert.deepEqual(places.filter(x => !ALLOWED.includes(x)), [],
+      `${needle} is in a place the schema does not designate for a private value`)
+  }
+
+  // And a BYTE IDENTICAL resend still answers with the line, from the replay path, which is
+  // the property the response-only hook exists for: the stored result carries no contact, so a
+  // replay that read the store would answer null.
+  const again = await post('share-contact', second.body)
+  assert.equal(again.status, 200, JSON.stringify(again.json))
+  assert.equal(again.json.idempotent, true, 'a byte identical resend is the replay path')
+  assert.equal(again.json.counterparty_contact, 'needle-from@example.com',
+    'and it recomputes the line rather than reading a stored copy')
+})
+
 test('SHARE: the two release emails are attempted once each', async () => {
   const L = await interested()
   await subscribeVerified(L.from.keys, 'req2@example.com')

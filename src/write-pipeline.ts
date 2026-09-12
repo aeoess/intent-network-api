@@ -64,6 +64,16 @@ export interface CanonicalRoute<T> {
   /** Non transactional effects, after a successful commit only. Never throws into
    *  the response: a lost email must not undo a committed connection. */
   afterCommit?: (ctx: CanonicalContext, result: T) => void | Promise<void>
+  /** Fields added to the RESPONSE and never to the stored result.
+   *
+   *  runCanonicalWrite persists the handler's whole return value into
+   *  write_nonces.result_json so an idempotent replay can be answered with the same bytes.
+   *  A value that must not be persisted therefore cannot come from the handler. This hook
+   *  runs after the transaction, on BOTH the commit and the replay path, so such a value
+   *  reaches the caller either way and reaches no table.
+   *
+   *  It runs after the write is settled and must only ever READ. */
+  responseOnly?: (ctx: CanonicalContext, result: T) => Record<string, unknown>
 }
 
 function refuse(res: Response, status: number, code: string, error: string): void {
@@ -168,9 +178,15 @@ async function runRoute<T>(route: CanonicalRoute<T>, req: Request, res: Response
       return
     }
 
-    // 13: respond. An idempotent resend gets the stored answer and the same status.
+    // 13: respond. An idempotent resend gets the stored answer and the same status, plus any
+    // response-only fields, which are recomputed here rather than read back from the store.
+    let responseOnly: Record<string, unknown> = {}
+    if (route.responseOnly) {
+      try { responseOnly = route.responseOnly(ctx, outcome.result) } catch { responseOnly = {} }
+    }
     res.status(outcome.kind === 'idempotent' ? 200 : 201).json({
       ...(outcome.result as object),
+      ...responseOnly,
       write_ref: write.writeRef,
       idempotent: outcome.kind === 'idempotent',
     })

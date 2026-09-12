@@ -537,23 +537,29 @@ const canonicalShareContact = canonicalWriteRoute({
       )
     }
     const state = materializeStatus(introId, now)
-    // The release effect, answered to the acting party in the same call that caused it.
-    // Read AFTER the column write above, so the second sharer sees the first sharer's line.
-    //
-    // This discloses nothing the caller cannot already read: the release happened, GET /mine
-    // answers this exact value to this exact key from here on, and the notification mails it.
-    // Withholding it only forced a second round trip that would return the same string, and
-    // a tool that says both contacts are now available while handing back null is a tool that
-    // has to lie or poll. Gated on `released`, and on this caller being a party, which
-    // requireParty settled above.
-    const releasedRow = released ? introsDb.getIntro(introId) : null
-    const counterpartyContact = releasedRow === null
-      ? null
-      : (isRequester ? releasedRow.to_contact : releasedRow.from_contact) ?? null
-    return {
-      intro_id: introId, state, released, shared_by: isRequester ? 'requester' : 'target',
-      counterparty_contact: counterpartyContact,
-    }
+    return { intro_id: introId, state, released, shared_by: isRequester ? 'requester' : 'target' }
+  },
+  // The release effect, answered to the acting party in the same call that caused it, and
+  // NEVER stored.
+  //
+  // It is response-only for a reason worth stating: runCanonicalWrite persists the handler's
+  // whole return value into write_nonces.result_json, so returning the contact from the handler
+  // put a released contact line into the nonce table for the 24 hours before the purge. That
+  // falsifies the schema's own load-bearing statement that opening_json is the only place a
+  // private value lives. Recomputed here instead, on both the commit and the replay path, so
+  // a client whose request timed out still learns the line on the resend.
+  //
+  // It discloses nothing the caller cannot already read: the release happened, GET /mine
+  // answers this exact value to this exact key from here on, and the notification mails it.
+  // Withholding it only forced a second round trip for the same string. Gated on `released`,
+  // and on the caller being a party, which requireParty settled inside the transaction.
+  responseOnly: (ctx, result) => {
+    const r = result as { intro_id: string; released: boolean; shared_by: string }
+    if (r.released !== true) return { counterparty_contact: null }
+    const row = introsDb.getIntro(r.intro_id)
+    if (row === null) return { counterparty_contact: null }
+    const isRequester = ctx.write.envelope.actor_key === row.from_key
+    return { counterparty_contact: (isRequester ? row.to_contact : row.from_contact) ?? null }
   },
   afterCommit: async (ctx, result) => {
     const r = result as { intro_id: string; released: boolean }
