@@ -25,7 +25,19 @@ import { questionFor } from './fit-questions.js'
 import { ledgerItemLive } from './fit-db.js'
 import { fitGate, postGateDrafted, type PostGateInput } from './fit-gate.js'
 import { extract as airlockExtract, plan as airlockPlan } from './fit-airlock.js'
+import { asyncRoute } from './async-route.js'
 import { recordCardEvent } from './card-events.js'
+import * as introsDb from './intros-db.js'
+import { jcs } from './canonical-write.js'
+import { canonicalWriteRoute, canonicalDispatch, refuseWrite } from './write-pipeline.js'
+import type { CanonicalContext } from './write-pipeline.js'
+import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
+import { recordAuthMode } from './write-db.js'
+import { recordAuthorization, materializeStatus, writeRefOfAuthorization } from './connection-facts.js'
+import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
+import { checkLegacyWrite, refuseLegacy } from './legacy-write-gate.js'
+import { writeArtifact } from './private-artifacts.js'
+import { policyHashForCommitment, commitmentIsCurrent, registerPolicyCommitment } from './policy-commitment.js'
 
 const router = Router()
 
@@ -82,6 +94,39 @@ router.get('/policy', rateLimited('fitv4_get', 60), (req, res) => {
   res.json(policy ?? { card_id, version: 0, dimensions: [] })
 })
 
+// ── POST /policy/commitment - register a salted commitment to your policy ──
+// The owner computes commitment = SHA-256(JCS({domain, salt, policy: normalized})) over
+// the policy the server already holds, and sends the commitment and the salt. The server
+// verifies the opening once and then keeps ONLY the commitment, so the strongest thing it
+// can say afterwards is that a commitment was opened to it once.
+//
+// The policy body is not resent, because the server has it and a resent body could differ
+// from the stored one. So the only secret crossing the wire is the salt, and it is dropped
+// after the check.
+
+router.post('/policy/commitment', rateLimited('fitv4_policy', 20), (req, res) => {
+  const { card_id, commitment, salt, public_key, nonce, signature } = req.body ?? {}
+  if (typeof card_id !== 'string' || typeof commitment !== 'string' || typeof nonce !== 'string') {
+    res.status(400).json({ error: 'card_id, commitment, salt, nonce required' }); return
+  }
+  // The commitment is inside the preimage, so a proxy cannot register a different one.
+  if (!checkSig(`register-policy-commitment:${card_id}:${commitment}:${nonce}`, signature, public_key)) {
+    res.status(403).json({ error: 'signature does not verify' }); return
+  }
+  if (!ownsCard(card_id, public_key)) { res.status(403).json({ error: 'not the card subject' }); return }
+
+  const result = registerPolicyCommitment({ cardId: card_id, subjectKey: public_key, commitment, salt })
+  if (result.ok !== true) {
+    const r = result as { code: string; error: string }
+    res.status(400).json({ code: r.code, error: r.error }); return
+  }
+  const okResult = result as { ok: true; row: { policy_hash: string; version: number }; already: boolean }
+  res.status(okResult.already ? 200 : 201).json({
+    card_id, commitment, version: okResult.row.version, already_registered: okResult.already,
+    note: 'The salt is not stored. Keep it: it is what lets you open this commitment later.',
+  })
+})
+
 // ══════════════════════════════════════════════════════════════
 // Bilateral predicate handshake
 // ══════════════════════════════════════════════════════════════
@@ -130,9 +175,499 @@ function levelName(a: policyDb.PolicyDimension, b: policyDb.PolicyDimension): st
   return (['', 'local_only', 'testable', 'reveal_overlap', 'reveal_bucket', 'reveal_exact'])[eff]
 }
 
+// ══════════════════════════════════════════════════════════════
+// The canonical lane for the five fit actions
+// ══════════════════════════════════════════════════════════════
+// Each of the five gains a canonical branch ahead of its legacy branch, on the path it
+// already has, dispatched on the presence of an `envelope` key.
+//
+// DOUBLE GATE. These routes sit behind MINGLE_FIT_ENABLED as well as behind the new
+// pipeline, and that flag is unset in production. So this is code that does not run in
+// production, and its tests set the flag explicitly. The legacy fit adapters are in
+// practice a compatibility window for a surface that is off.
+//
+// Three repairs land here, each already justified:
+//   reciprocal_offer and query_budget become REQUIRED in a canonical payload, so the
+//     defaulting at fit-v4-routes.ts:153-154 cannot run on that lane
+//   fit_commit carries request_write_ref, so a commit names the request it answers
+//   first_step_approve moves its digest comparison and its write into one transaction
+
+const HEX64_RE = /^[0-9a-f]{64}$/
+
+/** How a shared helper refuses, so the two lanes can answer in their own idiom. */
+export type Refuse = (status: number, code: string, error: string) => never
+
+class LegacyFitRefusal extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+    this.name = 'LegacyFitRefusal'
+  }
+}
+const legacyRefuse: Refuse = (status, _code, error) => { throw new LegacyFitRefusal(status, error) }
+
+/** A dimension list a principal signed: non empty, sorted by code unit, no duplicates.
+ *  Sorting it here would be a repair after approval, so an unsorted list is refused. */
+function gateDimensionList(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    refuseWrite(400, 'malformed_payload', `${field} must be a non empty array`)
+  }
+  const list = value as unknown[]
+  if (!list.every(x => typeof x === 'string' && x.length > 0)) {
+    refuseWrite(400, 'malformed_payload', `${field} must contain only non empty strings`)
+  }
+  const strings = list as string[]
+  for (let i = 1; i < strings.length; i++) {
+    if (strings[i - 1] === strings[i]) refuseWrite(400, 'malformed_payload', `${field} contains a duplicate`)
+    if (strings[i - 1] > strings[i]) refuseWrite(400, 'malformed_payload', `${field} must be sorted by code unit`)
+  }
+  return strings
+}
+
+function gateHex64(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !HEX64_RE.test(value)) {
+    refuseWrite(400, 'malformed_payload', `${field} must be 64 lowercase hex characters`)
+  }
+  return value as string
+}
+
+/** Exactly these keys, plus optionally these. A field inside payload_digest that the
+ *  server ignores is a field the signature says the principal asked for and the server
+ *  did not honour, so an unknown one is refused rather than dropped. */
+function gatePayloadKeys(payload: Record<string, unknown>, required: string[], optional: string[] = []): void {
+  const present = Object.keys(payload)
+  for (const k of required) {
+    if (!present.includes(k)) refuseWrite(400, 'malformed_payload', `payload is missing ${k}`)
+  }
+  const allowed = new Set([...required, ...optional])
+  const extra = present.filter(k => !allowed.has(k))
+  if (extra.length > 0) refuseWrite(400, 'malformed_payload', `unexpected payload field: ${extra.join(', ')}`)
+}
+
+/** The actor's card and policy, resolved THROUGH the signed commitment rather than
+ *  through a policy_hash the client sent in the clear.
+ *
+ *  An unregistered commitment resolves to nothing and is refused. That is what makes
+ *  policy_commitment a check rather than an opaque string copied into a receipt. */
+function resolvePolicy(hs: handshakeDb.HandshakeRow, actorKey: string, commitment: string): {
+  card: string
+  policyHash: string
+  policy: policyDb.FitPolicy
+} {
+  const card = cardOfKey(hs, actorKey)
+  if (!card) refuseWrite(403, 'not_a_party', 'not a party to this handshake')
+  const resolved = policyHashForCommitment(card as string, commitment)
+  if (resolved === null) {
+    refuseWrite(400, 'policy_commitment_unknown',
+      'this policy commitment was never registered for your card, so the server cannot resolve it')
+  }
+  if (!commitmentIsCurrent(card as string, commitment)) {
+    refuseWrite(400, 'policy_commitment_stale',
+      'this commitment names an older policy version; register a commitment to your current policy')
+  }
+  const policy = policyDb.getPolicyByHash(card as string, resolved as string)
+  if (policy === null) refuseWrite(400, 'policy_commitment_unknown', 'the committed policy version is no longer retained')
+  return { card: card as string, policyHash: resolved as string, policy: policy as policyDb.FitPolicy }
+}
+
+/** Every canonical fit act shares these: the intro accepts a continuation in its current
+ *  state, the handshake exists, and the actor is a party to both. */
+function fitPreamble(ctx: CanonicalContext, wantHandshakeState: handshakeDb.HandshakeRow['state'] | null): {
+  hs: handshakeDb.HandshakeRow
+  introId: string
+  actorKey: string
+} {
+  const introId = ctx.write.envelope.resource.id
+  const actorKey = ctx.write.envelope.actor_key
+  const facts = factsOrRefuse(introId)
+  requireParty(facts, actorKey, 'either', 'only a party to this introduction may act on it')
+  guardState(ctx.write.envelope.operation, facts, ctx.now)
+
+  const hs = handshakeDb.getHandshake(introId)
+  if (!hs) refuseWrite(404, 'no_handshake', 'no handshake for this intro')
+  const row = hs as handshakeDb.HandshakeRow
+  if (!isParty(row, actorKey)) refuseWrite(403, 'not_a_party', 'not a party to this handshake')
+  if (wantHandshakeState !== null && row.state !== wantHandshakeState) {
+    refuseWrite(409, 'handshake_wrong_state', `handshake is ${row.state}, not ${wantHandshakeState}`)
+  }
+  return { hs: row, introId, actorKey }
+}
+
+export interface EvaluationResult {
+  overlapMap: OverlapEntry[]
+  receipt: string
+  receiptDigest: string
+  receiptContent: Record<string, unknown>
+}
+
+/** The evaluation, the activity ledger and the receipt, shared by both lanes.
+ *
+ *  Extracted rather than duplicated. Two copies of a predicate evaluation would be two
+ *  places for the disclosure rules to drift, and the drift would show as one lane
+ *  disclosing more than the other. Only the refusal mechanism differs, and each lane
+ *  supplies its own. */
+function evaluateAndReceipt(args: {
+  hs: handshakeDb.HandshakeRow
+  actorKey: string
+  introId: string
+  committerCard: string
+  comPolicyHash: string
+  accept: string[]
+  comReciprocal: string[]
+  autonomous: boolean
+  refuse: Refuse
+}): EvaluationResult {
+  const { hs, actorKey, introId, committerCard, comPolicyHash, accept, comReciprocal, autonomous, refuse } = args
+  const requesterCard = cardOfKey(hs, hs.requester_key!)!
+  const policyReq = dimMapFor(requesterCard, hs.req_policy_hash!, hs.intent)
+  const policyCom = dimMapFor(committerCard, comPolicyHash, hs.intent)
+  const requested: string[] = JSON.parse(hs.requested_json || '[]')
+  const reqReciprocal: string[] = JSON.parse(hs.req_reciprocal_json || '[]')
+
+  const dims = selectEvaluableDimensions(requested, accept, reqReciprocal, comReciprocal, policyReq, policyCom)
+
+  // Anti-narrowing: consume budget per (principal pair, dimension). A dimension over its
+  // lifetime cap is refused, not re-evaluated.
+  const pairKey = handshakeDb.principalPairKey(hs.key_a, hs.key_b)
+  const budgetBlocked = new Set<string>()
+  for (const dim of dims) {
+    if (!handshakeDb.budgetConsume(pairKey, dim).allowed) budgetBlocked.add(dim)
+  }
+
+  // Graduated autonomy: when the committer commits under a standing scope with no fresh
+  // human tap, every disclosed dimension must fall within the scope's tier. Anything
+  // above it, or high-sensitivity, or exact, is refused and must be committed by a human.
+  if (autonomous) {
+    for (const dim of dims) {
+      const a = policyReq.get(dim), b = policyCom.get(dim)
+      if (!a || !b || budgetBlocked.has(dim)) continue
+      const eff = levelName(a, b) as any
+      if (!autonomyDb.autonomyPermitsDisclosure(committerCard, hs.intent, dim, eff, b.sensitivity)) {
+        refuse(403, 'outside_autonomy_scope',
+          `dimension "${dim}" is outside your autonomy scope (or too sensitive, or exact); commit it without autonomous:true so the principal approves it`)
+      }
+    }
+  }
+
+  const facts = evaluateHandshake(dims, policyReq, policyCom, budgetBlocked)
+  const compl = complementarityEntry(dims, policyReq, policyCom)
+  const overlapMap = compl ? [...facts, compl] : facts
+
+  // Legible activity: record what the committer's agent disclosed, so a truthful
+  // "while you were away" summary can be shown later.
+  autonomyDb.recordActivity(actorKey, introId, 'evaluated', null, otherKey(hs, actorKey), autonomous)
+  for (const e of overlapMap) {
+    if (e.dimension === 'complementarity') continue
+    if (e.result === 'overlap') autonomyDb.recordActivity(actorKey, introId, 'overlap_disclosed', e.dimension, otherKey(hs, actorKey), autonomous)
+    else if (e.result === 'bucket' || e.result === 'exact_available') autonomyDb.recordActivity(actorKey, introId, 'bucket_disclosed', e.dimension, otherKey(hs, actorKey), autonomous)
+  }
+
+  // Receipt: binds both policy hashes, requested predicates, purpose, each authorized
+  // disclosure level, outcome, expiry. Attests authorization only. Step 13 replaces the
+  // two policy hashes with the two commitments and the `proves` string with a rendered
+  // sentence, for both lanes at once.
+  const disclosures = dims.filter(dd => policyReq.get(dd) && policyCom.get(dd))
+    .map(dd => ({ dimension: dd, level: levelName(policyReq.get(dd)!, policyCom.get(dd)!) }))
+  const receiptContent = {
+    intro_id: introId, purpose: hs.intent, predicate_version: PREDICATE_VERSION,
+    policy_hash_a: hs.req_policy_hash, policy_hash_b: comPolicyHash,
+    requested_predicates: dims,
+    disclosures,
+    outcome: overlapMap.map((e: OverlapEntry) => ({ dimension: e.dimension, result: e.result })),
+    expiry: hs.expires_at,
+    proves: 'Each party authorized the listed dimensions at the listed disclosure levels under their stated policy hash, for the stated purpose. This attests authorization, not the truth of any value.',
+  }
+  const receiptDigest = createHash('sha256').update(canonicalize(receiptContent), 'utf8').digest('hex')
+  return { overlapMap, receipt: signReceipt(receiptDigest), receiptDigest, receiptContent }
+}
+
+// ── fit_request, canonical ────────────────────────────────────────────────
+
+const canonicalFitRequest = canonicalWriteRoute({
+  operations: ['fit_request'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload,
+      ['requested_dimensions', 'reciprocal_offer', 'predicate_version', 'policy_commitment', 'query_budget'])
+
+    const requested = gateDimensionList(write.payload.requested_dimensions, 'requested_dimensions')
+    // NOT defaulted. fit-v4-routes.ts:153 falls back to requested_dimensions AFTER
+    // verification and :154 coerces, floors and clamps the budget, so both end up inside a
+    // receipt as fields no principal signed.
+    const reciprocal = gateDimensionList(write.payload.reciprocal_offer, 'reciprocal_offer')
+    const commitment = gateHex64(write.payload.policy_commitment, 'policy_commitment')
+    if (write.payload.predicate_version !== PREDICATE_VERSION) {
+      refuseWrite(400, 'malformed_payload', `predicate_version must be ${PREDICATE_VERSION}`)
+    }
+    const budget = write.payload.query_budget
+    if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1 || budget > MAX_QUERY_BUDGET) {
+      refuseWrite(400, 'malformed_payload', `query_budget must be an integer from 1 to ${MAX_QUERY_BUDGET}`)
+    }
+
+    // A GAP IN THE CANONICAL LANE, closed here. Today the handshake is opened as a side
+    // effect of the legacy accept at intros-routes.ts:120, and canonical express_interest
+    // deliberately does none of that: it writes one authorization and a timestamp, as
+    // decided. So on the canonical lane nothing would ever open a handshake and fit_request
+    // would answer no_handshake forever.
+    //
+    // Opening it here rather than widening express_interest keeps express_interest minimal
+    // as decided, and it matches what section 14.1 already says: the first fit action is
+    // what moves the pair to connecting. The predicate is unchanged, so a pair that could
+    // not open a handshake through the legacy accept cannot open one through this either.
+    const introIdEarly = write.envelope.resource.id
+    if (!handshakeDb.existsHandshakeForIntro(introIdEarly)) {
+      const row = introsDb.getIntro(introIdEarly)
+      if (row === null) refuseWrite(404, 'intro_not_found', 'no such introduction')
+      if (openV4HandshakeForIntro(row as IntroRow) === null) {
+        refuseWrite(409, 'no_handshake_possible',
+          'a fit handshake needs both cards to carry a Fit Policy for this intro\'s intent')
+      }
+    }
+
+    const { hs, introId, actorKey } = fitPreamble(ctx, 'open')
+    const resolved = resolvePolicy(hs, actorKey, commitment)
+    const permitted = new Set(policyDb.dimensionsForIntent(resolved.policy, hs.intent).map(x => x.dimension))
+    for (const dim of requested) {
+      if (!permitted.has(dim)) {
+        refuseWrite(400, 'dimension_not_in_policy', `dimension "${dim}" is not in your policy for intent ${hs.intent}`)
+      }
+    }
+
+    handshakeDb.setRequest(introId, actorKey, requested, reciprocal, resolved.policyHash, budget as number)
+    const evidenceId = recordCanonicalEvidence(write)
+    recordAuthorization({ introId, actorKey, operation: 'fit_request', evidenceId, evidence: 'canonical' })
+    recordCardEvent('handshake_requested', resolved.card, actorKey,
+      { intro_id: introId, intent: hs.intent, dimensions: requested.length, canonical: true })
+    const state = materializeStatus(introId, now)
+    return {
+      intro_id: introId, state, handshake_state: 'requested',
+      requested_dimensions: requested, reciprocal_offer: reciprocal, query_budget: budget,
+      note: 'Nothing is evaluated until the counterparty commits to the same dimensions with matching reciprocity.',
+    }
+  },
+})
+
+// ── fit_commit, canonical ─────────────────────────────────────────────────
+
+const canonicalFitCommit = canonicalWriteRoute({
+  operations: ['fit_commit'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload,
+      ['accept_dimensions', 'reciprocal_offer', 'policy_commitment', 'request_write_ref'],
+      ['standing_scope_commitment'])
+    const accept = gateDimensionList(write.payload.accept_dimensions, 'accept_dimensions')
+    const comReciprocal = gateDimensionList(write.payload.reciprocal_offer, 'reciprocal_offer')
+    const commitment = gateHex64(write.payload.policy_commitment, 'policy_commitment')
+    const requestRef = gateHex64(write.payload.request_write_ref, 'request_write_ref')
+
+    const { hs, introId, actorKey } = fitPreamble(ctx, 'requested')
+    // The role check, which is what makes this action's actor distinct from fit_request's.
+    if (actorKey === hs.requester_key) {
+      refuseWrite(403, 'requester_cannot_commit', 'the requester cannot also commit; the counterparty commits')
+    }
+    if (Date.parse(hs.expires_at) <= now.getTime()) {
+      refuseWrite(409, 'handshake_expired', 'handshake window expired')
+    }
+
+    // request_write_ref names the exact fit_request envelope this commit answers, so a
+    // commit cannot be applied to a different request than the one the principal saw.
+    // Today nothing ties the two acts together beyond the intro id and the stored state.
+    const answeredRef = writeRefOfAuthorization(introId, hs.requester_key!, 'fit_request')
+    if (answeredRef === null) {
+      refuseWrite(409, 'request_not_canonical',
+        'the request on this handshake was not canonically signed, so there is no write_ref to answer')
+    }
+    if (answeredRef !== requestRef) {
+      refuseWrite(409, 'request_write_ref_mismatch', 'request_write_ref does not name the request on this handshake')
+    }
+
+    const resolved = resolvePolicy(hs, actorKey, commitment)
+    const comPermitted = new Set(policyDb.dimensionsForIntent(resolved.policy, hs.intent).map(x => x.dimension))
+    for (const dim of accept) {
+      if (!comPermitted.has(dim)) {
+        refuseWrite(400, 'dimension_not_in_policy', `dimension "${dim}" is not in your policy for intent ${hs.intent}`)
+      }
+    }
+
+    // A SIGNED scope reference, not an unsigned boolean. Today `autonomous` is a body field
+    // the server reads and it alone decides whether the graduated checks run, and no
+    // published client even sends it. Here the field is inside payload_digest and it must
+    // name a scope the principal actually signed.
+    const scopeCommitment = write.payload.standing_scope_commitment
+    let autonomous = false
+    if (scopeCommitment !== undefined) {
+      const named = gateHex64(scopeCommitment, 'standing_scope_commitment')
+      const scope = autonomyDb.getScope(resolved.card)
+      if (scope === null || scope.scope_hash !== named) {
+        refuseWrite(400, 'standing_scope_unknown',
+          'standing_scope_commitment does not name a standing scope registered for your card')
+      }
+      if ((scope as autonomyDb.StoredScope).paused) {
+        refuseWrite(403, 'autonomy_paused', 'autonomous commits are paused for this card')
+      }
+      autonomous = true
+    }
+
+    const evaluated = evaluateAndReceipt({
+      hs, actorKey, introId, committerCard: resolved.card, comPolicyHash: resolved.policyHash,
+      accept, comReciprocal, autonomous, refuse: refuseWrite,
+    })
+    handshakeDb.setCommitResult(introId, actorKey, accept, comReciprocal, resolved.policyHash,
+      JSON.stringify(evaluated.overlapMap), evaluated.receipt, evaluated.receiptDigest,
+      JSON.stringify(evaluated.receiptContent))
+    const evidenceId = recordCanonicalEvidence(write)
+    recordAuthorization({ introId, actorKey, operation: 'fit_commit', evidenceId, evidence: 'canonical' })
+    recordCardEvent('handshake_committed', resolved.card, actorKey,
+      { intro_id: introId, intent: hs.intent, dimensions: accept.length, receipt_digest: evaluated.receiptDigest, canonical: true })
+    const state = materializeStatus(introId, now)
+    return {
+      intro_id: introId, state, handshake_state: 'committed',
+      overlap_map: evaluated.overlapMap, receipt: evaluated.receipt,
+      receipt_digest: evaluated.receiptDigest, receipt_content: evaluated.receiptContent,
+      server_public_key: serverPublicKey(),
+      authorized_under_standing_scope: autonomous,
+    }
+  },
+})
+
+// ── release_exact, canonical ──────────────────────────────────────────────
+
+const canonicalReleaseExact = canonicalWriteRoute({
+  operations: ['release_exact'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['dimension', 'policy_commitment', 'private_value_commitment'])
+    const dimension = write.payload.dimension
+    if (typeof dimension !== 'string' || dimension.length === 0) {
+      refuseWrite(400, 'malformed_payload', 'dimension must be a non empty string')
+    }
+    const commitment = gateHex64(write.payload.policy_commitment, 'policy_commitment')
+    gateHex64(write.payload.private_value_commitment, 'private_value_commitment')
+    const dim = dimension as string
+
+    const { hs, introId, actorKey } = fitPreamble(ctx, 'committed')
+    const resolved = resolvePolicy(hs, actorKey, commitment)
+
+    // CHECK ONE already ran, in step 7 of the pipeline: the opening recomputed to
+    // private_value_commitment. So by here the value is the value the principal committed
+    // to, and the remaining question is whether the policy permits releasing it.
+    //
+    // CHECK TWO, and the direction is the point. The signed commitment is the
+    // AUTHORIZATION and the stored policy is the PERMISSION, so a mismatch is an error and
+    // never a substitution. Today the value is pinned instead: dimMapFor at
+    // fit-v4-routes.ts:304 returns whatever the stored policy holds at the moment the
+    // request lands, so a policy edited between commit and reveal changes what the same
+    // signature releases.
+    const own = new Map(policyDb.dimensionsForIntent(resolved.policy, hs.intent).map(x => [x.dimension, x]))
+      .get(dim)
+    if (!own || own.disclosure_state !== 'reveal_exact') {
+      refuseWrite(403, 'dimension_not_releasable', 'this dimension is not authorized for exact release by you')
+    }
+    const opened = write.opening!.value
+    if (jcs(opened) !== jcs((own as policyDb.PolicyDimension).value)) {
+      refuseWrite(409, 'value_not_in_policy',
+        'the value you signed is not the value your stored policy holds for this dimension; re-read your policy and re-approve')
+    }
+
+    const added = handshakeDb.releaseExact(introId, dim, actorKey)
+    if (added) autonomyDb.recordActivity(actorKey, introId, 'exact_released', dim, otherKey(hs, actorKey), false)
+    const evidenceId = recordCanonicalEvidence(write)
+    // `subject` carries the dimension, which is why that column exists: one actor can hold
+    // many live release_exact authorizations on one intro and exactly one share_contact.
+    recordAuthorization({ introId, actorKey, operation: 'release_exact', subject: dim, evidenceId, evidence: 'canonical' })
+    writeArtifact({ write, introId, recipientKey: otherKey(hs, actorKey), subject: dim })
+    const state = materializeStatus(introId, now)
+    // Release is one way. There is no withdraw_release and there must not be, by the same
+    // decision that governs contacts.
+    return { intro_id: introId, state, revealed: dim, added }
+  },
+})
+
+// ── first_step_propose, canonical ─────────────────────────────────────────
+
+const canonicalFirstStepPropose = canonicalWriteRoute({
+  operations: ['first_step_propose'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    // The payload IS the half, field for field, in the shape validateHalf accepts. So
+    // payload_digest covers every text field and the expiry, where today the preimage is
+    // fit-firststep:${introId}:${nonce} and the entire half is unbound.
+    const v = firstStepDb.validateHalf(write.payload)
+    if (!v.ok || !v.half) refuseWrite(400, 'malformed_half', v.error ?? 'invalid half')
+    const gate = postGateDrafted((v.texts ?? []).map((t, i) => ({ question_id: String(i), text: t })))
+    if (!gate.ok) refuseWrite(400, 'content_refused', `first-step content refused: ${gate.reason}`)
+    // The URL strip is computed at fit-v4-routes.ts:525 and then DISCARDED, so URLs survive
+    // there where the sibling answers route strips them. On this lane a half whose text
+    // changes under stripUrls is refused rather than quietly kept, because the client
+    // showed and signed these exact bytes.
+    for (const t of v.texts ?? []) {
+      if (introsDb.containsUrl(t)) {
+        refuseWrite(400, 'half_contains_link', 'a First Step half may not contain a link, and Mingle does not rewrite one for you')
+      }
+    }
+
+    const { hs, introId, actorKey } = fitPreamble(ctx, null)
+    // proposeHalf resets both approvals whenever either half changes, which is the right
+    // behavior and is kept.
+    firstStepDb.proposeHalf(introId, actorKey === hs.key_a, actorKey, v.half)
+    const evidenceId = recordCanonicalEvidence(write)
+    recordAuthorization({ introId, actorKey, operation: 'first_step_propose', evidenceId, evidence: 'canonical' })
+    recordCardEvent('first_step_proposed', cardOfKey(hs, actorKey), actorKey, { intro_id: introId, canonical: true })
+    const row = firstStepDb.getFirstStep(introId)!
+    const state = materializeStatus(introId, now)
+    return {
+      intro_id: introId, state, proposed: true,
+      both_proposed: !!row.half_a_json && !!row.half_b_json,
+      shared_digest: firstStepDb.sharedDigest(row),
+    }
+  },
+  afterCommit: async ctx => {
+    const introId = ctx.write.envelope.resource.id
+    const hs = handshakeDb.getHandshake(introId)
+    if (!hs) return
+    await email.notifyFirstStepProposed(otherKey(hs, ctx.write.envelope.actor_key), introId)
+  },
+})
+
+// ── first_step_approve, canonical ─────────────────────────────────────────
+
+const canonicalFirstStepApprove = canonicalWriteRoute({
+  operations: ['first_step_approve'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['approved_digest'])
+    const approvedDigest = gateHex64(write.payload.approved_digest, 'approved_digest')
+
+    const { hs, introId, actorKey } = fitPreamble(ctx, null)
+    // The read, the compare and the write are all inside this transaction. Lines 550 to 553
+    // of the legacy branch read the digest, compare, then write with no transaction and no
+    // await between them. That is safe today only because Node is single threaded and
+    // better-sqlite3 is synchronous, so nothing interleaves inside one process. It stops
+    // being safe the moment two processes share the database file.
+    const row = firstStepDb.getFirstStep(introId)
+    if (!row || !row.half_a_json || !row.half_b_json) {
+      refuseWrite(409, 'halves_incomplete', 'both sides must propose a half before either can approve the shared artifact')
+    }
+    const digest = firstStepDb.sharedDigest(row!)
+    if (digest !== approvedDigest) {
+      refuseWrite(409, 'digest_changed',
+        'approved_digest does not match the current shared artifact; re-read and re-approve')
+    }
+    firstStepDb.approve(introId, actorKey === hs.key_a)
+    const fresh = firstStepDb.getFirstStep(introId)!
+    const finalized = firstStepDb.isFinalized(fresh)
+    const evidenceId = recordCanonicalEvidence(write)
+    recordAuthorization({ introId, actorKey, operation: 'first_step_approve', evidenceId, evidence: 'canonical' })
+    recordCardEvent('first_step_approved', cardOfKey(hs, actorKey), actorKey,
+      { intro_id: introId, approved_digest: approvedDigest, finalized, canonical: true })
+    const state = materializeStatus(introId, now)
+    return { intro_id: introId, state, approved: true, finalized }
+  },
+})
+
 // ── POST /:introId/request - the signed Fit Request Manifest ──────────────
 
-router.post('/:introId/request', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/request', fitGate, canonicalDispatch(canonicalFitRequest), rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { requested_dimensions, reciprocal_offer, predicate_version, policy_hash, query_budget, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(requested_dimensions) || requested_dimensions.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'requested_dimensions and nonce required' }); return }
@@ -150,16 +685,30 @@ router.post('/:introId/request', fitGate, rateLimited('fitv4_hs', 30), (req, res
   for (const dim of requested_dimensions) {
     if (!permitted.has(dim)) { res.status(400).json({ error: `dimension "${dim}" is not in your policy for intent ${hs.intent}` }); return }
   }
+  const legacyGate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyGate !== null) { refuseLegacy(res, 'fit_request', introId, legacyGate); return }
+
+  // Today's defaulting, unchanged: the reciprocal offer falls back to
+  // requested_dimensions after verification and the budget is coerced, floored and clamped.
+  // Both are fields no principal signed, which is exactly what bound_fields_json records
+  // by naming only intro_id.
   const reciprocal = Array.isArray(reciprocal_offer) ? reciprocal_offer : requested_dimensions
   const budget = Math.min(Math.max(1, Number(query_budget) || 3), MAX_QUERY_BUDGET)
-  handshakeDb.setRequest(introId, public_key, requested_dimensions, reciprocal, policy_hash, budget)
-  recordCardEvent('handshake_requested', card, public_key, { intro_id: introId, intent: hs.intent, dimensions: requested_dimensions.length })
+  getDb().transaction(() => {
+    handshakeDb.setRequest(introId, public_key, requested_dimensions, reciprocal, policy_hash, budget)
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'fit_request', resourceType: 'intro', resourceId: introId, signature,
+    })
+    recordAuthorization({ introId, actorKey: public_key, operation: 'fit_request', evidenceId, evidence: 'legacy_unbound' })
+    recordAuthMode('intro', introId, public_key, 'legacy_unbound')
+    recordCardEvent('handshake_requested', card, public_key, { intro_id: introId, intent: hs.intent, dimensions: requested_dimensions.length })
+  })()
   res.status(201).json({ state: 'requested', requested_dimensions, note: 'Nothing is evaluated until the counterparty commits to the same dimensions with matching reciprocity.' })
 })
 
 // ── POST /:introId/commit - reciprocity gate; evaluate on mutual commit ───
 
-router.post('/:introId/commit', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/commit', fitGate, canonicalDispatch(canonicalFitCommit), rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { accept_dimensions, reciprocal_offer, policy_hash, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(accept_dimensions) || typeof nonce !== 'string') { res.status(400).json({ error: 'accept_dimensions and nonce required' }); return }
@@ -179,70 +728,50 @@ router.post('/:introId/commit', fitGate, rateLimited('fitv4_hs', 30), (req, res)
     if (!comPermitted.has(dim)) { res.status(400).json({ error: `dimension "${dim}" is not in your policy for intent ${hs.intent}` }); return }
   }
 
-  const requesterCard = cardOfKey(hs, hs.requester_key!)!
-  const policyReq = dimMapFor(requesterCard, hs.req_policy_hash!, hs.intent)
-  const policyCom = dimMapFor(committerCard, policy_hash, hs.intent)
-  const requested: string[] = JSON.parse(hs.requested_json || '[]')
-  const reqReciprocal: string[] = JSON.parse(hs.req_reciprocal_json || '[]')
   const comReciprocal: string[] = Array.isArray(reciprocal_offer) ? reciprocal_offer : accept_dimensions
 
-  const dims = selectEvaluableDimensions(requested, accept_dimensions, reqReciprocal, comReciprocal, policyReq, policyCom)
+  // The cutoff and anti-downgrade, after every authorization check so an unauthorized
+  // caller learns nothing about either.
+  const gate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (gate !== null) { refuseLegacy(res, 'fit_commit', introId, gate); return }
 
-  // Anti-narrowing: consume budget per (principal pair, dimension). A dimension
-  // over its lifetime cap is refused, not re-evaluated.
-  const pairKey = handshakeDb.principalPairKey(hs.key_a, hs.key_b)
-  const budgetBlocked = new Set<string>()
-  for (const dim of dims) {
-    if (!handshakeDb.budgetConsume(pairKey, dim).allowed) budgetBlocked.add(dim)
+  // The evaluation, the activity ledger and the receipt now come from one shared
+  // function, called with exactly what this branch computed before: the reciprocal
+  // fallback to accept_dimensions, and the unsigned `autonomous` boolean. So this lane's
+  // behavior is unchanged, and the two lanes cannot drift on the disclosure rules.
+  let evaluated: EvaluationResult
+  try {
+    evaluated = evaluateAndReceipt({
+      hs, actorKey: public_key, introId, committerCard, comPolicyHash: policy_hash,
+      accept: accept_dimensions, comReciprocal, autonomous: req.body?.autonomous === true,
+      refuse: legacyRefuse,
+    })
+  } catch (e) {
+    if (e instanceof LegacyFitRefusal) { res.status(e.status).json({ error: e.message }); return }
+    throw e
   }
 
-  // Graduated autonomy: when the committer commits autonomously (under a standing
-  // scope, no fresh human tap), every disclosed dimension must fall within the
-  // scope's tier. Anything above it, or high-sensitivity, or exact, is refused
-  // and must be committed by a human. A pause halts all autonomous commits.
-  const autonomous = req.body?.autonomous === true
-  if (autonomous) {
-    for (const dim of dims) {
-      const a = policyReq.get(dim), b = policyCom.get(dim)
-      if (!a || !b || budgetBlocked.has(dim)) continue
-      const eff = levelName(a, b) as any
-      if (!autonomyDb.autonomyPermitsDisclosure(committerCard, hs.intent, dim, eff, b.sensitivity)) {
-        res.status(403).json({ error: `dimension "${dim}" is outside your autonomy scope (or too sensitive, or exact); commit it without autonomous:true so the principal approves it` }); return
-      }
-    }
-  }
-
-  const facts = evaluateHandshake(dims, policyReq, policyCom, budgetBlocked)
-  const compl = complementarityEntry(dims, policyReq, policyCom)
-  const overlap_map = compl ? [...facts, compl] : facts
-
-  // Legible activity: record what the committer's agent disclosed, so a truthful
-  // "while you were away" summary can be shown later.
-  autonomyDb.recordActivity(public_key, introId, 'evaluated', null, otherKey(hs, public_key), autonomous)
-  for (const e of overlap_map) {
-    if (e.dimension === 'complementarity') continue
-    if (e.result === 'overlap') autonomyDb.recordActivity(public_key, introId, 'overlap_disclosed', e.dimension, otherKey(hs, public_key), autonomous)
-    else if (e.result === 'bucket' || e.result === 'exact_available') autonomyDb.recordActivity(public_key, introId, 'bucket_disclosed', e.dimension, otherKey(hs, public_key), autonomous)
-  }
-
-  // Receipt: binds both policy hashes, requested predicates, purpose, each
-  // authorized disclosure level, outcome, expiry. Attests authorization only.
-  const disclosures = dims.filter(d => policyReq.get(d) && policyCom.get(d)).map(d => ({ dimension: d, level: levelName(policyReq.get(d)!, policyCom.get(d)!) }))
-  const receiptContent = {
-    intro_id: introId, purpose: hs.intent, predicate_version: PREDICATE_VERSION,
-    policy_hash_a: hs.req_policy_hash, policy_hash_b: policy_hash,
-    requested_predicates: dims,
-    disclosures,
-    outcome: overlap_map.map((e: OverlapEntry) => ({ dimension: e.dimension, result: e.result })),
-    expiry: hs.expires_at,
-    proves: 'Each party authorized the listed dimensions at the listed disclosure levels under their stated policy hash, for the stated purpose. This attests authorization, not the truth of any value.',
-  }
-  const receiptDigest = createHash('sha256').update(canonicalize(receiptContent), 'utf8').digest('hex')
-  const receipt = signReceipt(receiptDigest)
-
-  handshakeDb.setCommitResult(introId, public_key, accept_dimensions, comReciprocal, policy_hash, JSON.stringify(overlap_map), receipt, receiptDigest, JSON.stringify(receiptContent))
-  recordCardEvent('handshake_committed', cardOfKey(hs, public_key), public_key, { intro_id: introId, intent: hs.intent, dimensions: accept_dimensions.length, receipt_digest: receiptDigest })
-  res.json({ state: 'committed', overlap_map, receipt, receipt_digest: receiptDigest, receipt_content: receiptContent, server_public_key: serverPublicKey() })
+  getDb().transaction(() => {
+    handshakeDb.setCommitResult(introId, public_key, accept_dimensions, comReciprocal, policy_hash,
+      JSON.stringify(evaluated.overlapMap), evaluated.receipt, evaluated.receiptDigest,
+      JSON.stringify(evaluated.receiptContent))
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'fit_commit', resourceType: 'intro', resourceId: introId, signature,
+    })
+    // bound_fields_json is ["intro_id"] and nothing else. The preimage is
+    // fit-commit:${introId}:${nonce}, so the dimensions, the reciprocal offer and the
+    // policy hash are all unbound, and no receipt may name them as authorized content.
+    // Whether the act was autonomous is established by nothing at all on this lane.
+    recordAuthorization({ introId, actorKey: public_key, operation: 'fit_commit', evidenceId, evidence: 'legacy_unbound' })
+    recordAuthMode('intro', introId, public_key, 'legacy_unbound')
+    recordCardEvent('handshake_committed', committerCard, public_key,
+      { intro_id: introId, intent: hs.intent, dimensions: accept_dimensions.length, receipt_digest: evaluated.receiptDigest })
+  })()
+  res.json({
+    state: 'committed', overlap_map: evaluated.overlapMap, receipt: evaluated.receipt,
+    receipt_digest: evaluated.receiptDigest, receipt_content: evaluated.receiptContent,
+    server_public_key: serverPublicKey(),
+  })
 })
 
 // ── GET /:introId (parties only) ──────────────────────────────────────────
@@ -288,7 +817,7 @@ router.get('/:introId', rateLimited('fitv4_get', 60), (req, res) => {
 
 // ── POST /:introId/reveal - human-tap exact release (state 5) ──────────────
 
-router.post('/:introId/reveal', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/reveal', fitGate, canonicalDispatch(canonicalReleaseExact), rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { dimension, public_key, nonce, signature } = req.body ?? {}
   if (typeof dimension !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'dimension and nonce required' }); return }
@@ -304,6 +833,10 @@ router.post('/:introId/reveal', fitGate, rateLimited('fitv4_hs', 30), (req, res)
   const ownMap = dimMapFor(ownerCard, ownerHash, hs.intent)
   const own = ownMap.get(dimension)
   if (!own || own.disclosure_state !== 'reveal_exact') { res.status(403).json({ error: 'this dimension is not authorized for exact release by you' }); return }
+
+  const legacyGate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyGate !== null) { refuseLegacy(res, 'release_exact', introId, legacyGate); return }
+
   // The release and its ledger row commit together or not at all, so a failed
   // ledger write never leaves a release the ledger does not show. Only the
   // caller's own release is recorded, and only the first time. A repeat tap
@@ -312,6 +845,20 @@ router.post('/:introId/reveal', fitGate, rateLimited('fitv4_hs', 30), (req, res)
     if (handshakeDb.releaseExact(introId, dimension, public_key)) {
       autonomyDb.recordActivity(public_key, introId, 'exact_released', dimension, otherKey(hs, public_key), false)
     }
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'release_exact', resourceType: 'intro', resourceId: introId, signature,
+    })
+    // The strongest of the five legacy fit preimages, because it binds the dimension:
+    // fit-reveal:${introId}:${dimension}:${nonce}, so bound_fields_json is
+    // ["intro_id","dimension"]. It still omits the value and the policy the value is read
+    // from, so the value released is whichever one dimMapFor returns when the request
+    // lands. No artifact is written, because a legacy act has no opening to write.
+    recordAuthorization({ introId, actorKey: public_key, operation: 'release_exact', subject: dimension, evidenceId, evidence: 'legacy_unbound' })
+    // Keyed on the intro and not the dimension, which is coarser than the action: an actor
+    // who released one dimension canonically cannot release a second by the legacy route.
+    // Stricter than necessary and the right direction, because the alternative is a per
+    // dimension mode table that lets one actor hold two authorization strengths on one intro.
+    recordAuthMode('intro', introId, public_key, 'legacy_unbound')
   })()
   res.json({ revealed: dimension })
 })
@@ -511,7 +1058,7 @@ router.get('/:introId/qa', rateLimited('fitv4_get', 60), (req, res) => {
 
 // ── POST /:introId/first-step - propose your own half ─────────────────────
 
-router.post('/:introId/first-step', fitGate, rateLimited('fitv4_hs', 30), async (req, res) => {
+router.post('/:introId/first-step', fitGate, canonicalDispatch(canonicalFirstStepPropose), rateLimited('fitv4_hs', 30), asyncRoute(async (req, res) => {
   const introId = String(req.params.introId)
   const { half, public_key, nonce, signature } = req.body ?? {}
   if (typeof nonce !== 'string') { res.status(400).json({ error: 'nonce required' }); return }
@@ -525,18 +1072,31 @@ router.post('/:introId/first-step', fitGate, rateLimited('fitv4_hs', 30), async 
   const gate = postGateDrafted((v.texts ?? []).map((t, i) => ({ question_id: String(i), text: t })))
   if (!gate.ok) { res.status(400).json({ error: `first-step content refused: ${gate.reason}` }); return }
 
+  const legacyGate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyGate !== null) { refuseLegacy(res, 'first_step_propose', introId, legacyGate); return }
+
   const isA = public_key === hs.key_a
-  firstStepDb.proposeHalf(introId, isA, public_key, v.half)
-  recordCardEvent('first_step_proposed', cardOfKey(hs, public_key), public_key, { intro_id: introId })
+  getDb().transaction(() => {
+    firstStepDb.proposeHalf(introId, isA, public_key, v.half!)
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'first_step_propose', resourceType: 'intro', resourceId: introId, signature,
+    })
+    // bound_fields_json is ["intro_id"]. The preimage is fit-firststep:${introId}:${nonce},
+    // so no receipt may name any field of the half. The discarded URL strip at :525 stays
+    // discarded here, because tightening a legacy route gains no evidence.
+    recordAuthorization({ introId, actorKey: public_key, operation: 'first_step_propose', evidenceId, evidence: 'legacy_unbound' })
+    recordAuthMode('intro', introId, public_key, 'legacy_unbound')
+    recordCardEvent('first_step_proposed', cardOfKey(hs, public_key), public_key, { intro_id: introId })
+  })()
   try { await email.notifyFirstStepProposed(otherKey(hs, public_key), introId) } catch { /* email never blocks proposal */ }
 
   const row = firstStepDb.getFirstStep(introId)!
   res.status(201).json({ proposed: true, both_proposed: !!row.half_a_json && !!row.half_b_json, shared_digest: firstStepDb.sharedDigest(row) })
-})
+}))
 
 // ── POST /:introId/first-step/approve - approve the merged shared artifact ─
 
-router.post('/:introId/first-step/approve', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
+router.post('/:introId/first-step/approve', fitGate, canonicalDispatch(canonicalFirstStepApprove), rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { approved_digest, public_key, nonce, signature } = req.body ?? {}
   if (typeof approved_digest !== 'string' || typeof nonce !== 'string') { res.status(400).json({ error: 'approved_digest and nonce required' }); return }
@@ -545,16 +1105,38 @@ router.post('/:introId/first-step/approve', fitGate, rateLimited('fitv4_hs', 30)
   if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
   if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
 
-  const row = firstStepDb.getFirstStep(introId)
-  if (!row || !row.half_a_json || !row.half_b_json) { res.status(409).json({ error: 'both sides must propose a half before either can approve the shared artifact' }); return }
-  const digest = firstStepDb.sharedDigest(row)
-  if (digest !== approved_digest) { res.status(400).json({ error: 'approved_digest does not match the current shared artifact; re-read and re-approve' }); return }
+  const legacyGate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyGate !== null) { refuseLegacy(res, 'first_step_approve', introId, legacyGate); return }
 
-  firstStepDb.approve(introId, public_key === hs.key_a)
-  const fresh = firstStepDb.getFirstStep(introId)!
-  const finalized = firstStepDb.isFinalized(fresh)
-  recordCardEvent('first_step_approved', cardOfKey(hs, public_key), public_key, { intro_id: introId, approved_digest, finalized })
-  res.json({ approved: true, finalized })
+  // The read, the compare and the write in one transaction, closing the same read compare
+  // write race the canonical branch closes. Today lines 550 to 553 do all three with no
+  // transaction between them, which is safe only while one process owns the database file.
+  // The refusals keep their exact status codes and messages, so the response is unchanged.
+  const outcome = getDb().transaction((): { status: number; body: Record<string, unknown> } => {
+    const row = firstStepDb.getFirstStep(introId)
+    if (!row || !row.half_a_json || !row.half_b_json) {
+      return { status: 409, body: { error: 'both sides must propose a half before either can approve the shared artifact' } }
+    }
+    const digest = firstStepDb.sharedDigest(row)
+    if (digest !== approved_digest) {
+      return { status: 400, body: { error: 'approved_digest does not match the current shared artifact; re-read and re-approve' } }
+    }
+    firstStepDb.approve(introId, public_key === hs.key_a)
+    const fresh = firstStepDb.getFirstStep(introId)!
+    const finalized = firstStepDb.isFinalized(fresh)
+    const evidenceId = recordLegacyEvidence({
+      actorKey: public_key, operation: 'first_step_approve', resourceType: 'intro', resourceId: introId, signature,
+    })
+    // The one fit action whose legacy signature covers its whole semantic content:
+    // fit-firststep-approve:${introId}:${digest}:${nonce} binds the digest, so
+    // bound_fields_json is ["intro_id","approved_digest"] and this legacy evidence is as
+    // strong as its canonical counterpart for the approval clause.
+    recordAuthorization({ introId, actorKey: public_key, operation: 'first_step_approve', evidenceId, evidence: 'legacy_unbound' })
+    recordAuthMode('intro', introId, public_key, 'legacy_unbound')
+    recordCardEvent('first_step_approved', cardOfKey(hs, public_key), public_key, { intro_id: introId, approved_digest, finalized })
+    return { status: 200, body: { approved: true, finalized } }
+  })()
+  res.status(outcome.status).json(outcome.body)
 })
 
 // ── GET /:introId/first-step (parties only) ───────────────────────────────

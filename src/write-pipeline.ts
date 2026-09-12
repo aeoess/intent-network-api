@@ -214,7 +214,10 @@ export function hasEnvelope(body: unknown): boolean {
 export function canonicalDispatch(canonical: (req: Request, res: Response) => Promise<void>) {
   return async (req: Request, res: Response, next: (err?: unknown) => void): Promise<void> => {
     if (!hasEnvelope(req.body)) { next(); return }
-    const pathId = (req.params as any)?.id
+    // Whichever name this router gave the resource in its path. The intro routes call it
+    // :id and the fit routes call it :introId, and both are the same resource.
+    const params = (req.params ?? {}) as Record<string, unknown>
+    const pathId = typeof params.id === 'string' ? params.id : params.introId
     if (typeof pathId === 'string' && pathId.length > 0) {
       const claimed = (req.body as any)?.envelope?.resource?.id
       if (claimed !== pathId) {
