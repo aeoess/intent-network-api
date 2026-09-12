@@ -242,7 +242,7 @@ test('WITHDRAW_REQUEST: the happy path withdraws the authorization, derives with
   const r = await post('withdraw-request', body)
   assert.equal(r.status, 201, JSON.stringify(r.json))
   assert.equal(r.json.state, 'withdrawn')
-  assert.equal(r.json.grandfathered, false)
+  assert.equal(r.json.bridged_from_legacy, false)
   assert.equal(r.json.write_ref, built.writeRef)
 
   const row = authRow(f.id, f.from.keys.publicKey, 'request_intro')
@@ -318,13 +318,20 @@ test('WITHDRAW_REQUEST: a pre-2A row with no authorization is withdrawn, and the
   const { body, built } = forIntro('withdraw_request', f.id, f.from.keys)
   const r = await post('withdraw-request', body)
   assert.equal(r.status, 201, JSON.stringify(r.json))
-  assert.equal(r.json.grandfathered, true)
+  assert.equal(r.json.bridged_from_legacy, true)
   assert.equal(r.json.state, 'withdrawn', 'which ends the grandfathered path cleanly')
 
   const row = authRow(f.id, f.from.keys.publicKey, 'request_intro')
   assert.equal(row.evidence, 'legacy_unbound',
     'the REQUEST was never canonically signed, so its row may never claim it was')
   assert.equal(row.live, 0)
+  // The bridged row points at a SENTINEL rather than at a real evidence row, because the
+  // request it records happened before the write subsystem existed and there is no signature
+  // to point at. Pointing it at the withdrawal's own evidence, which an earlier version did,
+  // was a small overclaim. boundFieldsOfAuthorization then finds nothing and returns null, so
+  // a receipt renderer emits no clause about it, which fails closed.
+  assert.equal(row.evidence_id, facts.PRE_2A_ANTECEDENT)
+  assert.equal(facts.boundFieldsOfAuthorization(f.id, f.from.keys.publicKey, 'request_intro'), null)
   const ev = db.getDb().prepare('SELECT evidence FROM write_evidence WHERE write_ref = ?').get(built.writeRef) as any
   assert.equal(ev.evidence, 'canonical', 'while the withdrawal itself is canonical and says so in its own row')
 })

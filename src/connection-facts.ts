@@ -238,33 +238,59 @@ export function isPre2AIntro(introId: string): boolean {
   return Date.parse(row.created_at) < Date.parse(marker)
 }
 
-/** Is this intro a pre-2A row whose legacy request is still open?
+/** The evidence id a bridged pre-2A authorization carries.
  *
- *  THE ONE PLACE the canonical lane reads v3_intros.status, and the conditions are
- *  narrow on purpose:
+ *  Deliberately NOT a real evidence row, and deliberately not another act's evidence id.
+ *  The request it records happened before the write subsystem existed, so there IS no
+ *  signature to point at, and pointing at an unrelated act's signature would be a small
+ *  overclaim. `boundFieldsOfAuthorization` joins to write_evidence, finds nothing, and
+ *  returns null, so a receipt renderer emits no clause about a bridged act. That fails
+ *  closed, which is the only acceptable direction. */
+export const PRE_2A_ANTECEDENT = 'legacy_pre_2a'
+
+export type BridgeOutcome = 'not_needed' | 'bridged' | 'not_bridgeable'
+
+/** Bridge a pre-2A intro's history into facts, once, or report that it cannot be.
  *
- *    the intro predates mingle_2a_deployed_at, so it was authorized before the write
- *    subsystem existed, AND it carries no authorization row at all
+ *  THE PROBLEM THIS SOLVES. An intro created before this build has no authorization rows,
+ *  and nothing backfills the requester's. So `hasMutualInterest` is false forever, the
+ *  derivation answers `requested` however far the intro has actually progressed, and the
+ *  consequences compound: the requester's canonical share_contact is refused `wrong_state`
+ *  so the pair can never connect on the canonical lane, and any canonical write's
+ *  materialization resets an accepted intro's column back to `pending` while its contact
+ *  column stays populated.
  *
- *  Under those two conditions the legacy column is the only record of the request
- *  the requester is retracting, so it is read as a legacy fact and never as a
- *  lifecycle state. From the moment the legacy adapters land, every legacy act
- *  writes a legacy_unbound authorization row, so a post-2A intro always has a
- *  canonical antecedent to read instead and this bridge cannot fire for it.
+ *  THE RULE. Only `pending` is bridgeable. It is the one legacy value that carries no
+ *  information the derivation cannot also see, so translating it into a live request_intro
+ *  row adds a fact the intro row itself already proves. Every other value records a history
+ *  the column knows and the facts do not, and the canonical lane REFUSES rather than
+ *  guessing at it. That keeps this a bridge rather than a translation layer.
  *
- *  The marker gate is what stops this becoming a general back door: a caller cannot
- *  reach it by deleting rows, because an intro created after the marker fails the
- *  first condition whatever its rows say.
+ *  WHY THIS IS NOT A MIGRATION IN PLACE. It runs only inside the transaction of an actual
+ *  act on that intro, triggered by a principal's own signed write or by that principal's
+ *  own legacy call. Nothing sweeps, nothing runs at boot, and nothing touches a row nobody
+ *  is acting on. The marker gate bounds it to rows that existed before this build.
  *
- *  deriveIntroState is untouched by this. Nothing synthesizes facts from the column,
- *  because a derivation that read its own materialization back in would make the
- *  column authoritative by the back door, which is exactly what 14.3 forbids. */
-export function grandfatheredRequestOpen(introId: string): boolean {
-  if (!isPre2AIntro(introId)) return false
-  if (hasAuthorizations(introId)) return false
-  const row = d().prepare('SELECT status FROM v3_intros WHERE id = ?').get(introId) as
-    { status: string } | undefined
-  return row !== undefined && row.status === 'pending'
+ *  deriveIntroState is still untouched. Nothing synthesizes facts from the column at READ
+ *  time, because a derivation that read its own materialization back would make the column
+ *  authoritative by the back door. This writes a durable fact once and then the facts are
+ *  the truth. */
+export function bridgePre2AIntro(introId: string): BridgeOutcome {
+  if (!isPre2AIntro(introId)) return 'not_needed'
+  if (hasAuthorizations(introId)) return 'not_needed'
+  const row = d().prepare('SELECT from_key, created_at, status FROM v3_intros WHERE id = ?').get(introId) as
+    { from_key: string; created_at: string; status: string } | undefined
+  if (row === undefined) return 'not_needed'
+  if (row.status !== 'pending') return 'not_bridgeable'
+  // created_at is the INTRO's own, because that is when the request happened, and it is
+  // what makes the 14 day requested window measure from the real time rather than from
+  // whenever the bridge happened to run.
+  d().prepare(`
+    INSERT INTO connection_authorizations
+      (intro_id, actor_key, operation, subject, evidence_id, evidence, live, created_at)
+    VALUES (?, ?, 'request_intro', '', ?, 'legacy_unbound', 1, ?)
+  `).run(introId, row.from_key, PRE_2A_ANTECEDENT, row.created_at)
+  return 'bridged'
 }
 
 /** Is this intro complete on the legacy lane: accepted with both contact columns?
@@ -345,6 +371,23 @@ export function sweepExpiredIntros(now: Date = new Date()): string[] {
   for (const { id } of candidates) {
     const facts = introFacts(id)
     if (facts === null) continue
+    // AN INTRO WITH NO AUTHORIZATION ROWS IS MATERIALIZED ONLY FROM `pending`.
+    //
+    // A pre-2A intro has no facts, so the derivation can see nothing but its age and answers
+    // `expired` for any row older than the shortest TTL. Materializing that over a legacy
+    // column carrying real information destroys it: a COMPLETED legacy connection, accepted
+    // with both contact lines stored, would be rewritten to `withdrawn`, and both parties
+    // would lose a contact they had already exchanged. Nothing could put it back, because
+    // the derived state is then terminal and the candidate filter no longer selects the row.
+    //
+    // `pending` is the one legacy value that carries no information the derivation cannot
+    // also see, so materializing a lapse over it is safe and is the whole reason the sweep
+    // exists: it stops a lapsed request showing in an old client's incoming list forever.
+    // Every other value means the intro has a history only the column knows.
+    if (facts.authorizations.length === 0) {
+      const legacy = d().prepare('SELECT status FROM v3_intros WHERE id = ?').get(id) as { status: string }
+      if (legacy.status !== 'pending') continue
+    }
     if (deriveIntroState(facts, now) !== 'expired') continue
     // One derived write, through the same function every canonical write uses, so the sweep
     // cannot disagree with the derivation about what the column should say.

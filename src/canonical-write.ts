@@ -119,6 +119,25 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return proto === Object.prototype || proto === null
 }
 
+/** The three string rules, applied to a KEY as well as to a value.
+ *
+ *  Keys were unchecked, and one uncovered shape was worse than cosmetic: `canonicalize`
+ *  applies its own serializer to keys too, so a lone surrogate in a key threw a plain Error
+ *  out of jcs() at the DIGEST step, which is step 3, before the signature at step 4. The
+ *  pipeline's boundary then answered 500 write_failed to a caller who had supplied no valid
+ *  signature at all. A gate that exists to produce a 400 must produce it. */
+function checkString(value: string, path: string, what: 'key' | 'value'): void {
+  if (CONTROL_RE.test(value)) {
+    throw new CanonicalPayloadError('control_character', `control characters are not allowed in a signed ${what}`, path)
+  }
+  if (LONE_SURROGATE_RE.test(value)) {
+    throw new CanonicalPayloadError('malformed_unicode', `a lone surrogate is not well formed Unicode in a signed ${what}`, path)
+  }
+  if (value !== value.trim()) {
+    throw new CanonicalPayloadError('edge_whitespace', `leading or trailing whitespace is not allowed in a signed ${what}`, path)
+  }
+}
+
 function walk(value: unknown, path: string, depth: number): void {
   if (depth > MAX_DEPTH) {
     throw new CanonicalPayloadError('payload_too_deep', `nesting deeper than ${MAX_DEPTH}`, path)
@@ -134,15 +153,7 @@ function walk(value: unknown, path: string, depth: number): void {
   }
   if (typeof value === 'boolean') return
   if (typeof value === 'string') {
-    if (CONTROL_RE.test(value)) {
-      throw new CanonicalPayloadError('control_character', 'control characters are not allowed in a signed string', path)
-    }
-    if (LONE_SURROGATE_RE.test(value)) {
-      throw new CanonicalPayloadError('malformed_unicode', 'a lone surrogate is not well formed Unicode', path)
-    }
-    if (value !== value.trim()) {
-      throw new CanonicalPayloadError('edge_whitespace', 'leading or trailing whitespace is not allowed in a signed string', path)
-    }
+    checkString(value, path, 'value')
     return
   }
   if (Array.isArray(value)) {
@@ -150,7 +161,13 @@ function walk(value: unknown, path: string, depth: number): void {
     return
   }
   if (isPlainObject(value)) {
-    for (const k of Object.keys(value)) walk(value[k], path ? `${path}.${k}` : k, depth + 1)
+    for (const k of Object.keys(value)) {
+      const kp = path ? `${path}.${k}` : k
+      // The key first, so a malformed key is refused with a code rather than reaching the
+      // serializer and throwing out of the verifier.
+      checkString(k, kp, 'key')
+      walk(value[k], kp, depth + 1)
+    }
     return
   }
   throw new CanonicalPayloadError('unsupported_value', `${Object.prototype.toString.call(value)} is not allowed in a canonical payload`, path)

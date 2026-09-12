@@ -34,7 +34,7 @@ import type { CanonicalContext } from './write-pipeline.js'
 import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.js'
 import { recordAuthMode } from './write-db.js'
 import { recordAuthorization, materializeStatus, writeRefOfAuthorization, boundFieldsOfAuthorization } from './connection-facts.js'
-import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
+import { factsForWrite, guardState, requireParty } from './intro-guards.js'
 import { checkLegacyWrite, refuseLegacy } from './legacy-write-gate.js'
 import { writeArtifact } from './private-artifacts.js'
 import { policyHashForCommitment, commitmentIsCurrent, registerPolicyCommitment, commitmentForPolicyHash } from './policy-commitment.js'
@@ -271,6 +271,36 @@ function resolvePolicy(hs: handshakeDb.HandshakeRow, actorKey: string, commitmen
   return { card: card as string, policyHash: resolved as string, policy: policy as policyDb.FitPolicy }
 }
 
+/** The actor's policy as the HANDSHAKE committed it, resolved through the signed commitment.
+ *
+ *  For an act that discloses a value the handshake already evaluated, the current policy is
+ *  the wrong version to authorize against: the disclosure decisions were made against the
+ *  committed one, and a read surface serves the committed one. */
+function resolvePolicyAtCommit(hs: handshakeDb.HandshakeRow, actorKey: string, commitment: string): {
+  card: string
+  policyHash: string
+  policy: policyDb.FitPolicy
+} {
+  const card = cardOfKey(hs, actorKey)
+  if (!card) refuseWrite(403, 'not_a_party', 'not a party to this handshake')
+  const committed = actorKey === hs.requester_key ? hs.req_policy_hash : hs.com_policy_hash
+  if (!committed) {
+    refuseWrite(409, 'handshake_wrong_state', 'this handshake has no committed policy version for you')
+  }
+  const resolved = policyHashForCommitment(card as string, commitment)
+  if (resolved === null) {
+    refuseWrite(400, 'policy_commitment_unknown',
+      'this policy commitment was never registered for your card, so the server cannot resolve it')
+  }
+  if (resolved !== committed) {
+    refuseWrite(409, 'policy_commitment_not_committed',
+      'this commitment names a policy version other than the one this handshake was committed under, and the disclosure was authorized against that one')
+  }
+  const policy = policyDb.getPolicyByHash(card as string, committed as string)
+  if (policy === null) refuseWrite(400, 'policy_commitment_unknown', 'the committed policy version is no longer retained')
+  return { card: card as string, policyHash: committed as string, policy: policy as policyDb.FitPolicy }
+}
+
 /** Every canonical fit act shares these: the intro accepts a continuation in its current
  *  state, the handshake exists, and the actor is a party to both. */
 function fitPreamble(ctx: CanonicalContext, wantHandshakeState: handshakeDb.HandshakeRow['state'] | null): {
@@ -280,7 +310,7 @@ function fitPreamble(ctx: CanonicalContext, wantHandshakeState: handshakeDb.Hand
 } {
   const introId = ctx.write.envelope.resource.id
   const actorKey = ctx.write.envelope.actor_key
-  const facts = factsOrRefuse(introId)
+  const facts = factsForWrite(introId)
   requireParty(facts, actorKey, 'either', 'only a party to this introduction may act on it')
   guardState(ctx.write.envelope.operation, facts, ctx.now)
 
@@ -543,8 +573,22 @@ const canonicalFitCommit = canonicalWriteRoute({
         refuseWrite(400, 'standing_scope_unknown',
           'standing_scope_commitment does not name a standing scope registered for your card')
       }
-      if ((scope as autonomyDb.StoredScope).paused) {
+      const stored = scope as autonomyDb.StoredScope
+      if (stored.paused) {
         refuseWrite(403, 'autonomy_paused', 'autonomous commits are paused for this card')
+      }
+      // The scope's OWN applicability, checked here rather than only inside the per-dimension
+      // loop. That loop is skipped entirely when nothing is mutually evaluable or when every
+      // dimension is budget-blocked, and the receipt would then carry "authorized under
+      // standing scope S" for a scope that had expired years ago or was registered for a
+      // different intent. A clause about how an act was authorized must not rest on a check
+      // that a particular input shape skips.
+      if (Date.parse(stored.scope.expiry) <= now.getTime()) {
+        refuseWrite(403, 'standing_scope_expired', 'that standing scope has expired, so this act needs individual approval')
+      }
+      if (!stored.scope.intents.includes(hs.intent)) {
+        refuseWrite(403, 'standing_scope_wrong_intent',
+          `that standing scope does not cover the intent ${hs.intent}, so this act needs individual approval`)
       }
       autonomous = true
     }
@@ -587,7 +631,15 @@ const canonicalReleaseExact = canonicalWriteRoute({
     const dim = dimension as string
 
     const { hs, introId, actorKey } = fitPreamble(ctx, 'committed')
-    const resolved = resolvePolicy(hs, actorKey, commitment)
+    // THE COMMIT-TIME VERSION, not the current one. resolvePolicy pins to whatever policy is
+    // in force now, and GET /:introId discloses the value from hs.req_policy_hash or
+    // hs.com_policy_hash, the version the handshake was EVALUATED under. Pinning the two
+    // halves to different versions meant the value disclosed was not the value the signature
+    // named: an owner could edit a dimension from testable to reveal_exact after a commit
+    // that had authorized no disclosure of it, sign a release of the new value, and have the
+    // counterparty handed the old one. The handshake's disclosure decisions were made against
+    // the committed versions, so the authorization has to be too.
+    const resolved = resolvePolicyAtCommit(hs, actorKey, commitment)
 
     // CHECK ONE already ran, in step 7 of the pipeline: the opening recomputed to
     // private_value_commitment. So by here the value is the value the principal committed
@@ -633,6 +685,14 @@ const canonicalFirstStepPropose = canonicalWriteRoute({
     // The payload IS the half, field for field, in the shape validateHalf accepts. So
     // payload_digest covers every text field and the expiry, where today the preimage is
     // fit-firststep:${introId}:${nonce} and the entire half is unbound.
+    //
+    // The key gate runs FIRST, because validateHalf copies seven known keys into a fresh
+    // object and ignores the rest. Without this, an eighth field would be covered by
+    // payload_digest, accepted with a 201, and silently dropped, so the counterparty would
+    // approve a merged digest from which the principal's signed clause had vanished. That is
+    // exactly the case gatePayloadKeys exists to refuse everywhere else.
+    gatePayloadKeys(write.payload,
+      ['purpose', 'next_action', 'meeting_length', 'agenda', 'each_wants', 'boundaries', 'expiry'])
     const v = firstStepDb.validateHalf(write.payload)
     if (!v.ok || !v.half) refuseWrite(400, 'malformed_half', v.error ?? 'invalid half')
     const gate = postGateDrafted((v.texts ?? []).map((t, i) => ({ question_id: String(i), text: t })))
@@ -742,8 +802,10 @@ router.post('/:introId/request', fitGate, canonicalDispatch(canonicalFitRequest)
     })
     recordAuthorization({ introId, actorKey: public_key, operation: 'fit_request', evidenceId, evidence: 'legacy_unbound' })
     recordAuthMode('intro', introId, public_key, 'legacy_unbound')
-    recordCardEvent('handshake_requested', card, public_key, { intro_id: introId, intent: hs.intent, dimensions: requested_dimensions.length })
   })()
+  // Outside the transaction, for the reason card-events.ts documents: it swallows its own
+  // failures and it reaches a lazy CREATE TABLE on the first call in a process.
+  recordCardEvent('handshake_requested', card, public_key, { intro_id: introId, intent: hs.intent, dimensions: requested_dimensions.length })
   res.status(201).json({ state: 'requested', requested_dimensions, note: 'Nothing is evaluated until the counterparty commits to the same dimensions with matching reciprocity.' })
 })
 
@@ -805,9 +867,9 @@ router.post('/:introId/commit', fitGate, canonicalDispatch(canonicalFitCommit), 
     // Whether the act was autonomous is established by nothing at all on this lane.
     recordAuthorization({ introId, actorKey: public_key, operation: 'fit_commit', evidenceId, evidence: 'legacy_unbound' })
     recordAuthMode('intro', introId, public_key, 'legacy_unbound')
-    recordCardEvent('handshake_committed', committerCard, public_key,
-      { intro_id: introId, intent: hs.intent, dimensions: accept_dimensions.length, receipt_digest: evaluated.receiptDigest })
   })()
+  recordCardEvent('handshake_committed', committerCard, public_key,
+    { intro_id: introId, intent: hs.intent, dimensions: accept_dimensions.length, receipt_digest: evaluated.receiptDigest })
   res.json({
     state: 'committed', overlap_map: evaluated.overlapMap, receipt: evaluated.receipt,
     receipt_digest: evaluated.receiptDigest, receipt_content: evaluated.receiptContent,
@@ -1127,8 +1189,8 @@ router.post('/:introId/first-step', fitGate, canonicalDispatch(canonicalFirstSte
     // discarded here, because tightening a legacy route gains no evidence.
     recordAuthorization({ introId, actorKey: public_key, operation: 'first_step_propose', evidenceId, evidence: 'legacy_unbound' })
     recordAuthMode('intro', introId, public_key, 'legacy_unbound')
-    recordCardEvent('first_step_proposed', cardOfKey(hs, public_key), public_key, { intro_id: introId })
   })()
+  recordCardEvent('first_step_proposed', cardOfKey(hs, public_key), public_key, { intro_id: introId })
   try { await email.notifyFirstStepProposed(otherKey(hs, public_key), introId) } catch { /* email never blocks proposal */ }
 
   const row = firstStepDb.getFirstStep(introId)!

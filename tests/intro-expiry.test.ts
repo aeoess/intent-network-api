@@ -222,6 +222,42 @@ test('RENEWAL: the same intro read a thousand times does not move the deadline a
   assert.equal(rows, 2, 'and the sweep inserted no authorization row, so it cannot renew anything')
 })
 
+test('EXPIRY: KNOWN GAP, withdrawing the last continuation past a stale interest expires the intro', () => {
+  // Found by a review and deliberately NOT changed, because the TTL rule it rests on is settled
+  // architecture and this is a gap in that rule rather than a defect in its implementation.
+  //
+  // The two design sentences diverge here. Item 6 of withdraw_contact says the basis "moves
+  // backward to whatever live continuation remains, or to the express_interest authorization if
+  // none does". The same item also says that if the withdrawn contact was the only connecting
+  // class authorization, "the state regresses to interested". When the interest is more than 30
+  // days old those give DIFFERENT answers, and the design does not address the case: its only
+  // statement about the direction is that a withdrawal "cannot resurrect an already lapsed
+  // intro", which is about an intro that had already expired, not one the withdrawal expires.
+  //
+  // The product consequence is real: a pair demonstrably active six days ago is killed outright
+  // by one party rescinding their own contact line, which punishes the safest act a user can
+  // take. My recommendation is in the handoff. Pinned here so the behavior is KNOWN rather than
+  // discovered, and so a later ruling changes a red test rather than a silent answer.
+  const i = makeIntro(T0)
+  addAuth(i.id, i.fromKey, 'request_intro', T0)
+  addAuth(i.id, i.toKey, 'express_interest', T0 + 1 * DAY)
+  addAuth(i.id, i.toKey, 'share_contact', T0 + 29 * DAY)
+  const at35 = new Date(T0 + 35 * DAY)
+
+  const before = facts.introFacts(i.id)!
+  assert.equal(state.deriveIntroState(before, at35), 'connecting')
+  assert.equal(state.expiryOf(before), iso(T0 + 59 * DAY), 'the signed continuation bought until day 59')
+  assert.equal(state.isWriteAllowedInState('withdraw_contact', 'connecting'), true, 'so the guard admits the write')
+
+  addAuth(i.id, i.toKey, 'share_contact', T0 + 29 * DAY, { live: false })
+  const after = facts.introFacts(i.id)!
+  assert.equal(state.expiryOf(after), iso(T0 + 31 * DAY), 'the basis falls back to the interest, which is already past')
+  assert.equal(state.deriveIntroState(after, at35), 'expired',
+    'so the intro expires as a RESULT of the withdrawal, at a clock where it was alive before it')
+  assert.deepEqual(state.pendingActions(after, i.fromKey, at35), [], 'and the pair has nothing left but a block')
+  assert.equal(state.materializedStatus('expired'), 'withdrawn')
+})
+
 // ══════════════════════════════════════════════════════════════
 // The sweep
 // ══════════════════════════════════════════════════════════════

@@ -610,7 +610,8 @@ test('LEGACY ACCEPT (a): a grandfathered row behaves exactly as at 909ffe3, asse
   // the state of a row that existed before this build opened the database.
   const marker = db.getSchemaMarker(db.MINGLE_2A_MARKER_KEY)!
   const d = db.getDb()
-  d.prepare('UPDATE v3_intros SET created_at = ? WHERE id = ?').run(new Date(Date.parse(marker) - 864e5).toISOString(), introId)
+  const backdated = new Date(Date.parse(marker) - 864e5).toISOString()
+  d.prepare('UPDATE v3_intros SET created_at = ? WHERE id = ?').run(backdated, introId)
   d.prepare('DELETE FROM connection_authorizations WHERE intro_id = ?').run(introId)
   d.prepare('DELETE FROM write_evidence WHERE resource_id = ?').run(introId)
   d.prepare('DELETE FROM write_auth_mode WHERE resource_id = ?').run(introId)
@@ -619,13 +620,23 @@ test('LEGACY ACCEPT (a): a grandfathered row behaves exactly as at 909ffe3, asse
   const r = await legacyRespond(p, introId, 'accept', 'grandfathered@example.com')
   assert.equal(r.status, 200, JSON.stringify(r.json))
   const row = introRow(introId)
-  assert.equal(row.status, 'accepted', 'the column, not a derivation of facts it does not have')
+  assert.equal(row.status, 'accepted', 'exactly what today\'s path stores')
   assert.equal(row.to_contact, 'grandfathered@example.com')
   assert.ok(row.responded_at)
-  // And the derivation would answer something else, which is exactly why the legacy lane
-  // does not materialize: it has no request_intro fact to derive mutual interest from.
-  assert.notEqual(facts.stateOf(introId), 'connecting')
-  assert.equal(row.status, 'accepted', 'the column is untouched by that disagreement')
+
+  // UPDATED after a review found the defect this assertion used to codify. It previously
+  // asserted the derivation did NOT answer connecting, which was true and was the bug: with
+  // no request_intro antecedent, hasMutualInterest was false forever, so the requester's
+  // canonical share_contact was refused wrong_state and the pair could never connect on the
+  // canonical lane. The adapter now bridges the pre-2A history into facts first.
+  assert.equal(facts.stateOf(introId), 'connecting',
+    'the bridged antecedent makes the facts agree with the column')
+  assert.equal(state.materializedStatus(facts.stateOf(introId)!), 'accepted', 'and they do agree')
+  const bridged = db.getDb().prepare(
+    "SELECT * FROM connection_authorizations WHERE intro_id = ? AND operation = 'request_intro'").get(introId) as any
+  assert.equal(bridged.evidence, 'legacy_unbound', 'the bridged request may never claim it was canonically signed')
+  assert.equal(bridged.evidence_id, facts.PRE_2A_ANTECEDENT)
+  assert.equal(bridged.created_at, backdated, 'and it carries the intro\'s own time, not the bridge\'s')
 })
 
 test('LEGACY ACCEPT (d): after the cutoff it is 426 with the decided text, and the pre-2A row is exempt', async () => {
@@ -814,6 +825,49 @@ test('AGREEMENT: a mixed pair reaches the same place, and the two evidence rows 
   assert.equal(canonical.payload_digest !== null, true, 'and the new target\'s act carries a digest')
   assert.equal(facts.stateOf(introId), 'interested', 'and the lifecycle reads both lanes as one fact set')
   assert.equal(introRow(introId).status, 'accepted')
+})
+
+test('LEGACY COMPLETE: the `complete` flag reports the real state, not a constant', async () => {
+  // Found by a review. The release gating was updated for the mixed lane but the `complete`
+  // field was not, so a legacy requester completing against a canonical target who had NOT
+  // shared received complete:true while the very next GET /mine answered complete:false. A
+  // retry is refused as already complete, so a client could not reconcile the two.
+  const p = await pair()
+  const introId = (await legacyRequest(p, 'old client')).json.id
+  assert.equal((await post(`${introId}/respond`, signedBody({
+    operation: 'express_interest', resource: { type: 'intro', id: introId }, keys: p.to.keys,
+  }).body)).status, 201, 'the target expresses interest canonically and shares nothing')
+  assert.equal(introRow(introId).to_contact, null)
+
+  const n = 'lc' + randomBytes(4).toString('hex')
+  const done = await post(`${introId}/complete`, {
+    contact: 'requester@example.com', public_key: p.from.keys.publicKey, nonce: n,
+    signature: sign(`intro-complete:${introId}:${n}`, p.from.keys.privateKey),
+  })
+  assert.equal(done.status, 200, JSON.stringify(done.json))
+  assert.equal(done.json.complete, false, 'the target has not shared, so the intro is NOT complete')
+  assert.equal(done.json.released, false)
+  // And it agrees with what the very next read says, which is the whole point.
+  const nonce = 'm' + randomBytes(4).toString('hex')
+  const qs = new URLSearchParams({
+    public_key: p.from.keys.publicKey, nonce, signature: sign(`intro-mine:${nonce}`, p.from.keys.privateKey),
+  })
+  const rows = (await (await fetch(`${base}/api/v3/intros/mine?${qs}`)).json()).intros
+  assert.equal(rows.find((x: any) => x.id === introId).complete, false)
+
+  // A PURE legacy flow is unchanged: both contacts present, so complete stays true and the
+  // published client sees exactly what it saw before.
+  const q = await pair()
+  const legacyId = (await legacyRequest(q, 'old')).json.id
+  assert.equal((await legacyRespond(q, legacyId, 'accept', 'target@example.com')).status, 200)
+  const n2 = 'lc' + randomBytes(4).toString('hex')
+  const pure = await post(`${legacyId}/complete`, {
+    contact: 'requester@example.com', public_key: q.from.keys.publicKey, nonce: n2,
+    signature: sign(`intro-complete:${legacyId}:${n2}`, q.from.keys.privateKey),
+  })
+  assert.equal(pure.status, 200)
+  assert.equal(pure.json.complete, true, 'no change for an all legacy pair')
+  assert.equal(pure.json.released, true)
 })
 
 test('AGREEMENT: a canonical create and a legacy response leave evidence under two resource identities', async () => {

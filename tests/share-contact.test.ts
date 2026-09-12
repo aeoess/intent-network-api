@@ -552,33 +552,74 @@ test('ARTIFACT: the recipient verifies all four checks alone, with no server key
   const read = artifacts.readArtifact(artifactRows(L.introId)[0].artifact_id, L.to.keys.publicKey)
   assert.equal(read.ok, true, 'the recipient may read it')
   const standalone = artifacts.standaloneFrom((read as any).artifact)
-  const v = artifacts.verifyArtifactStandalone(standalone, L.introId)
+  const author = L.from.keys.publicKey
+  const v = artifacts.verifyArtifactStandalone(standalone, L.introId, author)
   assert.deepEqual(v, {
     ok: true, signature_verifies: true, payload_digest_matches: true,
     commitment_opens: true, resource_is_expected: true,
-  }, 'four checks, and none of them touches the server key')
+    author_is_expected: true, envelope_is_well_formed: true,
+  }, 'six checks, and none of them touches the server key')
   assert.equal(standalone.opening.value, contact)
 
   // Each check fails on its own when its input is broken, so `ok` is not carried by one.
-  const badSig = artifacts.verifyArtifactStandalone({ ...standalone, signature: 'ab'.repeat(64) }, L.introId)
+  const badSig = artifacts.verifyArtifactStandalone({ ...standalone, signature: 'ab'.repeat(64) }, L.introId, author)
   assert.equal(badSig.signature_verifies, false)
   assert.equal(badSig.ok, false)
 
   const badPayload = artifacts.verifyArtifactStandalone(
-    { ...standalone, payload: { private_value_commitment: 'a'.repeat(64) } }, L.introId)
+    { ...standalone, payload: { private_value_commitment: 'a'.repeat(64) } }, L.introId, author)
   assert.equal(badPayload.payload_digest_matches, false)
   assert.equal(badPayload.commitment_opens, false)
 
   const badOpening = artifacts.verifyArtifactStandalone(
-    { ...standalone, opening: { value: 'someone-else@example.com', salt: standalone.opening.salt } }, L.introId)
+    { ...standalone, opening: { value: 'someone-else@example.com', salt: standalone.opening.salt } }, L.introId, author)
   assert.equal(badOpening.signature_verifies, true, 'a signed act still happened')
   assert.equal(badOpening.payload_digest_matches, true)
   assert.equal(badOpening.commitment_opens, false,
     'which is exactly what step 3 adds: without it the recipient could not tell that the value it received is the value authorized')
 
-  const wrongIntro = artifacts.verifyArtifactStandalone(standalone, 'intro-v3-someone-elses')
+  const wrongIntro = artifacts.verifyArtifactStandalone(standalone, 'intro-v3-someone-elses', author)
   assert.equal(wrongIntro.resource_is_expected, false)
   assert.equal(wrongIntro.ok, false)
+
+  // THE CHECK A REVIEW ADDED. A stranger builds their own share_contact envelope over this
+  // reader's intro id, commits to a value of their choosing, signs it with their OWN key and
+  // hands it over. Every arithmetic check passes, because the forgery is internally
+  // consistent. Only the author check says whose authorization it is.
+  const mallory = generateKeyPair()
+  const forgedSalt = randomBytes(32).toString('base64url')
+  const forgedRes = { type: 'intro' as const, id: L.introId }
+  const forgedCommitment = env.privateValueCommitment('share_contact', forgedRes, forgedSalt, 'mallory@evil.example')
+  const forgedBuilt = env.buildEnvelope({
+    operation: 'share_contact', actorKey: mallory.publicKey, resource: forgedRes,
+    issuedAt: new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z'), nonce: newNonce(),
+    payload: { private_value_commitment: forgedCommitment },
+  })
+  const forged = {
+    envelope: forgedBuilt.envelope,
+    signature: sign(forgedBuilt.envelopeBytes, mallory.privateKey),
+    payload: { private_value_commitment: forgedCommitment },
+    opening: { value: 'mallory@evil.example', salt: forgedSalt },
+  }
+  const forgedResult = artifacts.verifyArtifactStandalone(forged, L.introId, author)
+  assert.equal(forgedResult.signature_verifies, true, 'the forgery is internally consistent')
+  assert.equal(forgedResult.payload_digest_matches, true)
+  assert.equal(forgedResult.commitment_opens, true)
+  assert.equal(forgedResult.resource_is_expected, true)
+  assert.equal(forgedResult.author_is_expected, false, 'and this is the only check that catches it')
+  assert.equal(forgedResult.ok, false)
+
+  // And the two envelope rules the server applies, applied here too: a verifier weaker than
+  // the server endorses what the server would refuse.
+  const wrongDomain = artifacts.verifyArtifactStandalone(
+    { ...standalone, envelope: { ...standalone.envelope, domain: 'some-other-protocol-v9' as any } }, L.introId, author)
+  assert.equal(wrongDomain.envelope_is_well_formed, false)
+  assert.equal(wrongDomain.ok, false)
+  const extraField = artifacts.verifyArtifactStandalone(
+    { ...standalone, envelope: { ...standalone.envelope, scope: 'read-only-do-not-honour' } as any }, L.introId, author)
+  assert.equal(extraField.envelope_is_well_formed, false,
+    'an extra signed field may narrow authority, and the server refuses one for exactly that reason')
+  assert.equal(extraField.ok, false)
 })
 
 test('ARTIFACT: only the author and the recipient may read it, and a party to another intro may not', async () => {
@@ -594,9 +635,14 @@ test('ARTIFACT: only the author and the recipient may read it, and a party to an
   const stranger = await interested()
   const refused = artifacts.readArtifact(id, stranger.from.keys.publicKey)
   assert.equal(refused.ok, false)
-  assert.equal((refused as any).code, 'not_a_permitted_reader')
+  assert.equal((refused as any).code, 'artifact_unavailable')
   assert.equal(artifacts.readArtifact(id, generateKeyPair().publicKey).ok, false, 'and neither may a key with no intros')
-  assert.equal(artifacts.readArtifact('pa_does_not_exist', L.to.keys.publicKey).ok, false)
+  const missing = artifacts.readArtifact('pa_does_not_exist', L.to.keys.publicKey)
+  assert.equal(missing.ok, false)
+  // ONE answer for both, so a caller holding a guessed id cannot tell a real one from a
+  // fabricated one by comparing refusals. The codes used to differ while the comment claimed
+  // they did not.
+  assert.deepEqual(refused, missing, 'not an existence oracle')
 })
 
 test('ARTIFACT: a withdrawn artifact is no longer readable', async () => {

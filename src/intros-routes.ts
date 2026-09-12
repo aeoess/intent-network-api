@@ -7,7 +7,7 @@
 // party ever sees a contact. Every write is signed by the acting key.
 //
 // TWO LANES ON THREE OF THESE PATHS. A body carrying an `envelope` key is a canonical
-// mingle-write-v1 write and goes to the canonical handler; a body without one is the
+// mingle-write-v1 write and goes to the canonical handler. A body without one is the
 // published 3.2.x shape and goes to the legacy handler below, byte for byte as it
 // behaved at 909ffe3. The dispatch is a shape check and not a header, so an old client
 // needs no change to keep working.
@@ -42,10 +42,10 @@ import { recordCanonicalEvidence, recordLegacyEvidence } from './write-evidence.
 import { recordAuthMode, createMapRow, claimCreate } from './write-db.js'
 import {
   recordAuthorization, materializeStatus, stateOf, authorizationOf,
-  claimRelease, writeRefOfAuthorization,
+  claimRelease, writeRefOfAuthorization, bridgePre2AIntro,
 } from './connection-facts.js'
 import { writeArtifact } from './private-artifacts.js'
-import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
+import { factsForWrite, guardState, requireParty } from './intro-guards.js'
 import { checkLegacyWrite, checkLegacyCreate, refuseLegacy } from './legacy-write-gate.js'
 
 const router = Router()
@@ -113,7 +113,7 @@ const canonicalRequestIntro = canonicalWriteRoute({
     }
 
     // The create's second idempotency key, checked first. Nonce idempotency covers a
-    // byte identical retry; a client whose request timed out mints a fresh nonce and
+    // byte identical retry, and a client whose request timed out mints a fresh nonce and
     // issued_at, so write_ref differs and the nonce store sees a new write. request_id
     // is what stops that producing a second intro, which is today's behavior: the id at
     // intros-routes.ts:75 carries a fresh Date.now() every time.
@@ -259,8 +259,12 @@ router.post('/request', canonicalDispatch(canonicalRequestIntro), rateLimited('i
     // (five Math.random sites at build/index.js), so refusing a repeat would change
     // behavior for a working client inside the compatibility window.
     recordAuthMode('intro', id, public_key, 'legacy_unbound')
-    recordCardEvent('intro_requested', from_card, public_key, { intro_id: id, to_card, purpose })
   })()
+  // OUTSIDE the transaction. card-events.ts documents that an intro event is written outside
+  // the transaction it records, and recordCardEvent reaches a lazy CREATE TABLE on the first
+  // call in a process, which is precisely the shape step 3 refused to put inside a business
+  // transaction. It also swallows its own failures, so it never belonged in an atomic group.
+  recordCardEvent('intro_requested', from_card, public_key, { intro_id: id, to_card, purpose })
 
   // Email the target, if subscribed and verified. Dark and instant when
   // unconfigured; never breaks the request.
@@ -288,7 +292,7 @@ const canonicalRespond = canonicalWriteRoute({
     if (Object.keys(write.payload).length !== 0) {
       refuseWrite(400, 'malformed_payload', `${operation} carries an empty payload`)
     }
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     requireParty(facts, actorKey, 'target', 'only the intro target may respond')
     // The state guard, not the status column. Both operations require `requested`, which
     // mirrors today's guard at intros-routes.ts:100 refusing a response unless the intro
@@ -348,6 +352,14 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
 
   if (intro.status !== 'pending') { res.status(409).json({ error: `intro already ${intro.status}` }); return }
 
+  // Bridge a pre-2A history into facts before writing any. Without it, a legacy accept on an
+  // intro created before this build leaves the target's two authorizations with no
+  // request_intro antecedent, so hasMutualInterest is false forever: the requester's
+  // canonical share_contact is then refused `wrong_state` and the pair can never connect on
+  // the canonical lane. The status check above already established `pending`, which is the
+  // only bridgeable value, so this cannot refuse here.
+  bridgePre2AIntro(id)
+
   if (action === 'accept') {
     if (typeof contact !== 'string' || contact.trim().length === 0) { res.status(400).json({ error: 'accept requires a contact line' }); return }
     if (contact.length > MAX_CONTACT) { res.status(400).json({ error: `contact too long (max ${MAX_CONTACT})` }); return }
@@ -367,8 +379,8 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
       recordAuthorization({ introId: id, actorKey: public_key, operation: 'express_interest', evidenceId, evidence: 'legacy_unbound' })
       recordAuthorization({ introId: id, actorKey: public_key, operation: 'share_contact', evidenceId, evidence: 'legacy_unbound' })
       recordAuthMode('intro', id, public_key, 'legacy_unbound')
-      recordCardEvent('intro_accepted', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, purpose: intro.purpose })
     })()
+    recordCardEvent('intro_accepted', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, purpose: intro.purpose })
     // If both cards share a banked intent, open a structured fit exchange and
     // return the accepter's consent sheet; otherwise the intro proceeds straight
     // to the existing contact-completion flow, unchanged.
@@ -416,8 +428,8 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
       recordAuthorization({ introId: id, actorKey: public_key, operation: 'decline', evidenceId, evidence: 'legacy_unbound' })
       recordAuthorization({ introId: id, actorKey: public_key, operation: 'block_pair', evidenceId, evidence: 'legacy_unbound' })
       recordAuthMode('intro', id, public_key, 'legacy_unbound')
-      recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: true })
     })()
+    recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: true })
     res.json({ id, status: 'declined', blocked: true })
     return
   }
@@ -432,8 +444,8 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
     introsDb.respondIntro(id, 'declined', null)
     recordAuthorization({ introId: id, actorKey: public_key, operation: 'decline', evidenceId, evidence: 'legacy_unbound' })
     recordAuthMode('intro', id, public_key, 'legacy_unbound')
-    recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: false })
   })()
+  recordCardEvent('intro_declined', intro.to_card, public_key, { intro_id: id, from_card: intro.from_card, blocked: false })
   res.json({ id, status: 'declined' })
 }))
 
@@ -443,7 +455,7 @@ router.post('/:id/respond', canonicalDispatch(canonicalRespond), rateLimited('in
 // different routes with two different preimages and two different guards. One operation
 // replaces both, and the actor is whichever party signed.
 //
-// The contact is never in the signed payload. The payload carries a commitment; the value
+// The contact is never in the signed payload. The payload carries a commitment, and the value
 // travels in the opening beside it. So no copy of a signed payload is a copy of the
 // contact, and the payload is safe to store in evidence and to reference in a shared
 // receipt. What it is NOT is end to end encrypted: the server stores the opening.
@@ -483,7 +495,7 @@ const canonicalShareContact = canonicalWriteRoute({
     // so by here the value is the value the principal committed to.
     const contact = gateContact(write.opening!.value)
 
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     requireParty(facts, actorKey, 'either', 'only a party to this introduction may share a contact')
     guardState('share_contact', facts, now)
 
@@ -578,6 +590,11 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async
   if (intro.status !== 'accepted') { res.status(409).json({ error: 'intro is not accepted' }); return }
   if (intro.from_contact) { res.status(409).json({ error: 'intro already complete' }); return }
 
+  // A pre-2A intro reaching here is `accepted`, which is NOT bridgeable, so no bridge is
+  // attempted and no fact is guessed at. The completion still works, on the legacy lane,
+  // exactly as it did before: the column is this intro's truth and the legacy lane never
+  // materializes over it.
+
   // One transaction around the group. The contact column, the authorization, the evidence
   // and the release either all land or none do. Today the single UPDATE is alone, so there
   // was nothing to be atomic with.
@@ -608,7 +625,7 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async
 
   // The release emails, gated on the intro actually being complete rather than fired
   // unconditionally. Today's accept always stored a contact, so the two were the same
-  // thing; a canonical target who expressed interest without sharing makes them differ,
+  // thing. A canonical target who expressed interest without sharing makes them differ,
   // and an ungated send would mail "How to reach them:" with nothing after it.
   if (introsDb.isComplete(final)) {
     try {
@@ -620,7 +637,12 @@ router.post('/:id/complete', rateLimited('intro_complete', 30), asyncRoute(async
     } catch { /* notification failure never affects completion */ }
   }
 
-  res.json({ id, status: 'accepted', complete: true, released })
+  // `complete` reports the intro's ACTUAL state rather than a constant. On a pure legacy flow
+  // both contact columns are set and this stays true, so the published client sees no change.
+  // A canonical target who expressed interest without sharing makes it differ, and the old
+  // value claimed completion while the very next GET /mine answered complete:false, which a
+  // client cannot reconcile because a retry is refused as already complete.
+  res.json({ id, status: 'accepted', complete: introsDb.isComplete(final), released })
 }))
 
 // ── GET /mine (signed) ────────────────────────────────────────────────────

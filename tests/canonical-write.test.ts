@@ -131,6 +131,29 @@ test('PAYLOAD GATE: a lone surrogate is refused', () => {
   assert.throws(() => assertCanonicalPayload({ a: '\ud800' }), { code: 'malformed_unicode' })
 })
 
+test('PAYLOAD GATE: an object KEY is held to the same three string rules as a value', () => {
+  // Added after a review. Keys were unchecked, and one uncovered shape was worse than
+  // cosmetic: `canonicalize` applies its own serializer to keys too, so a lone surrogate in a
+  // key threw a plain Error out of jcs() at the DIGEST step, which runs BEFORE the signature.
+  // An unauthenticated caller therefore reached a 500 with a stack trace from a gate whose
+  // whole job is to answer 400 with a code.
+  assert.throws(() => assertCanonicalPayload({ 'no\nte': 'hi' }), { code: 'control_character' })
+  assert.throws(() => assertCanonicalPayload({ 'a\u0000b': 'hi' }), { code: 'control_character' })
+  assert.throws(() => assertCanonicalPayload({ 'a\u007f': 'hi' }), { code: 'control_character' })
+  assert.throws(() => assertCanonicalPayload({ ' note': 'hi' }), { code: 'edge_whitespace' })
+  assert.throws(() => assertCanonicalPayload({ 'note ': 'hi' }), { code: 'edge_whitespace' })
+  assert.throws(() => assertCanonicalPayload({ '\ud800': 1 }), { code: 'malformed_unicode' })
+  assert.throws(() => assertCanonicalPayload({ outer: { '\ud800': 1 } }), { code: 'malformed_unicode' })
+
+  // The message says WHICH half failed, because a bad key and a bad value are different
+  // problems for a client to fix.
+  assert.throws(() => assertCanonicalPayload({ ' k': 'v' }), /signed key/)
+  assert.throws(() => assertCanonicalPayload({ k: ' v' }), /signed value/)
+
+  // And the shape that used to escape the gate now never reaches jcs at all.
+  assert.throws(() => assertCanonicalPayload({ '\ud800': 1 }), CanonicalPayloadError)
+})
+
 test('PAYLOAD GATE: an ordinary payload passes and is returned unchanged', () => {
   const p = { from_card: 'v3-c-1', to_card: 'v3-c-2', purpose: 'collaborate', note: 'hello there' }
   assert.equal(assertCanonicalPayload(p), p, 'the gate never repairs, it returns the same object')

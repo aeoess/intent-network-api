@@ -30,9 +30,9 @@ import { cardPairResourceId } from './write-envelope.js'
 import {
   authorizationOf, recordAuthorization, withdrawAuthorization,
   withdrawArtifacts, materializeStatus, isReleased, contactsExchanged,
-  grandfatheredRequestOpen,
+  PRE_2A_ANTECEDENT,
 } from './connection-facts.js'
-import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
+import { factsForWrite, guardState, requireParty } from './intro-guards.js'
 import { deriveIntroState } from './connection-state.js'
 import type { IntroFacts } from './connection-state.js'
 
@@ -72,44 +72,34 @@ router.post('/withdraw-request', canonicalWriteRoute({
     const { write, now } = ctx
     const introId = write.envelope.resource.id
     const actorKey = write.envelope.actor_key
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     requireParty(facts, actorKey, 'requester', 'only the requester may withdraw its own request')
 
+    // A pre-2A row's antecedent was bridged by factsForWrite, so there is ONE path here
+    // rather than two. That is a simplification the bridge bought: the grandfathered branch
+    // this handler used to carry, and the second reader of the legacy column it needed, are
+    // both gone.
     const antecedent = authorizationOf(introId, actorKey, 'request_intro')
-
+    if (antecedent === null) {
+      refuseWrite(409, 'no_open_request', 'this introduction carries no open request to withdraw')
+    }
     // An already withdrawn request answers with its own code rather than with the
     // terminal-state refusal, because the caller's situation is specific and a fresh
     // envelope for an act already done is a state answer, not a replay answer.
-    if (antecedent !== null && antecedent.live !== 1) {
+    if (antecedent!.live !== 1) {
       refuseWrite(409, 'already_withdrawn', 'this request was already withdrawn')
-    }
-    // No canonical antecedent at all. Allowed only for a pre-2A row whose legacy
-    // request is still open, which ends the grandfathered path cleanly, and refused
-    // otherwise so nobody can retract a request that was never recorded.
-    const grandfathered = antecedent === null
-    if (grandfathered && !grandfatheredRequestOpen(introId)) {
-      refuseWrite(409, 'no_open_request', 'this introduction carries no open request to withdraw')
     }
     guardState('withdraw_request', facts, now)
 
-    const evidenceId = recordCanonicalEvidence(write)
-    if (grandfathered) {
-      // Recorded as legacy_unbound, because that is what authorized the REQUEST. The
-      // withdrawal itself is canonical and its own evidence row says so. Labelling
-      // this row 'canonical' would manufacture canonical evidence for an act that was
-      // never canonically signed, which is the one thing the adapters may never do.
-      recordAuthorization({ introId, actorKey, operation: 'request_intro', evidenceId, evidence: 'legacy_unbound' })
-    }
-    // Not a refusal. Every reachable reason to refuse was checked above: the row is either
-    // live, or it was just backfilled live. A failure here is an INVARIANT VIOLATION rather
-    // than a caller error, so it becomes a 500 through the pipeline's boundary instead of
-    // pretending the caller did something wrong. Keeping the two apart matters, because a
-    // refusal after a write is a side effect that preceded a check.
+    recordCanonicalEvidence(write)
+    // Not a refusal. Every reachable reason to refuse was checked above, so a failure here
+    // is an INVARIANT VIOLATION rather than a caller error and becomes a logged 500 through
+    // the pipeline's boundary instead of pretending the caller did something wrong.
     if (!withdrawAuthorization({ introId, actorKey, operation: 'request_intro', withdrawnBy: write.writeRef })) {
       throw new Error(`withdraw_request found no live request_intro row after its checks passed: ${introId}`)
     }
     const state = materializeStatus(introId, now)
-    return { intro_id: introId, state, grandfathered }
+    return { intro_id: introId, state, bridged_from_legacy: antecedent!.evidence_id === PRE_2A_ANTECEDENT }
   },
 }))
 
@@ -121,7 +111,7 @@ router.post('/withdraw-interest', canonicalWriteRoute({
     const { write, now } = ctx
     const introId = write.envelope.resource.id
     const actorKey = write.envelope.actor_key
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     requireParty(facts, actorKey, 'target', 'only the target may withdraw its own interest')
 
     // Read the release inside this transaction, which is what makes the race in
@@ -173,7 +163,7 @@ router.post('/withdraw-contact', canonicalWriteRoute({
     const { write, now } = ctx
     const introId = write.envelope.resource.id
     const actorKey = write.envelope.actor_key
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     requireParty(facts, actorKey, 'either')
 
     // The release check and the withdrawal write are in ONE transaction. Split them
@@ -199,8 +189,12 @@ router.post('/withdraw-contact', canonicalWriteRoute({
     const artifacts = withdrawArtifacts(introId, actorKey, 'share_contact')
     recordCanonicalEvidence(write)
     // The state is recomputed, not assigned. If another continuation is live it stays
-    // connecting, and if the withdrawn contact was the only one it regresses to
-    // interested.
+    // connecting. If the withdrawn contact was the only one, the basis falls back to the
+    // express_interest authorization, so it regresses to `interested` ONLY when that interest
+    // is inside its own 30 day window. When the interest is older than that, the fallback
+    // deadline is already past and the intro derives `expired` instead. That is a gap in the
+    // settled TTL rule rather than something this route decides, it is pinned by a test in
+    // tests/intro-expiry.test.ts, and the handoff carries the recommendation.
     const state = materializeStatus(introId, now)
     return { intro_id: introId, state, artifacts_withdrawn: artifacts }
   },
@@ -239,7 +233,7 @@ router.post('/block-pair', canonicalWriteRoute({
     // Check 2. The pair matches the intro. Without it, a signature naming one intro
     // would authorize a block on any two cards the signer chose to list, and check 1
     // would still pass because the id is derived from those same two cards.
-    const facts = factsOrRefuse(introId)
+    const facts = factsForWrite(introId)
     const row = introsDb.getIntro(introId) as introsDb.IntroRow
     const introPair = [row.from_card, row.to_card].sort()
     if (introPair[0] !== cardA || introPair[1] !== cardB) {

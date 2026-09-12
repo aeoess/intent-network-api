@@ -36,7 +36,7 @@ import type { Database } from 'better-sqlite3'
 import { verify } from 'agent-passport-system'
 import { getDb } from './db.js'
 import { jcs, sha256Hex } from './canonical-write.js'
-import { PAYLOAD_DOMAIN, privateValueCommitment } from './write-envelope.js'
+import { PAYLOAD_DOMAIN, WRITE_DOMAIN, ENVELOPE_FIELDS, privateValueCommitment } from './write-envelope.js'
 import type { VerifiedWrite, WriteEnvelope, Resource } from './write-envelope.js'
 import type { Operation } from './connection-state.js'
 
@@ -113,7 +113,14 @@ export function liveArtifactOf(introId: string, authorKey: string, operation: Op
   `).get(introId, authorKey, operation, subject) as ArtifactRow) ?? null
 }
 
-export type ArtifactReadRefusal = 'artifact_not_found' | 'not_a_permitted_reader' | 'artifact_withdrawn'
+/** `artifact_unavailable` covers BOTH "no such artifact" and "not addressed to you", with one
+ *  message, because two distinct answers are an existence oracle: a caller holding a guessed
+ *  id could tell a real one from a fabricated one by comparing refusals. The comment used to
+ *  claim they were indistinguishable while the codes differed.
+ *
+ *  `artifact_withdrawn` stays separate because only a PERMITTED reader can reach it, so it
+ *  tells a stranger nothing. */
+export type ArtifactReadRefusal = 'artifact_unavailable' | 'artifact_withdrawn'
 
 export type ArtifactRead =
   | { ok: true; artifact: ArtifactRow }
@@ -125,14 +132,10 @@ export type ArtifactRead =
  *  forget: being a Mingle user with intros of your own says nothing about this one. */
 export function readArtifact(artifactId: string, readerKey: string): ArtifactRead {
   const row = artifactById(artifactId)
-  if (row === null) {
-    return { ok: false, code: 'artifact_not_found', error: 'no such artifact' }
-  }
-  if (readerKey !== row.author_key && readerKey !== row.recipient_key) {
-    // Deliberately the same shape of answer as a missing artifact carries no id, so a
-    // caller cannot enumerate which artifact ids exist by comparing refusals.
-    return { ok: false, code: 'not_a_permitted_reader', error: 'this artifact is not addressed to you' }
-  }
+  const unavailable = { ok: false as const, code: 'artifact_unavailable' as const, error: 'no artifact is available to you under that id' }
+  // One answer for both, so a caller cannot learn that an id exists by comparing refusals.
+  if (row === null) return unavailable
+  if (readerKey !== row.author_key && readerKey !== row.recipient_key) return unavailable
   if (row.withdrawn === 1) {
     return { ok: false, code: 'artifact_withdrawn', error: 'this authorization was withdrawn' }
   }
@@ -154,15 +157,34 @@ export interface StandaloneResult {
   payload_digest_matches: boolean
   commitment_opens: boolean
   resource_is_expected: boolean
+  /** Is the signer the key the reader expected? WITHOUT this, `ok` means only that SOMEBODY
+   *  signed something that opens to this value. */
+  author_is_expected: boolean
+  /** Is this a mingle-write-v1 envelope carrying exactly the seven envelope fields? */
+  envelope_is_well_formed: boolean
 }
 
-/** Run the recipient's four checks. Nothing here touches the database or any server
- *  key, which is the property being demonstrated: the recipient does not have to trust
- *  Mingle to believe the other side authorized this exact value.
+/** Run the recipient's checks. Nothing here touches the database or any server key, which is
+ *  the property being demonstrated: the recipient does not have to trust Mingle to believe
+ *  the other side authorized this exact value.
  *
- *  `expectedIntroId` is check 4. A caller that does not know which intro it is a party to
- *  has no business calling this. */
-export function verifyArtifactStandalone(artifact: StandaloneArtifact, expectedIntroId: string): StandaloneResult {
+ *  `expectedAuthorKey` and the two envelope checks are NOT decoration. Without the author
+ *  check, a stranger could build their own share_contact envelope over the reader's intro id,
+ *  commit to a value of their choosing, sign it with their OWN key, and this function would
+ *  answer ok:true, byte for byte the same object as for the legitimate artifact. The four
+ *  arithmetic checks establish that a signature, a digest and a commitment agree with each
+ *  other. Only the author check establishes WHOSE authorization it is.
+ *
+ *  The domain and unknown-field checks mirror verifyWriteBody. An envelope carrying an extra
+ *  signed field is refused on the server precisely because such a field may narrow authority,
+ *  and a recipient verifier that accepted it would grant more than the signer asked for while
+ *  the signature said otherwise. A verifier weaker than the server is a verifier that
+ *  endorses what the server would refuse. */
+export function verifyArtifactStandalone(
+  artifact: StandaloneArtifact,
+  expectedIntroId: string,
+  expectedAuthorKey: string,
+): StandaloneResult {
   const { envelope, signature, payload, opening } = artifact
 
   let signatureVerifies = false
@@ -180,14 +202,25 @@ export function verifyArtifactStandalone(artifact: StandaloneArtifact, expectedI
   const recomputedCommitment = privateValueCommitment(envelope.operation, resource, opening.salt, opening.value)
   const commitmentOpens = typeof claimed === 'string' && claimed === recomputedCommitment
 
-  const resourceExpected = resource.type === 'intro' && resource.id === expectedIntroId
+  const resourceExpected = resource !== undefined && resource !== null
+    && resource.type === 'intro' && resource.id === expectedIntroId
+  const authorExpected = typeof expectedAuthorKey === 'string' && expectedAuthorKey.length > 0
+    && envelope.actor_key === expectedAuthorKey
+
+  const keys = envelope === null || typeof envelope !== 'object' ? [] : Object.keys(envelope)
+  const wellFormed = envelope?.domain === WRITE_DOMAIN
+    && keys.length === ENVELOPE_FIELDS.length
+    && ENVELOPE_FIELDS.every(f => keys.includes(f))
 
   return {
-    ok: signatureVerifies && digestMatches && commitmentOpens && resourceExpected,
+    ok: signatureVerifies && digestMatches && commitmentOpens && resourceExpected
+      && authorExpected && wellFormed,
     signature_verifies: signatureVerifies,
     payload_digest_matches: digestMatches,
     commitment_opens: commitmentOpens,
     resource_is_expected: resourceExpected,
+    author_is_expected: authorExpected,
+    envelope_is_well_formed: wellFormed,
   }
 }
 

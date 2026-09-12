@@ -7,11 +7,36 @@
 // refusal rolls everything back.
 
 import { refuseWrite } from './write-pipeline.js'
-import { introFacts } from './connection-facts.js'
+import { introFacts, bridgePre2AIntro } from './connection-facts.js'
 import { deriveIntroState, isWriteAllowedInState, guardRefusal } from './connection-state.js'
 import type { IntroFacts, IntroState, Operation } from './connection-state.js'
 
-/** Load the facts for one intro, or refuse. */
+/** Load the facts for one intro for a WRITE, bridging a pre-2A history first, or refuse.
+ *
+ *  It writes, and the name says so. An intro created before this build has no authorization
+ *  rows, so the derivation would answer `requested` however far that intro had actually
+ *  progressed, and a write would then be admitted against a state the intro is not in. Two
+ *  independent reviewers reached the same defect from opposite ends: a canonical
+ *  express_interest or decline on an already accepted pre-2A intro succeeded and destroyed
+ *  it, and a legacy accept on one left a pair that could never connect on the canonical
+ *  lane.
+ *
+ *  So the bridge runs before the facts are read, once per intro, inside the write's own
+ *  transaction. Only a `pending` pre-2A intro is bridgeable. Anything else has a history the
+ *  legacy column records and the facts do not, and this REFUSES rather than guessing at it,
+ *  because a guess is how a finished connection gets reopened. */
+export function factsForWrite(introId: string): IntroFacts {
+  const bridged = bridgePre2AIntro(introId)
+  if (bridged === 'not_bridgeable') {
+    refuseWrite(409, 'legacy_intro_not_upgradable',
+      'this introduction predates signed writes and has already progressed past a request, so it stays on the path it started on')
+  }
+  const facts = introFacts(introId)
+  if (facts === null) refuseWrite(404, 'intro_not_found', 'no such introduction')
+  return facts as IntroFacts
+}
+
+/** A read-only load, for a caller that is not about to write. */
 export function factsOrRefuse(introId: string): IntroFacts {
   const facts = introFacts(introId)
   if (facts === null) refuseWrite(404, 'intro_not_found', 'no such introduction')

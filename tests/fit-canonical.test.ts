@@ -677,9 +677,109 @@ test('RELEASE_EXACT: the artifact carries the value, the evidence does not, and 
   // The recipient verifies it alone, exactly as for a contact.
   const read = artifacts.readArtifact(art.artifact_id, p.bob.keys.publicKey)
   assert.equal(read.ok, true)
-  const v = artifacts.verifyArtifactStandalone(artifacts.standaloneFrom((read as any).artifact), p.introId)
+  // The author key is a REQUIRED argument now. Without it, `ok: true` meant only that
+  // somebody signed something that opens to this value, which a stranger can also produce.
+  const v = artifacts.verifyArtifactStandalone(
+    artifacts.standaloneFrom((read as any).artifact), p.introId, p.alice.keys.publicKey)
   assert.equal(v.ok, true)
+  assert.equal(v.author_is_expected, true)
+  const wrongAuthor = artifacts.verifyArtifactStandalone(
+    artifacts.standaloneFrom((read as any).artifact), p.introId, p.bob.keys.publicKey)
+  assert.equal(wrongAuthor.author_is_expected, false)
+  assert.equal(wrongAuthor.ok, false, 'a release_exact artifact is bound to WHO released it')
   assert.equal(artifacts.readArtifact(art.artifact_id, generateKeyPair().publicKey).ok, false)
+})
+
+test('RELEASE_EXACT: the commitment must name the policy version the HANDSHAKE was committed under', async () => {
+  // Found by a review, and it was the sharpest of the fit findings. resolvePolicy pinned the
+  // authorization to whatever policy is in force NOW, while GET /:introId discloses the value
+  // from the COMMIT-TIME version. With the two halves on different versions, an owner could
+  // edit a dimension after a commit that had authorized no disclosure of it, sign a release of
+  // the new value, and have the counterparty handed the old one.
+  const { p } = await committed()
+  const committedHash = policyDb.policyHash(p.aliceDims)
+  assert.equal(handshakeDb.getHandshake(p.introId)!.req_policy_hash, committedHash)
+
+  // Supersede Alice's policy and register a commitment to the NEW version.
+  const newDims = [
+    dim('cadence', 'mixed', 'reveal_overlap'),
+    dim('weekly_commitment', { min: 1, max: 2 }, 'reveal_exact'),
+  ]
+  assert.equal((await setPolicy(p.alice, p.aliceCard, newDims)).status, 201)
+  const fresh = await registerCommitment(p.alice, p.aliceCard, newDims)
+  assert.equal(fresh.status, 201, JSON.stringify(fresh.body))
+
+  // A release under the CURRENT commitment is refused, because the handshake did not authorize
+  // against that version.
+  const underCurrent = await postJson(fitUrl(p.introId, '/reveal'),
+    revealBody(p, p.alice, fresh.commitment, 'weekly_commitment', { min: 1, max: 2 }).body)
+  assert.equal(underCurrent.status, 409, JSON.stringify(underCurrent.json))
+  assert.equal(underCurrent.json.code, 'policy_commitment_not_committed')
+  assert.equal(handshakeDb.releasersFor(
+    handshakeDb.parseReleased(handshakeDb.getHandshake(p.introId)!.released_exacts_json), 'weekly_commitment',
+  ).length, 0, 'and nothing was released')
+
+  // The COMMITTED commitment still works, and the value it names is the committed one, which is
+  // the value the read surface serves.
+  const underCommitted = await postJson(fitUrl(p.introId, '/reveal'),
+    revealBody(p, p.alice, p.aliceCommitment, 'weekly_commitment', { min: 20, max: 40 }).body)
+  assert.equal(underCommitted.status, 201, JSON.stringify(underCommitted.json))
+  assert.equal(underCommitted.json.added, true)
+})
+
+test('FIT_COMMIT: a standing scope must itself apply, even when nothing is evaluable', async () => {
+  // Found by a review. The scope's expiry, intents and dimensions were enforced ONLY inside the
+  // per-dimension loop, which is skipped entirely when nothing is mutually evaluable. So a
+  // server-signed receipt could say "authorized under standing scope S" for a scope that had
+  // expired years ago or was registered for another intent.
+  const p = await pair()
+  const req = await canonicalFitRequest(p, {
+    requested_dimensions: ['cadence'], reciprocal_offer: ['cadence'],
+  })
+  assert.equal(req.status, 201, JSON.stringify(req.json))
+
+  const expired = autonomyDb.validateScope({
+    intents: ['cofound'], dimensions: ['cadence', 'weekly_commitment'],
+    auto_reveal_overlap: true, reveal_bucket_on_reciprocity: true,
+    ask_before_exact: true, forbidden_categories: [],
+    expiry: new Date(Date.now() - 365 * 864e5).toISOString(),
+  }).scope!
+  const expiredHash = autonomyDb.scopeHash(expired)
+  const sn = 'sx' + rid()
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy`, {
+    card_id: p.bobCard, scope: expired, approved_hash: expiredHash, public_key: p.bob.keys.publicKey, nonce: sn,
+    signature: sign(`set-fit-autonomy:${p.bobCard}:${expiredHash}:${sn}`, p.bob.keys.privateKey),
+  })).status, 201, 'validateScope accepts any parseable expiry, including a past one')
+
+  // accept_dimensions names something the request did not, so nothing is evaluable and the
+  // per-dimension loop never runs.
+  const r = await canonicalFitCommit(p, req.built.writeRef, {
+    accept_dimensions: ['weekly_commitment'], reciprocal_offer: ['weekly_commitment'],
+    standing_scope_commitment: expiredHash,
+  })
+  assert.equal(r.status, 403, JSON.stringify(r.json))
+  assert.equal(r.json.code, 'standing_scope_expired')
+  assert.equal(handshakeDb.getHandshake(p.introId)!.state, 'requested', 'and nothing was committed')
+})
+
+test('FIT_COMMIT: a standing scope registered for another intent is refused', async () => {
+  const p = await pair()
+  const req = await canonicalFitRequest(p)
+  const other = autonomyDb.validateScope({
+    intents: ['collaborate'], dimensions: ['cadence'],
+    auto_reveal_overlap: true, reveal_bucket_on_reciprocity: true,
+    ask_before_exact: true, forbidden_categories: [], expiry: future(),
+  }).scope!
+  const h = autonomyDb.scopeHash(other)
+  const sn = 'sy' + rid()
+  assert.equal((await postJson(`${base}/api/v4/fit/autonomy`, {
+    card_id: p.bobCard, scope: other, approved_hash: h, public_key: p.bob.keys.publicKey, nonce: sn,
+    signature: sign(`set-fit-autonomy:${p.bobCard}:${h}:${sn}`, p.bob.keys.privateKey),
+  })).status, 201)
+  const r = await canonicalFitCommit(p, req.built.writeRef, { standing_scope_commitment: h })
+  assert.equal(r.status, 403, JSON.stringify(r.json))
+  assert.equal(r.json.code, 'standing_scope_wrong_intent',
+    'the handshake intent is cofound and the scope covers collaborate')
 })
 
 // ══════════════════════════════════════════════════════════════
@@ -739,6 +839,30 @@ test('FIRST_STEP_PROPOSE: the half is the payload, so the digest covers every fi
   assert.equal(linked.status, 400)
   assert.equal(linked.json.code, 'half_contains_link')
   assert.equal(firstStepDb.getFirstStep(p.introId)!.half_b_json, null, 'and nothing was stored')
+})
+
+test('FIRST_STEP_PROPOSE: an EXTRA signed field is refused rather than silently dropped', async () => {
+  // Found by a review. This was the one canonical fit action with no payload key gate, because
+  // validateHalf copies seven known keys into a fresh object and ignores the rest. So an eighth
+  // field was covered by payload_digest, accepted with a 201, and discarded, and the
+  // counterparty would then approve a merged digest from which the principal's signed clause
+  // had vanished. That is exactly what gatePayloadKeys refuses everywhere else.
+  const { p } = await committed()
+  const withExtra = await propose(p, p.alice, { ...half(), equity_split: '50/50' })
+  assert.equal(withExtra.status, 400, JSON.stringify(withExtra.json))
+  assert.equal(withExtra.json.code, 'malformed_payload')
+  assert.match(withExtra.json.error, /unexpected payload field: equity_split/)
+  assert.equal(firstStepDb.getFirstStep(p.introId), null, 'and nothing was stored')
+
+  // A missing required field is refused the same way, by the gate rather than by validateHalf.
+  const { expiry, ...withoutExpiry } = half()
+  const missing = await propose(p, p.alice, withoutExpiry)
+  assert.equal(missing.status, 400)
+  assert.equal(missing.json.code, 'malformed_payload')
+  assert.match(missing.json.error, /missing expiry/)
+
+  // The exact seven still pass.
+  assert.equal((await propose(p, p.alice, half())).status, 201)
 })
 
 test('FIRST_STEP_APPROVE: a digest that changed between read and write is refused, inside one transaction', async () => {

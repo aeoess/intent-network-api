@@ -120,6 +120,7 @@ export type EnvelopeRejection =
   | 'malformed_payload_digest'
   | 'unexpected_envelope_field'
   | 'missing_signature'
+  | 'malformed_signature'
   | 'payload_digest_mismatch'
   | 'signature_invalid'
   | 'stale_authorization'
@@ -140,8 +141,11 @@ export type EnvelopeResult =
   | { ok: true; write: VerifiedWrite }
   | { ok: false; status: number; code: EnvelopeRejection; error: string }
 
-const ENVELOPE_FIELDS = ['domain', 'operation', 'actor_key', 'resource', 'issued_at', 'nonce', 'payload_digest'] as const
+/** Exported so a recipient-side verifier can apply the SAME unknown-field rule the server
+ *  applies. A verifier weaker than the server endorses what the server would refuse. */
+export const ENVELOPE_FIELDS = ['domain', 'operation', 'actor_key', 'resource', 'issued_at', 'nonce', 'payload_digest'] as const
 const HEX64 = /^[0-9a-f]{64}$/
+const SIG_HEX = /^[0-9a-f]{128}$/
 // ISO 8601 with milliseconds and a literal Z. One shape, so two implementations
 // cannot disagree about what a timestamp means.
 const ISO_MS_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
@@ -169,6 +173,15 @@ export function verifyWriteBody(body: WireBody | unknown): EnvelopeResult {
   }
   if (!isPlainObject(envelope)) return bad(400, 'malformed_body', 'envelope must be an object')
   if (typeof signature !== 'string' || signature.length === 0) return bad(400, 'missing_signature', 'signature required')
+  // The SHAPE, not only the presence. The APS verifier decodes with parseInt per byte pair,
+  // which accepts uppercase, whitespace and a sign and truncates at the first non-hex
+  // character, so many distinct strings decode to the same 64 bytes and all of them verify.
+  // Evidence stores the string verbatim and promises a later reader can re-verify it without
+  // trusting the row, and a strict hex decoder in another language rejects those spellings.
+  // One shape, so the stored bytes mean the same thing everywhere.
+  if (!SIG_HEX.test(signature)) {
+    return bad(400, 'malformed_signature', 'signature must be 128 lowercase hex characters')
+  }
   if (!isPlainObject(payload)) return bad(400, 'malformed_body', 'payload must be an object')
 
   // Refusing an unknown envelope field matters, and the danger is concrete. JCS
@@ -214,8 +227,15 @@ export function verifyWriteBody(body: WireBody | unknown): EnvelopeResult {
   if (resource.type !== wantType) {
     return bad(400, 'resource_type_mismatch', `${operation} names a ${wantType}, not a ${resource.type}`)
   }
-  if (typeof envelope.issued_at !== 'string' || !ISO_MS_Z.test(envelope.issued_at) || Number.isNaN(Date.parse(envelope.issued_at))) {
-    return bad(400, 'malformed_issued_at', 'issued_at must be ISO 8601 with milliseconds and a trailing Z')
+  if (typeof envelope.issued_at !== 'string' || !ISO_MS_Z.test(envelope.issued_at)
+      || Number.isNaN(Date.parse(envelope.issued_at))
+      // The shape alone admits a calendar-invalid instant that V8 silently rolls over, so
+      // 2026-02-30 parses as 2026-03-02 and hour 24 as the next midnight. Go, Python and Rust
+      // all reject those, which would leave a signed record with no agreed meaning, and hour
+      // 24 additionally gives two signable strings for one instant. The round trip is what
+      // makes the comment above true.
+      || new Date(Date.parse(envelope.issued_at)).toISOString() !== envelope.issued_at) {
+    return bad(400, 'malformed_issued_at', 'issued_at must be ISO 8601 with milliseconds and a trailing Z, and must name a real instant')
   }
   if (!isValidNonce(envelope.nonce)) {
     return bad(400, 'malformed_nonce', 'nonce must be unpadded base64url of at least 16 CSPRNG bytes, and never a UUID')

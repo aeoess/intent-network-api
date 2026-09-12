@@ -112,6 +112,17 @@ function isRow(w: Warrant): w is EvidenceRow {
   return !!w && !Array.isArray(w) && typeof (w as EvidenceRow).bound_fields_json === 'string'
 }
 
+/** Is this warrant ABSENT, as distinct from present but weak?
+ *
+ *  The distinction is load bearing. `warrants()` fails closed, so a caller that reads a false
+ *  answer as "this side was legacy" turns a MISSING evidence row into a positive claim that
+ *  the side signed a legacy message. Absent means no claim is available, not a weak claim. */
+export function isAbsent(w: Warrant): boolean {
+  if (!w) return true
+  if (isRow(w)) return false
+  return (w as readonly string[]).length === 0
+}
+
 /** Is every one of these fields covered by the signature this warrant records?
  *
  *  Fails closed on an unparseable list and on a missing warrant, because an absent warrant
@@ -130,6 +141,11 @@ export interface RenderedReceipt {
   keys: SentenceKey[]
   /** Set when any side of the act was legacy, so a reader is told once. */
   mixed: boolean
+  /** Set when a warrant was ABSENT rather than weak, so no sentence about that side was
+   *  emitted at all. The approved copy has no sentence for "the evidence for one side is
+   *  missing", and inventing one is not mine to do, so the receipt says LESS instead. A
+   *  receipt that says less is safe. One that overclaims is not. */
+  missing_warrant?: true
 }
 
 function build(pairs: [SentenceKey, boolean][]): RenderedReceipt {
@@ -155,13 +171,19 @@ export function renderConnection(a: Warrant, b: Warrant): RenderedReceipt {
   }
   // The three paragraph form. It states a limit on Mingle's own knowledge rather than a
   // suspicion about the weaker side, which is what makes it honest.
-  return build([
+  //
+  // With a warrant ABSENT rather than weak, the same rule as the fit record applies: the
+  // paragraph that asserts what the weaker side did is suppressed. mixed_para_1 is a server
+  // observation about its own release, so it stands whenever a release happened.
+  const absent = isAbsent(a) || isAbsent(b)
+  const out = build([
     ['mixed_para_1', true],
     ['mixed_para_2', aBound || bBound],
-    ['mixed_para_3', !(aBound && bBound)],
-    ['legacy_side_present', true],
+    ['mixed_para_3', !(aBound && bBound) && !absent],
+    ['legacy_side_present', !absent],
     ['contact_irrevocable', true],
   ])
+  return absent ? { ...out, missing_warrant: true } : out
 }
 
 /** The v4 handshake record, from the fit_request and fit_commit evidence rows. */
@@ -179,15 +201,20 @@ export function renderFitHandshake(args: {
     'payload.accept_dimensions', 'payload.reciprocal_offer', 'payload.policy_commitment', 'payload.request_write_ref',
   ])
   const canonical = requestBound && commitBound
-  return build([
+  // An ABSENT warrant is not a legacy one. fit_legacy asserts that both keys "each sent a
+  // signed fit message naming this introduction", which is a positive claim, and gating it on
+  // the mere absence of a canonical warrant would make a missing evidence row assert it.
+  const absent = isAbsent(args.request) || isAbsent(args.commit)
+  const out = build([
     ['fit_canonical', canonical],
     ['fit_commitment_disclosure', canonical],
-    ['fit_legacy', !canonical],
-    ['legacy_side_present', !canonical],
+    ['fit_legacy', !canonical && !absent],
+    ['legacy_side_present', !canonical && !absent],
     // 5.3 is required wherever a scope applied, and only a canonical commit can establish
     // one: on the legacy lane whether the act was autonomous is established by nothing.
     ['fit_standing_scope', args.standingScope && commitBound],
   ])
+  return absent ? { ...out, missing_warrant: true } : out
 }
 
 /** The First Step record, from the two propose rows and the two approve rows. */
@@ -206,21 +233,26 @@ export function renderFirstStep(args: {
   const bothApproved =
     (warrants(args.approveA, ['payload.approved_digest']) || warrants(args.approveA, ['approved_digest']))
     && (warrants(args.approveB, ['payload.approved_digest']) || warrants(args.approveB, ['approved_digest']))
-  return build([
+  const absent = isAbsent(args.proposeA) || isAbsent(args.proposeB)
+    || isAbsent(args.approveA) || isAbsent(args.approveB)
+  const out = build([
     ['first_step_canonical', bothHalves && bothApproved],
     ['first_step_mixed', !bothHalves && bothApproved],
-    ['legacy_side_present', !bothHalves],
+    ['legacy_side_present', !bothHalves && !absent],
     ['first_step_finality', true],
   ])
+  return absent ? { ...out, missing_warrant: true } : out
 }
 
 /** The intro request record, from its one evidence row. */
 export function renderIntroRequest(row: Warrant): RenderedReceipt {
   const bound = warrants(row, ['payload.to_card', 'payload.purpose', 'payload.note'])
-  return build([
+  const absent = isAbsent(row)
+  const out = build([
     ['request_canonical', bound],
-    ['request_legacy', !bound],
+    ['request_legacy', !bound && !absent],
   ])
+  return absent ? { ...out, missing_warrant: true } : out
 }
 
 /** Every field a row's signature covers, for a surface that wants to show the warrant

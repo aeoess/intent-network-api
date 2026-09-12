@@ -159,8 +159,42 @@ test('ENVELOPE: a signature by the wrong key is refused with 403', () => {
   assert.equal(r.status, 403)
 })
 
-test('ENVELOPE: garbage in the signature field is refused rather than thrown', () => {
-  rej(e.verifyWriteBody(bodyFor({ signOverride: 'not-hex' }).body), 'signature_invalid')
+test('ENVELOPE: garbage in the signature field is refused on SHAPE, before any crypto', () => {
+  // Tightened after a review. The APS verifier decodes with parseInt per byte pair, so it
+  // accepts uppercase, whitespace and a sign and truncates at the first non-hex character,
+  // which means several distinct strings decode to the same 64 bytes and ALL of them verify.
+  // Evidence stores the signature verbatim and promises a later reader can re-verify it
+  // without trusting the row, and a strict hex decoder in another language rejects those
+  // spellings. One shape, so the stored bytes mean the same thing everywhere.
+  rej(e.verifyWriteBody(bodyFor({ signOverride: 'not-hex' }).body), 'malformed_signature')
+  rej(e.verifyWriteBody(bodyFor({ signOverride: 'AB'.repeat(64) }).body), 'malformed_signature')
+  rej(e.verifyWriteBody(bodyFor({ signOverride: 'ab'.repeat(63) }).body), 'malformed_signature')
+  rej(e.verifyWriteBody(bodyFor({ signOverride: 'ab'.repeat(65) }).body), 'malformed_signature')
+  rej(e.verifyWriteBody(bodyFor({ signOverride: ' ' + 'ab'.repeat(64) }).body), 'malformed_signature')
+  // A well shaped signature by the wrong key is still a signature failure, not a shape one.
+  const other = generateKeyPair()
+  rej(e.verifyWriteBody(bodyFor({ privateKey: other.privateKey }).body), 'signature_invalid')
+})
+
+test('ENVELOPE: issued_at must name a REAL instant, not one V8 rolls over', () => {
+  // Added after a review. The shape regex alone admits a calendar-invalid instant: V8 parses
+  // 2026-02-30 as 2026-03-02 and hour 24 as the next midnight, while Go, Python and Rust all
+  // reject them, so the signed record would have no agreed meaning. Hour 24 additionally
+  // gives two signable strings for one instant.
+  for (const bad of [
+    '2026-02-30T00:00:00.000Z',
+    '2026-09-12T24:00:00.000Z',
+    '2026-04-31T12:00:00.000Z',
+  ]) {
+    rej(e.verifyWriteBody(bodyFor({ issuedAt: bad }).body), 'malformed_issued_at')
+  }
+  // And a real instant still passes the envelope check, so the round trip did not
+  // over-tighten. Freshness is a separate step, checkFreshness, and verifyWriteBody does not
+  // run it, which is why an old but REAL instant verifies here and is refused later.
+  const verified = ok(e.verifyWriteBody(bodyFor({ issuedAt: '2026-02-28T23:59:59.999Z' }).body))
+  assert.equal(verified.envelope.issued_at, '2026-02-28T23:59:59.999Z')
+  assert.equal(e.checkFreshness(verified.envelope, new Date('2026-09-12T00:00:00.000Z'))!.code, 'stale_authorization',
+    'and the freshness gate is what refuses it, afterwards')
 })
 
 test('ENVELOPE: changing only the operation is a forgery, not a replay', () => {
