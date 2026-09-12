@@ -43,7 +43,29 @@ import { join } from 'node:path'
 
 const repo = new URL('..', import.meta.url).pathname
 const argBase = process.argv.indexOf('--base')
-const BASE = argBase > -1 ? process.argv[argBase + 1] : '909ffe3'
+/** The commit currently deployed, which is what "additive since" has to mean.
+ *
+ *  It was hardcoded to 909ffe3 with a header claiming "the last release tag or 909ffe3", and
+ *  there was no tag lookup. That matters after this deploy: the nine write-subsystem tables do
+ *  not exist at 909ffe3, so they are classified as NEW tables forever and their columns are
+ *  never compared. Verified: adding withdrawn_at to connection_authorizations passed against the
+ *  default base and failed against the real one. Those are exactly the tables the next revision
+ *  is most likely to extend, and connection-facts.ts already documents withdrawn_at as the field
+ *  that cannot be a column at this revision.
+ *
+ *  So: the newest release tag wins, then an explicit --base, and the 909ffe3 fallback says
+ *  loudly that it is guessing. */
+function defaultBase() {
+  try {
+    const tag = execFileSync('git', ['describe', '--tags', '--abbrev=0'], { cwd: repo, encoding: 'utf8' }).trim()
+    if (tag) return { ref: tag, how: 'the newest release tag' }
+  } catch { /* no tags in this repo */ }
+  return { ref: '909ffe3', how: 'a hardcoded fallback, because this repo has no release tag' }
+}
+const baseChoice = argBase > -1
+  ? { ref: process.argv[argBase + 1], how: 'given with --base' }
+  : defaultBase()
+const BASE = baseChoice.ref
 
 let failed = 0
 const ok = m => console.log(`  ok    ${m}`)
@@ -95,9 +117,18 @@ console.log('\n1. receipt keys')
 // ── 2. Additive schema only ───────────────────────────────────────────────
 console.log(`\n2. schema is additive (${BASE}..HEAD)`)
 {
-  let diff = ''
-  try { diff = git('diff', '-U0', `${BASE}..HEAD`, '--', 'src/') } catch (e) {
-    bad(`cannot diff ${BASE}..HEAD: ${e.message}`, `pass --base <ref> naming the currently deployed commit`)
+  note(`base is ${BASE}, ${baseChoice.how}`)
+  if (baseChoice.how.startsWith('a hardcoded fallback')) {
+    note('PASS --base WITH THE COMMIT PRODUCTION IS ACTUALLY RUNNING. Against a base that predates')
+    note('a table, that table is treated as new and its columns are never compared, which is how')
+    note('this check goes quietly blind.')
+  }
+  // The base has to resolve, and this is the check that says so rather than a side effect of an
+  // unused variable. With an unresolvable base, ls-tree below returns nothing, baseSrc is empty,
+  // every table looks new, and the whole section reports ok over a comparison of nothing.
+  try { git('rev-parse', '--verify', `${BASE}^{commit}`) } catch {
+    bad(`${BASE} does not resolve to a commit in this repository`,
+      'pass --base <ref> naming the commit production is running. Without a base, nothing below compares anything.')
   }
 
   // No ALTER TABLE anywhere in the tree, added or otherwise.
@@ -138,10 +169,33 @@ console.log(`\n2. schema is additive (${BASE}..HEAD)`)
   const columnsOf = (sql, table) => {
     for (const m of sql.matchAll(/CREATE TABLE\s+(?:IF NOT EXISTS\s+)?([a-z_][a-z0-9_]*)\s*\(([\s\S]*?)\n\s*\)/gi)) {
       if (m[1] !== table) continue
-      return new Set(m[2].split('\n')
-        .map(l => l.trim())
-        .filter(l => /^[a-z_][a-z0-9_]*\s+(TEXT|INTEGER|REAL|BLOB|NUMERIC)/i.test(l))
-        .map(l => l.split(/\s+/)[0]))
+      // EVERY DECLARATION, not only the five types and not only one per line.
+      //
+      // The old parse required a type from {TEXT, INTEGER, REAL, BLOB, NUMERIC} at the start of
+      // a line, so BOOLEAN, DATETIME, VARCHAR(64), INT, a column with no type at all, and a
+      // second column sharing a physical line were all invisible. All six are valid SQLite and
+      // all six were verified to pass the old check.
+      //
+      // So: split the body on commas at depth zero, which is what SQL means, and treat every
+      // fragment starting with an identifier as a column unless it starts with a table
+      // constraint keyword.
+      const CONSTRAINTS = /^(PRIMARY|UNIQUE|CHECK|FOREIGN|CONSTRAINT)\b/i
+      const body = m[2]
+      const parts = []
+      let depth = 0
+      let cur = ''
+      for (const ch of body) {
+        if (ch === '(') depth++
+        if (ch === ')') depth--
+        if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue }
+        cur += ch
+      }
+      parts.push(cur)
+      return new Set(parts
+        .map(part => part.replace(/--[^\n]*/g, ' ').trim())
+        .filter(part => part.length > 0 && !CONSTRAINTS.test(part))
+        .map(part => (part.match(/^"?([A-Za-z_][A-Za-z0-9_]*)"?/) ?? [])[1])
+        .filter(Boolean))
     }
     return null
   }
@@ -198,7 +252,11 @@ console.log('\n4. the compatibility clock is not being started')
   }
 }
 
-// ── 5. The build and the suites, so a deploy cannot ship a red tree ───────
+// ── 5. The tree, and the commands this script does NOT run for you ───────
+// It used to be headed "the build and the suites, so a deploy cannot ship a red tree", which it
+// could not do: it printed the three commands and read none of their exit codes. Running a full
+// suite inside a preflight would make the preflight the slow thing nobody runs, so the honest
+// arrangement is that this section checks the tree and NAMES what you must run yourself.
 console.log('\n5. the tree itself')
 {
   const status = git('status', '--short').trim()
@@ -206,7 +264,7 @@ console.log('\n5. the tree itself')
   else bad(`working tree is not clean:\n${status.split('\n').map(l => '        ' + l).join('\n')}`, 'commit or stash before deploying, so the deployed commit is the reviewed one')
   const head = git('rev-parse', 'HEAD').trim()
   ok(`HEAD ${head}`)
-  note('Run these two before deploying, and read the exit codes rather than the output:')
+  note('THIS SCRIPT DOES NOT RUN THESE. Run them yourself and read the exit codes:')
   note('  npx tsc --noEmit')
   note('  npm test')
   note('  MINGLE_FIT_ENABLED=1 MINGLE_V2_ENABLED=1 npm test    (the flags are scoped to this command)')

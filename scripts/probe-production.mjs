@@ -1,11 +1,24 @@
 #!/usr/bin/env node
 // ══════════════════════════════════════════════════════════════
-// Post-deploy production probes. READ ONLY, and that is enforced by what it sends.
+// Post-deploy production probes. No business write, and here is exactly what it does touch.
 // ══════════════════════════════════════════════════════════════
-// Run AFTER the API deploy, against the deployed URL. Nothing here creates, changes or
-// deletes anything: every request is either a GET, or a POST whose body is deliberately
-// unsignable so the server refuses it before any write. Running it twice changes nothing,
-// and running it a hundred times changes nothing.
+// Run AFTER the API deploy, against the deployed URL.
+//
+// WHAT IT DOES NOT DO: it creates, changes or deletes no card, no introduction, no
+// authorization, no receipt and no subscription. Every request is a GET, or a POST whose body
+// cannot authorize anything, so each one is refused before any handler writes.
+//
+// WHAT IT DOES TOUCH, because a script that claims to touch nothing and then writes is worse
+// than one that says so:
+//   - `rate_limits` counter rows, three or four per run. Every /api/v3 request passes a limiter
+//     that upserts a counter before the handler refuses. Keyed per hour and per IP.
+//   - On a database that has never served a v3 card read, the first `cards/search` creates the
+//     v3 card and embedding tables, which this build creates lazily on first use.
+// Neither is business state and neither is reversible in the sense that matters, because
+// neither carries anything. An earlier version of this script also posted to the legacy intro
+// request route, which consumed the 20 per hour `intro_request` bucket shared with real 3.2.x
+// clients behind the same address: enough runs in one clock hour turned this script red for a
+// reason unrelated to the deploy. That probe is gone, see probe 3.
 //
 //   node scripts/probe-production.mjs --url https://api.aeoess.com
 //
@@ -27,10 +40,16 @@
 //    a non-null value means something stamped the clock, and the marker is INSERT OR IGNORE,
 //    so it cannot be corrected by stamping again.
 //
-//  3 GRANDFATHERED LEGACY CLIENT. A published 3.2.x install must still be able to change a
-//    connection. Probed WITHOUT writing: a legacy-shaped body with an unusable signature must
-//    be refused for the signature, not for the window. A 403 proves the lane is open and
-//    reachable. A 426 would prove it is closed, which at this point would be a defect.
+//  3 GRANDFATHERED LEGACY CLIENT, answered from the capability field and NOT by a write probe.
+//    The earlier version posted an unsignable legacy body and read the refusal. That could not
+//    work: every legacy route checks the signature BEFORE the window, deliberately, so an
+//    unauthorized caller learns nothing about the window. Verified against a server with the
+//    window fully closed, where the probe still reported the lane open. It also accepted a 404
+//    as proof of reachability, so a server with no such route at all passed.
+//    `legacy_accepted` in probe 2 is the authoritative answer, and it is the same answer the
+//    server gives its own clients. The write-level property, that a real 3.2.x body is accepted
+//    and creates a real introduction, cannot be checked read-only against production: it is
+//    driven end to end against a local API in mingle-mcp's e2e suite instead.
 //
 //  4 BOTH CONTAINMENTS. The v2 surface and the fit surface must each answer with their own
 //    refusal and their own approved sentence, and the root index must advertise neither.
@@ -55,8 +74,14 @@ const ok = m => console.log(`  ok    ${m}`)
 const bad = (m, why) => { failed++; console.log(`  FAIL  ${m}`); if (why) console.log(`        ${why}`) }
 const note = m => console.log(`        ${m}`)
 
+/** A GET that reports a dead endpoint rather than throwing an undici stack at the operator. */
 async function get(path) {
-  const res = await fetch(`${URL_}${path}`)
+  let res
+  try {
+    res = await fetch(`${URL_}${path}`, { signal: AbortSignal.timeout(20000) })
+  } catch (e) {
+    return { status: 0, body: null, unreachable: e.message }
+  }
   let body = null
   try { body = await res.json() } catch { body = null }
   return { status: res.status, body }
@@ -65,9 +90,15 @@ async function get(path) {
 /** A POST whose body cannot possibly authorize anything. Used to ask a route whether it is
  *  reachable without asking it to do something. */
 async function unsignablePost(path, body) {
-  const res = await fetch(`${URL_}${path}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  })
+  let res
+  try {
+    res = await fetch(`${URL_}${path}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    })
+  } catch (e) {
+    return { status: 0, body: null, unreachable: e.message }
+  }
   let out = null
   try { out = await res.json() } catch { out = null }
   return { status: res.status, body: out }
@@ -78,6 +109,12 @@ if (URL_ !== '') {
   console.log(`\n1. the deploy is up and serving v3 (${URL_})`)
   {
     const health = await get('/health')
+    if (health.unreachable) {
+      bad(`${URL_} is not reachable: ${health.unreachable}`,
+        'nothing below can run. Check the URL, the deploy and the network, then re-run.')
+      console.log('\nPROBES FAILED: the endpoint did not answer at all')
+      process.exit(1)
+    }
     if (health.status === 200) ok('/health 200')
     else bad(`/health answered ${health.status}`, 'the deploy is not serving. Stop here and look at the logs.')
 
@@ -114,26 +151,25 @@ if (URL_ !== '') {
   // ── 3. Grandfathered legacy client ───────────────────────────────────────
   console.log('\n3. a published 3.2.x client can still change a connection')
   {
-    // The exact body shape mingle-mcp 3.2.2 sends, with a signature that cannot verify. The
-    // server must refuse it for the SIGNATURE. A 426 here would mean the window is closed.
-    const probe = await unsignablePost('/api/v3/intros/request', {
-      from_card: 'probe-not-a-card', to_card: 'probe-not-a-card-either', purpose: 'meet',
-      note: 'A read only probe. This body cannot authorize anything.',
-      public_key: '0'.repeat(64), nonce: 'probe-nonce', signature: '0'.repeat(128),
-    })
-    if (probe.status === 426 || probe.body?.code === 'client_upgrade_required') {
-      bad('the legacy lane answered client_upgrade_required',
-        'the 30 day window is closed for this shape, so every published 3.2.x install is already cut off. This must not be true before the MCP is published.')
-    } else if (probe.status === 403 || probe.status === 401) {
-      ok(`the legacy lane is reachable and refused the probe for its signature (${probe.status})`)
-      note('Nothing was created: the signature cannot verify, so the handler refused before any write.')
-    } else if (probe.status === 400 || probe.status === 404) {
-      ok(`the legacy lane is reachable and refused the probe on its shape (${probe.status})`)
-      note(`answer: ${JSON.stringify(probe.body)}`)
-      note('Not a 426, which is the part that matters: the window is open.')
+    // Probe 2 already read the authoritative answer. This states what it means, and does not
+    // attempt a write probe: every legacy route checks the signature before the window, so an
+    // unsignable body cannot observe the window and the old probe reported the lane open even
+    // against a server that had closed it.
+    const cap = (await get('/')).body?.write_authorization
+    if (cap?.legacy_accepted === true && cap?.legacy_cutoff_at === null) {
+      ok('the window is open and unstamped, so every published 3.2.x install can still change a connection')
+      note('This is the same answer the server gives its own clients, and the only one available')
+      note('read-only: a legacy route refuses an unsigned body for the signature, before the window,')
+      note('so no probe can observe the window without a real signature and a real write.')
+      note('The write-level property is covered end to end against a local API by')
+      note('mingle-mcp/test/e2e-two-principals.test.ts, which posts a real 3.2.2 body and')
+      note('asserts a real introduction comes back with every field that client reads.')
+    } else if (cap?.legacy_accepted === false) {
+      bad('legacy_accepted is false, so every published 3.2.x install is already cut off',
+        'this must not be true before the MCP is published. Check whether the clock was stamped.')
     } else {
-      bad(`the legacy lane answered ${probe.status}: ${JSON.stringify(probe.body)}`,
-        'expected a refusal for the signature or the shape. Anything else needs reading before the MCP is published.')
+      bad(`the capability field does not answer the window: ${JSON.stringify(cap)}`,
+        'without it a client cannot tell a server that has not answered from one that does not know about canonical writes.')
     }
   }
 
@@ -148,12 +184,18 @@ if (URL_ !== '') {
       } else bad(`the v2 sentence has drifted: ${JSON.stringify(v2.body.error)}`)
     } else bad(`POST /api/feedback answered ${v2.status} ${JSON.stringify(v2.body)}`, 'expected 503 v2_disabled. A live v2 surface exposes the authorization model this flag contains.')
 
+    // bad(), not note(). This branch used note() for the sentence, so replacing the approved fit
+    // text with anything at all still printed PROBES OK. The v2 branch above always checked its
+    // sentence, so one of the two claims the commit made was unenforced.
     const fit = await unsignablePost('/api/v4/fit/probe-not-an-intro/request', {})
     if (fit.status === 503) {
       ok('the fit surface refuses')
       if (fit.body?.error === 'Agent fit is temporarily unavailable. You can still continue the introduction directly.') {
         ok('and with its approved sentence, byte exact')
-      } else note(`fit answer: ${JSON.stringify(fit.body)}`)
+      } else {
+        bad(`the fit sentence has drifted: ${JSON.stringify(fit.body?.error)}`,
+          'it is approved copy and a person reads it. Restore it byte for byte.')
+      }
     } else bad(`POST /api/v4/fit/.../request answered ${fit.status} ${JSON.stringify(fit.body)}`, 'expected 503. MINGLE_FIT_ENABLED must not be set.')
 
     // The index must say the legacy product is unavailable AND must not list any of it. The
@@ -237,7 +279,17 @@ if (DB) {
              to_contact IS NOT NULL AS has_to_contact, created_at, responded_at
       FROM v3_intros ORDER BY created_at, id
     `).all()
-    const auth = db.prepare('SELECT intro_id, COUNT(*) AS n FROM connection_authorizations GROUP BY intro_id').all()
+    // GUARDED. The currently deployed commit has no write subsystem at all, so production's
+    // database has v3_intros and NOT connection_authorizations. The documented pre-deploy
+    // snapshot crashed on this line with a raw SqliteError and wrote no snapshot file, which
+    // meant the "nothing changed across the deploy" check could not be performed on the one
+    // deploy it was written for.
+    const auth = has('connection_authorizations')
+      ? db.prepare('SELECT intro_id, COUNT(*) AS n FROM connection_authorizations GROUP BY intro_id').all()
+      : []
+    if (!has('connection_authorizations')) {
+      note('this database has no connection_authorizations table, which is expected BEFORE the deploy')
+    }
     const authBy = Object.fromEntries(auth.map(a => [a.intro_id, a.n]))
     const snapshot = rows.map(r => ({ ...r, authorizations: authBy[r.id] ?? 0 }))
     console.log(`        ${snapshot.length} intro row(s):`)
@@ -252,17 +304,49 @@ if (DB) {
     } else if (COMPARE) {
       const { readFileSync } = await import('node:fs')
       const before = JSON.parse(readFileSync(COMPARE, 'utf8'))
-      const key = r => `${r.id}|${r.status}|${!!r.has_from_contact}|${!!r.has_to_contact}|${r.responded_at ?? ''}`
-      const beforeKeys = before.map(key).sort()
-      const afterKeys = snapshot.map(key).sort()
-      if (JSON.stringify(beforeKeys) === JSON.stringify(afterKeys)) {
-        ok('every live introduction is exactly as it was before the deploy')
-        note('Nothing migrated it and nothing swept it. The deploy is additive for existing rows.')
-      } else {
-        bad('a live introduction changed across the deploy')
-        for (const k of afterKeys.filter(k => !beforeKeys.includes(k))) console.log(`        after only:  ${k}`)
-        for (const k of beforeKeys.filter(k => !afterKeys.includes(k))) console.log(`        before only: ${k}`)
-        note('An existing row must not be rewritten by a deploy. Escalate before anything else.')
+      // COMPARED BY ID, over the rows that existed BEFORE.
+      //
+      // A sorted set comparison of every row reported a new introduction, which is a person
+      // using the product during the deploy window, as "a live introduction changed across the
+      // deploy, an existing row must not be rewritten, escalate before anything else". Verified:
+      // inserting one new row produced exactly that false escalation. The same happened when an
+      // existing introduction legitimately progressed. What this check is for is a MIGRATION
+      // touching a row nobody acted on, so it compares each pre-existing id against itself and
+      // reports new and progressed rows as activity.
+      const state = r => `status=${r.status} from_contact=${!!r.has_from_contact} to_contact=${!!r.has_to_contact} responded_at=${r.responded_at ?? 'null'}`
+      const byId = new Map(snapshot.map(r => [r.id, r]))
+      const changed = []
+      const gone = []
+      for (const was of before) {
+        const now = byId.get(was.id)
+        if (now === undefined) { gone.push(was.id); continue }
+        if (state(now) !== state(was)) changed.push({ id: was.id, was: state(was), now: state(now) })
+      }
+      const added = snapshot.filter(r => !before.some(b => b.id === r.id)).map(r => r.id)
+
+      if (gone.length > 0) {
+        bad(`${gone.length} introduction(s) present before the deploy are GONE: ${gone.join(', ')}`,
+          'nothing in this build deletes an introduction row. Escalate before anything else.')
+      }
+      if (changed.length === 0 && gone.length === 0) {
+        ok(`all ${before.length} pre-existing introduction(s) are exactly as they were`)
+        note('Nothing migrated one and nothing swept one.')
+      } else if (changed.length > 0) {
+        // A CHANGE IS NOT AUTOMATICALLY A FAULT. A person acting during the window changes a
+        // row legitimately. It is reported for a human to read rather than called an escalation.
+        note(`${changed.length} pre-existing introduction(s) changed state during the window:`)
+        for (const c of changed) {
+          console.log(`        ${c.id}`)
+          console.log(`          before: ${c.was}`)
+          console.log(`          after:  ${c.now}`)
+        }
+        note('Each of these is either somebody acting during the deploy window, which is normal,')
+        note('or a migration that rewrote a row, which nothing in this build does. Read them and')
+        note('decide. A row that moved ALONG the lifecycle is activity. A row that moved backwards,')
+        note('or lost a contact, is not.')
+      }
+      if (added.length > 0) {
+        ok(`${added.length} introduction(s) were created during the window, which is people using it`)
       }
       // Authorization rows may only be ADDED, and only by a principal acting. A row that lost
       // authorizations across a deploy would mean something deleted evidence.
