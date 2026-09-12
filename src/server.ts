@@ -22,7 +22,7 @@ import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
 import { recomputeAllMatches } from './matches-db.js'
 import { runWeeklyDigest } from './weekly.js'
-import { assertReceiptKeyConfigured } from './server-key.js'
+import { assertReceiptKeyConfigured, assertTrustedKeySetConfigured } from './server-key.js'
 
 const PORT = parseInt(process.env.PORT || '3100')
 
@@ -32,9 +32,16 @@ const PORT = parseInt(process.env.PORT || '3100')
 // So the key is a startup requirement rather than a runtime fallback: refuse to
 // serve, and say which variable is wrong, instead of booting into a state where
 // receipts look fine and are not.
+//
+// The whole TRUSTED SET is asserted here too, not only the signing pair: exactly one
+// active_signer, and every retired entry carrying a parseable retired_at. A malformed
+// retired entry would otherwise narrow what verifies later, at read time, on a surface
+// nobody is watching.
 try {
   const key = assertReceiptKeyConfigured()
-  console.log(`[receipt key] issuer ${key.issuerKeyId}`)
+  const trusted = assertTrustedKeySetConfigured()
+  const retired = trusted.filter(e => e.role === 'verification_only')
+  console.log(`[receipt key] active signer ${key.issuerKeyId}, ${retired.length} retired key(s) trusted for verification only`)
 } catch (e) {
   console.error(`[receipt key] refusing to start: ${(e as Error).message}`)
   process.exit(1)

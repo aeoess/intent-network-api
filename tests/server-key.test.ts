@@ -107,43 +107,168 @@ test('RECEIPT KEY: issuer_key_id is derived from the public key and is stable', 
   }).key.issuerKeyId, a)
 })
 
-// ── The trusted key set and resolution ────────────────────────────────────
+// ── The trusted key set, with roles ───────────────────────────────────────
 
-test('RECEIPT KEY: the trusted set holds the current key plus every retired one', () => {
+const RETIRED_AT = '2026-06-01T00:00:00.000Z'
+const BEFORE_RETIREMENT = '2026-05-20T12:00:00.000Z'
+const AFTER_RETIREMENT = '2026-06-01T00:00:00.001Z'
+
+test('ROTATION: every entry holds exactly one role and there is exactly one active signer', () => {
   const retired1 = generateKeyPair()
   const retired2 = generateKeyPair()
-  const set = sk.trustedKeySetFrom({
+  const set = sk.loadTrustedKeySetFrom({
     MINGLE_RECEIPT_PRIVKEY: testKey.privateKey,
     MINGLE_RECEIPT_PUBKEY: testKey.publicKey,
-    MINGLE_RECEIPT_RETIRED_PUBKEYS: `${retired1.publicKey},${retired2.publicKey}`,
+    MINGLE_RECEIPT_RETIRED_PUBKEYS: `${retired1.publicKey}@${RETIRED_AT},${retired2.publicKey}@2025-01-02T03:04:05.678Z`,
   })
-  assert.equal(set.size, 3)
-  assert.equal(set.get(sk.deriveIssuerKeyId(testKey.publicKey)), testKey.publicKey)
-  assert.equal(set.get(sk.deriveIssuerKeyId(retired1.publicKey)), retired1.publicKey)
-  assert.equal(set.get(sk.deriveIssuerKeyId(retired2.publicKey)), retired2.publicKey)
+  assert.equal(set.ok, true)
+  if (!set.ok) return
+  assert.equal(set.entries.length, 3)
+  assert.equal(set.entries.filter(e => e.role === 'active_signer').length, 1)
+  assert.equal(set.active.publicKey, testKey.publicKey)
+  assert.equal(set.active.retiredAt, undefined, 'the active signer carries no retirement time')
+
+  const byId = new Map(set.entries.map(e => [e.issuerKeyId, e]))
+  assert.equal(byId.get(sk.deriveIssuerKeyId(retired1.publicKey))!.role, 'verification_only')
+  assert.equal(byId.get(sk.deriveIssuerKeyId(retired1.publicKey))!.retiredAt, RETIRED_AT)
+  assert.equal(byId.get(sk.deriveIssuerKeyId(retired2.publicKey))!.retiredAt, '2025-01-02T03:04:05.678Z')
+  // And the roles are disjoint, which is what "exactly one of" means.
+  for (const e of set.entries) {
+    assert.equal(e.role === 'verification_only', typeof e.retiredAt === 'string')
+  }
 })
 
-test('RECEIPT KEY: a receipt signed under a retired key still verifies after rotation', () => {
+test('ROTATION: a retired key cannot sign, because retirement is a public key plus a time', () => {
+  const old = generateKeyPair()
+  const fresh = generateKeyPair()
+  const env = {
+    MINGLE_RECEIPT_PRIVKEY: fresh.privateKey,
+    MINGLE_RECEIPT_PUBKEY: fresh.publicKey,
+    MINGLE_RECEIPT_RETIRED_PUBKEYS: `${old.publicKey}@${RETIRED_AT}`,
+  }
+  const set = sk.loadTrustedKeySetFrom(env)
+  assert.equal(set.ok, true)
+  if (!set.ok) return
+  // The only key with a private half anywhere in the configuration is the active
+  // signer, so "only the active signer creates new receipts" is structural rather than
+  // a check that could be forgotten. A retired entry carries no private key at all.
+  assert.equal(set.active.publicKey, fresh.publicKey)
+  for (const e of set.entries) assert.equal((e as any).privateKey, undefined)
+  // And a receipt actually signed with the retired private half does not pass as a new
+  // receipt: it resolves to the retired entry, which is bounded in time.
+  const digest = 'e'.repeat(64)
+  const nowIsh = new Date(Date.parse(RETIRED_AT) + 86400000).toISOString()
+  const out = sk.checkReceiptWith(env, digest, sign(digest, old.privateKey), sk.deriveIssuerKeyId(old.publicKey), nowIsh)
+  assert.equal(out.ok, false)
+  if (out.ok) return
+  assert.equal(out.reason, 'issuer_retired_before_record')
+})
+
+test('ROTATION: a historical receipt under a retired key still verifies', () => {
   const old = generateKeyPair()
   const fresh = generateKeyPair()
   const digest = 'a'.repeat(64)
   const receipt = sign(digest, old.privateKey)
   const oldId = sk.deriveIssuerKeyId(old.publicKey)
 
-  // After rotation the current key is `fresh` and `old` is retained.
+  // After rotation the active signer is `fresh` and `old` is retained with its time.
   const env = {
     MINGLE_RECEIPT_PRIVKEY: fresh.privateKey,
     MINGLE_RECEIPT_PUBKEY: fresh.publicKey,
-    MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey,
+    MINGLE_RECEIPT_RETIRED_PUBKEYS: `${old.publicKey}@${RETIRED_AT}`,
   }
-  assert.equal(sk.verifyReceiptWith(env, digest, receipt, oldId), true,
-    'retention is what stops a rotation invalidating history')
+  const out = sk.checkReceiptWith(env, digest, receipt, oldId, BEFORE_RETIREMENT)
+  assert.equal(out.ok, true, 'retention is what stops a rotation invalidating history')
+  if (!out.ok) return
+  assert.equal(out.role, 'verification_only')
+  // The boundary itself is inside the bound, because the rule is "not after".
+  assert.equal(sk.verifyReceiptWith(env, digest, receipt, oldId, RETIRED_AT), true)
 
   // Drop the retained key and the same receipt becomes unresolvable rather than
   // invalid. Those are different failures and an operator needs to see which.
   const without = { MINGLE_RECEIPT_PRIVKEY: fresh.privateKey, MINGLE_RECEIPT_PUBKEY: fresh.publicKey }
   assert.equal(sk.resolveIssuerKeyWith(without, oldId), null)
-  assert.equal(sk.verifyReceiptWith(without, digest, receipt, oldId), false)
+  assert.equal(sk.verifyReceiptWith(without, digest, receipt, oldId, BEFORE_RETIREMENT), false)
+})
+
+test('ROTATION: a receipt under a retired key recorded AFTER retired_at is refused', () => {
+  const old = generateKeyPair()
+  const fresh = generateKeyPair()
+  const digest = 'b'.repeat(64)
+  const receipt = sign(digest, old.privateKey)
+  const oldId = sk.deriveIssuerKeyId(old.publicKey)
+  const env = {
+    MINGLE_RECEIPT_PRIVKEY: fresh.privateKey,
+    MINGLE_RECEIPT_PUBKEY: fresh.publicKey,
+    MINGLE_RECEIPT_RETIRED_PUBKEYS: `${old.publicKey}@${RETIRED_AT}`,
+  }
+  // One millisecond past the bound. The signature itself is perfectly valid, which is
+  // the point: what is wrong is the receipt existing at that time under that key.
+  const out = sk.checkReceiptWith(env, digest, receipt, oldId, AFTER_RETIREMENT)
+  assert.equal(out.ok, false)
+  if (out.ok) return
+  assert.equal(out.reason, 'issuer_retired_before_record')
+
+  // And a missing record time fails closed rather than waiving the bound, because a
+  // waived bound is the same as no retirement at all.
+  const noTime = sk.checkReceiptWith(env, digest, receipt, oldId)
+  assert.equal(noTime.ok, false)
+  if (noTime.ok) return
+  assert.equal(noTime.reason, 'record_time_unknown')
+  // A malformed record time is the same failure, not an accepted one.
+  assert.equal(sk.verifyReceiptWith(env, digest, receipt, oldId, '2026-06-01'), false)
+
+  // The active signer needs no record time, because it is not bounded.
+  const currentDigest = 'c'.repeat(64)
+  assert.equal(
+    sk.verifyReceiptWith(env, currentDigest, sign(currentDigest, fresh.privateKey), sk.deriveIssuerKeyId(fresh.publicKey)),
+    true)
+})
+
+test('ROTATION: a malformed, duplicated or self-referential retired entry refuses at startup', () => {
+  const old = generateKeyPair()
+  const base = { MINGLE_RECEIPT_PRIVKEY: testKey.privateKey, MINGLE_RECEIPT_PUBKEY: testKey.publicKey }
+  const codeOf = (retired: string) => {
+    const r = sk.loadTrustedKeySetFrom({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: retired })
+    return r.ok ? 'ok' : (r as any).code
+  }
+  // No retirement time at all, which is the entry shape before this ruling. Refused
+  // rather than trusted forever, because trusted forever is the active signer's trust.
+  assert.equal(codeOf(old.publicKey), 'retired_key_malformed')
+  assert.equal(codeOf(`${old.publicKey}@`), 'retired_key_malformed')
+  assert.equal(codeOf(`${old.publicKey}@not-a-date`), 'retired_key_malformed')
+  // A shape V8 would silently roll over into a different day.
+  assert.equal(codeOf(`${old.publicKey}@2026-02-30T00:00:00.000Z`), 'retired_key_malformed')
+  assert.equal(codeOf(`${old.publicKey}@2026-06-01T00:00:00Z`), 'retired_key_malformed')
+  // The same key twice, so its bound would depend on parse order.
+  assert.equal(codeOf(`${old.publicKey}@${RETIRED_AT},${old.publicKey}@2020-01-01T00:00:00.000Z`), 'retired_key_duplicate')
+  // The active signer listed as retired, which is one entry holding two roles.
+  assert.equal(codeOf(`${testKey.publicKey}@${RETIRED_AT}`), 'retired_key_is_active_signer')
+  // And an invalid set resolves NOTHING, so a misconfiguration cannot widen trust.
+  assert.equal(sk.resolveIssuerKeyWith({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey },
+    sk.deriveIssuerKeyId(testKey.publicKey)), null)
+  assert.throws(() => sk.assertReceiptKeyConfigured({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: old.publicKey }),
+    /PUBKEY@RETIRED_AT/)
+  assert.throws(() => sk.assertTrustedKeySetConfigured({ ...base, MINGLE_RECEIPT_RETIRED_PUBKEYS: `${testKey.publicKey}@${RETIRED_AT}` }),
+    /two roles|exactly one role/)
+})
+
+test('ROTATION: the module says out loud what it does not prevent', async () => {
+  // The time bound rests on the server's own record of when it issued a receipt. It
+  // bounds an honest server and a key that leaks later. It cannot contradict a holder
+  // of a compromised retired private key who claims a time at or before retired_at,
+  // and the module header has to say so rather than implying a guarantee it has not
+  // got. Asserted mechanically so the limit cannot be quietly deleted.
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('../src/server-key.ts', import.meta.url), 'utf8')
+  assert.match(src, /BACKDATING/, 'the header must name the attack it does not stop')
+  assert.match(src, /transparency log|timestamp/, 'and must name what would stop it')
+  assert.match(src, /outside 2B/, 'and must say the mechanism is out of scope here')
+  // Configuration and verifier machinery only: no key management surface landed.
+  assert.equal(typeof (sk as any).rotateKey, 'undefined')
+  assert.equal(typeof (sk as any).retireKey, 'undefined')
+  assert.equal(typeof (sk as any).setActiveSigner, 'undefined')
+  assert.equal(src.includes('CREATE TABLE'), false, 'no database backed rotation service')
 })
 
 test('RECEIPT KEY: an unresolvable issuer_key_id is reported as unresolvable, not as a bad signature', () => {
