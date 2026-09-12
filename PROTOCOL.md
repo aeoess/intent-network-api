@@ -113,6 +113,14 @@ recomputation that re-derives an existing pair never notifies again.
 - `POST /api/v3/intros/request`, `POST /api/v3/intros/:id/respond`,
   `POST /api/v3/intros/:id/complete`, `GET /api/v3/intros/mine`. Contact lines
   are released only when an intro is complete, and only to the two parties.
+- `GET /api/v3/intros/mine` also carries the owner side projection for the calling
+  key: `state` (the derived lifecycle state), `expires_at` (derived, never stored)
+  and `pending_actions` (the operations available to THIS key right now). All three
+  come from one derivation over the durable authorization facts and are stored
+  nowhere, so two clients cannot disagree about what a principal may do next.
+  `status` remains the compatibility materialization and keeps its exact meaning.
+  A row whose authorization facts are absent carries `state: null` and an empty
+  `pending_actions` rather than a guessed state.
 
 ### Notifications and abuse
 - `POST /api/v3/notifications/subscribe|unsubscribe`, `GET /confirm/:token`,
