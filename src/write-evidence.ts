@@ -78,6 +78,9 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   // The v4 side of the same shape and the same caveat: a hash over what ARRIVED, while the
   // stored drafted text is cleaned and the stored ledger text is a composed sentence.
   fit_answers: ['intro_id', 'answers_submitted'],
+  // fit-qa-round2:${introId}:${nonce} names the intro and nothing about which dimensions
+  // are being escalated, which is matrix row 35 in one line.
+  fit_round2: ['intro_id'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -97,6 +100,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   fit_exchange_custom: 'fit-custom:${id}:${nonce}',
   fit_exchange_answers: 'sha256(JCS({exchange_id, nonce, answers}))',
   fit_answers: 'sha256(JCS({intro_id, nonce, answers}))',
+  fit_round2: 'fit-qa-round2:${introId}:${nonce}',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {

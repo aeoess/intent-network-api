@@ -1228,3 +1228,112 @@ test('FIT ANSWERS: anti-downgrade, a canonical answer closes the legacy form for
   assert.equal(qaDb.qaForIntro(p.introId).find(r => r.dimension === 'cadence')!.text, 'Mixed.',
     'and the refused call changed nothing')
 })
+
+// ══════════════════════════════════════════════════════════════
+// fit_round2, canonical (step 22b)
+// ══════════════════════════════════════════════════════════════
+// Matrix row 35, rank 12, NO. The round two dimension ids were entirely outside the signed
+// bytes, so the signature said the key holder wanted a round two and nothing about on what.
+// The plan's step 12 was expected to cover this and did not: the route had no canonical
+// branch, which the release gate found mechanically.
+
+test('FIT ROUND2: the signed dimension ids are stored exactly, and the act is a continuation', async () => {
+  const p = await pair()
+  const req = await canonicalFitRequest(p)
+  assert.equal(req.status, 201)
+  const s = signedBody({
+    operation: 'fit_round2', resource: { type: 'intro', id: p.introId },
+    payload: { dimension_ids: ['cadence', 'weekly_commitment'], antecedent_write_ref: req.built.writeRef },
+    keys: p.bob.keys,
+  })
+  const res = await postJson(fitUrl(p.introId, '/round2'), s.body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.deepEqual(res.json.round2, ['cadence', 'weekly_commitment'])
+
+  const stored = qaDb.round2ForIntro(p.introId)
+  assert.deepEqual(stored.map(r => r.dimension).sort(), ['cadence', 'weekly_commitment'])
+  for (const r of stored) assert.equal(r.requester_key, p.bob.keys.publicKey)
+
+  const row = evidence.evidenceByWriteRef(s.built.writeRef)!
+  assert.deepEqual(evidence.boundFieldsOf(row),
+    ['operation', 'resource.id', 'payload.dimension_ids', 'payload.antecedent_write_ref'])
+  assert.equal(evidence.covers(row, 'payload.question_ids'), false,
+    'the v4 route sends dimension_ids, so its bound list must not name the v3 field')
+
+  // The continuation row, which nothing wrote before this branch existed.
+  const auth = facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_round2' as any)!
+  assert.equal(auth.live, 1)
+  assert.equal(auth.evidence, 'canonical')
+  const proj = facts.introProjection(p.introId, p.bob.keys.publicKey)!
+  assert.equal(proj.expires_at, new Date(Date.parse(auth.created_at) + 30 * 864e5).toISOString())
+})
+
+test('FIT ROUND2: an unaskable dimension is REFUSED rather than silently dropped', async () => {
+  // The legacy loop drops a dimension with no canonical question, so a signer could be told
+  // their escalation was accepted while half of it was discarded.
+  const p = await pair()
+  const req = await canonicalFitRequest(p)
+  const s = signedBody({
+    operation: 'fit_round2', resource: { type: 'intro', id: p.introId },
+    payload: { dimension_ids: ['cadence', 'favourite_colour'], antecedent_write_ref: req.built.writeRef },
+    keys: p.bob.keys,
+  })
+  const res = await postJson(fitUrl(p.introId, '/round2'), s.body)
+  assert.equal(res.status, 400)
+  assert.equal(res.json.code, 'dimension_not_askable')
+  assert.deepEqual(qaDb.round2ForIntro(p.introId), [], 'and the askable one did not survive the refusal')
+
+  // The legacy lane still drops, because a published client depends on it. Driven from a
+  // legacy pair, because Bob has signed canonically on the pair above and anti-downgrade
+  // would refuse him the old form there, which is the correct answer and a different test.
+  const old = await legacyPair()
+  const nonce = 'lr' + rid()
+  const legacy = await postJson(fitUrl(old.introId, '/round2'), {
+    dimension_ids: ['cadence', 'favourite_colour'], public_key: old.bob.keys.publicKey, nonce,
+    signature: sign(`fit-qa-round2:${old.introId}:${nonce}`, old.bob.keys.privateKey),
+  })
+  assert.equal(legacy.status, 200, JSON.stringify(legacy.json))
+  assert.deepEqual(qaDb.round2ForIntro(old.introId).map(r => r.dimension), ['cadence'],
+    'one of the two was dropped and the response said both')
+})
+
+test('FIT ROUND2: the antecedent must resolve and must name this intro, and the cap is three', async () => {
+  const p = await pair()
+  const req = await canonicalFitRequest(p)
+  const other = await pair()
+  const otherReq = await canonicalFitRequest(other)
+
+  const call = (payload: any) => postJson(fitUrl(p.introId, '/round2'), signedBody({
+    operation: 'fit_round2', resource: { type: 'intro', id: p.introId }, payload, keys: p.bob.keys,
+  }).body)
+
+  const nowhere = await call({ dimension_ids: ['cadence'], antecedent_write_ref: 'a'.repeat(64) })
+  assert.equal(nowhere.json.code, 'unknown_antecedent')
+  const elsewhere = await call({ dimension_ids: ['cadence'], antecedent_write_ref: otherReq.built.writeRef })
+  assert.equal(elsewhere.json.code, 'antecedent_other_resource')
+  const tooMany = await call({
+    dimension_ids: ['cadence', 'decision_model', 'start_window', 'weekly_commitment'],
+    antecedent_write_ref: req.built.writeRef,
+  })
+  assert.equal(tooMany.json.code, 'malformed_payload')
+  assert.match(String(tooMany.json.error), /cap is 3/)
+  assert.deepEqual(qaDb.round2ForIntro(p.introId), [])
+})
+
+test('FIT ROUND2: the legacy lane is recorded as weak and never as a continuation', async () => {
+  const p = await legacyPair()
+  const nonce = 'lw' + rid()
+  const res = await postJson(fitUrl(p.introId, '/round2'), {
+    dimension_ids: ['cadence'], public_key: p.bob.keys.publicKey, nonce,
+    signature: sign(`fit-qa-round2:${p.introId}:${nonce}`, p.bob.keys.privateKey),
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+  const ev = evidence.evidenceForResource('intro', p.introId).filter(e => e.operation === 'fit_round2')
+  assert.equal(ev.length, 1)
+  assert.equal(ev[0].evidence, 'legacy_unbound')
+  assert.deepEqual(evidence.boundFieldsOf(ev[0]), ['intro_id'])
+  assert.equal(evidence.covers(ev[0], 'payload.dimension_ids'), false)
+  assert.equal(ev[0].legacy_preimage, 'fit-qa-round2:${introId}:${nonce}')
+  assert.equal(facts.authorizationOf(p.introId, p.bob.keys.publicKey, 'fit_round2' as any), null,
+    'nothing in those bytes says which dimensions, so there is nothing to move a deadline on')
+})

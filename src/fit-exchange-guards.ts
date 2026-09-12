@@ -19,7 +19,6 @@ import { refuseWrite } from './write-pipeline.js'
 import * as fitDb from './fit-db.js'
 import * as v3db from './v3-db.js'
 import * as introsDb from './intros-db.js'
-import { evidenceByWriteRef } from './write-evidence.js'
 
 function cardActive(cardId: string, now: Date): boolean {
   const c = v3db.getV3Card(cardId)
@@ -44,26 +43,4 @@ export function exchangeForWrite(exchangeId: string, actorKey: string, now: Date
     refuseWrite(409, 'card_unavailable', 'a card in this exchange has been withdrawn, superseded or expired')
   }
   return row
-}
-
-/** The act this one follows must be a real recorded act on the SAME resource.
- *
- *  What an antecedent reference buys, given that resource.id is already inside the
- *  signed envelope: it says WHICH state of the conversation the signer was answering.
- *  Without it one signature over a set of question ids stands for the same escalation
- *  at any later point in the exchange, and the signer cannot tell those apart.
- *
- *  Checked by resolution rather than accepted as an opaque string, because an opaque
- *  string copied into evidence is a field that looks like a check and is not. */
-export function requireAntecedent(resourceType: string, resourceId: string, writeRef: string): void {
-  const row = evidenceByWriteRef(writeRef)
-  if (row === null) {
-    refuseWrite(400, 'unknown_antecedent',
-      'antecedent_write_ref names no write this server recorded')
-  }
-  const ev = row as { resource_type: string; resource_id: string }
-  if (ev.resource_type !== resourceType || ev.resource_id !== resourceId) {
-    refuseWrite(400, 'antecedent_other_resource',
-      'antecedent_write_ref names an act on a different resource, so it cannot place this one in a conversation')
-  }
 }

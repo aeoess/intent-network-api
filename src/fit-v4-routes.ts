@@ -44,6 +44,7 @@ import { boundFieldsFor } from './write-evidence.js'
 // "an unknown payload key is refused rather than dropped" would be two places for that
 // rule to drift.
 import { gateStringList as gateDimensionList, gateHex64, gatePayloadKeys } from './write-payload-gates.js'
+import { requireAntecedent } from './write-antecedent.js'
 
 const router = Router()
 
@@ -1202,7 +1203,38 @@ router.post('/:introId/answers', fitGate, canonicalDispatch(canonicalFitAnswers)
 
 // ── POST /:introId/round2 ──────────────────────────────────────────────────
 
-router.post('/:introId/round2', fitGate, rateLimited('fitv4_hs', 30), (req, res) => {
+const MAX_QA_ROUND2 = 3
+
+const canonicalFitRound2 = canonicalWriteRoute({
+  operations: ['fit_round2'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['dimension_ids', 'antecedent_write_ref'])
+    const dimensionIds = gateDimensionList(write.payload.dimension_ids, 'dimension_ids', MAX_QA_ROUND2)
+    const antecedent = gateHex64(write.payload.antecedent_write_ref, 'antecedent_write_ref')
+    const { introId, actorKey } = fitPreamble(ctx, null)
+    requireAntecedent('intro', introId, antecedent)
+    // EVERY id is checked before the FIRST is written, and an unknown one is REFUSED. The
+    // legacy loop below silently drops a dimension with no canonical question, so a signer
+    // could be told their escalation was accepted while half of it was discarded.
+    for (const dim of dimensionIds) {
+      if (!questionFor(dim)) {
+        refuseWrite(400, 'dimension_not_askable', `dimension "${dim}" has no canonical question`)
+      }
+    }
+
+    for (const dim of dimensionIds) qaDb.addRound2(introId, actorKey, dim)
+    const evidenceId = recordCanonicalEvidence(write)
+    // A continuation, as ruling 12 decided: not a product action, and still a signed act on
+    // a live connection. This is the first branch anywhere that writes the row, which is
+    // why the deadline could not move on an escalation before.
+    recordAuthorization({ introId, actorKey, operation: 'fit_round2', evidenceId, evidence: 'canonical' })
+    const state = materializeStatus(introId, now)
+    return { intro_id: introId, state, round2: dimensionIds }
+  },
+})
+
+router.post('/:introId/round2', fitGate, canonicalDispatch(canonicalFitRound2), rateLimited('fitv4_hs', 30), (req, res) => {
   const introId = String(req.params.introId)
   const { dimension_ids, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(dimension_ids) || dimension_ids.length === 0 || dimension_ids.length > 3 || typeof nonce !== 'string') { res.status(400).json({ error: 'dimension_ids required (1..3)' }); return }
@@ -1210,7 +1242,16 @@ router.post('/:introId/round2', fitGate, rateLimited('fitv4_hs', 30), (req, res)
   const hs = handshakeDb.getHandshake(introId)
   if (!hs) { res.status(404).json({ error: 'no handshake for this intro' }); return }
   if (!isParty(hs, public_key)) { res.status(403).json({ error: 'not a party to this handshake' }); return }
+  const legacyR2Gate = checkLegacyWrite({ resourceType: 'intro', resourceId: introId, actorKey: public_key, introId })
+  if (legacyR2Gate !== null) { refuseLegacy(res, 'fit_round2', introId, legacyR2Gate); return }
   for (const dim of dimension_ids) { if (questionFor(dim)) qaDb.addRound2(introId, public_key, String(dim)) }
+  // Recorded as weak and never as a continuation: fit-qa-round2:${introId}:${nonce} names the
+  // intro and nothing about which dimensions are being escalated, so there is nothing here to
+  // move a deadline on.
+  recordLegacyEvidence({
+    actorKey: public_key, operation: 'fit_round2',
+    resourceType: 'intro', resourceId: introId, signature: String(signature ?? ''),
+  })
   res.json({ ok: true, round2: dimension_ids })
 })
 
