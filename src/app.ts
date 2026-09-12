@@ -20,8 +20,15 @@ import fitRoutes from './fit-routes.js'
 import fitV4Routes from './fit-v4-routes.js'
 import matchRoutes, { v3RateHeaders } from './match-routes.js'
 import { v2Enabled, V2_INDEX_KEYS } from './v2-gate.js'
+import { initWriteSchema } from './write-db.js'
 
 export function createApp() {
+  // The write subsystem tables, created here as well as at server boot. server.ts is not
+  // the only thing that builds this app: a test, a script or a future worker can, and
+  // before this call the legacy adapters on the intro routes would hit "no such table:
+  // write_evidence" the first time a 3.2.x client responded to an intro. Idempotent, and
+  // outside any transaction, which is the whole reason it is not lazy on first use.
+  initWriteSchema()
   const app = express()
 
   // ── Middleware ──

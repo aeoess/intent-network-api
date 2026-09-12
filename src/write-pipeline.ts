@@ -189,3 +189,41 @@ export function isDowngrade(resourceType: string, resourceId: string, actorKey: 
 export function refuseWrite(status: number, code: string, error: string): never {
   throw new WriteRefusal(status, code, error)
 }
+
+// ── Sharing a path with a legacy handler ──────────────────────────────────
+
+/** Is this a canonical body? A body carrying an `envelope` key is canonical and one
+ *  without it is legacy.
+ *
+ *  A shape check and not a header, which is the whole point: a published 3.2.x client
+ *  needs no change to keep working, because its body simply never has the key. A
+ *  header would have required the old client to send something it does not know
+ *  about. */
+export function hasEnvelope(body: unknown): boolean {
+  return body !== null && typeof body === 'object' && !Array.isArray(body)
+    && Object.prototype.hasOwnProperty.call(body, 'envelope')
+}
+
+/** Put a canonical handler in front of a legacy one on the same path.
+ *
+ *  On a path carrying an :id, the signed envelope and the path are two copies of the
+ *  resource identity. This refuses a disagreement rather than picking a winner. The
+ *  comparison reads the unverified body, which is safe because it authorizes nothing:
+ *  agreement only lets the request reach envelope verification, which is what decides
+ *  anything. */
+export function canonicalDispatch(canonical: (req: Request, res: Response) => Promise<void>) {
+  return async (req: Request, res: Response, next: (err?: unknown) => void): Promise<void> => {
+    if (!hasEnvelope(req.body)) { next(); return }
+    const pathId = (req.params as any)?.id
+    if (typeof pathId === 'string' && pathId.length > 0) {
+      const claimed = (req.body as any)?.envelope?.resource?.id
+      if (claimed !== pathId) {
+        refuse(res, 400, 'path_resource_mismatch',
+          'the signed envelope names a different resource than the path')
+        return
+      }
+    }
+    // canonicalWriteRoute carries its own error boundary, so this never rejects.
+    await canonical(req, res)
+  }
+}

@@ -172,6 +172,22 @@ export function hasAuthorizations(introId: string): boolean {
   return !!d().prepare('SELECT 1 FROM connection_authorizations WHERE intro_id = ? LIMIT 1').get(introId)
 }
 
+/** Was this intro created before this build's write subsystem existed?
+ *
+ *  The grandfathering predicate. A pre-2A intro was authorized entirely on the legacy
+ *  path, and the decision is that it stays there until terminal or expired, so it is
+ *  exempt from the legacy write cutoff. An unstamped marker means nothing is
+ *  grandfathered, which is the safe direction: it can only ever refuse an exemption,
+ *  never grant one. */
+export function isPre2AIntro(introId: string): boolean {
+  const marker = getSchemaMarker(MINGLE_2A_MARKER_KEY)
+  if (marker === null) return false
+  const row = d().prepare('SELECT created_at FROM v3_intros WHERE id = ?').get(introId) as
+    { created_at: string } | undefined
+  if (row === undefined) return false
+  return Date.parse(row.created_at) < Date.parse(marker)
+}
+
 /** Is this intro a pre-2A row whose legacy request is still open?
  *
  *  THE ONE PLACE the canonical lane reads v3_intros.status, and the conditions are
@@ -194,14 +210,11 @@ export function hasAuthorizations(introId: string): boolean {
  *  because a derivation that read its own materialization back in would make the
  *  column authoritative by the back door, which is exactly what 14.3 forbids. */
 export function grandfatheredRequestOpen(introId: string): boolean {
-  const marker = getSchemaMarker(MINGLE_2A_MARKER_KEY)
-  if (marker === null) return false
-  const row = d().prepare('SELECT created_at, status FROM v3_intros WHERE id = ?').get(introId) as
-    { created_at: string; status: string } | undefined
-  if (row === undefined) return false
-  if (Date.parse(row.created_at) >= Date.parse(marker)) return false
+  if (!isPre2AIntro(introId)) return false
   if (hasAuthorizations(introId)) return false
-  return row.status === 'pending'
+  const row = d().prepare('SELECT status FROM v3_intros WHERE id = ?').get(introId) as
+    { status: string } | undefined
+  return row !== undefined && row.status === 'pending'
 }
 
 /** Is this intro complete on the legacy lane: accepted with both contact columns?

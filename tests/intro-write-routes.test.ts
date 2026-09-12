@@ -141,7 +141,19 @@ async function intro(shape: Seeded): Promise<Fixture> {
   const r = await legacyRequest(from, fromCard, toCard)
   assert.equal(r.status, 201, `fixture request failed: ${JSON.stringify(r.json)}`)
   const f: Fixture = { id: r.json.id as string, from, to, fromCard, toCard }
-  if (shape === 'bare') return f
+  if (shape === 'bare') {
+    // A pre-2A intro, which means an intro row with NO write subsystem rows of any kind,
+    // because the code that writes them did not exist when it was created. The legacy
+    // adapter now records a legacy_unbound request_intro authorization for every legacy
+    // request, so the only way to get this shape is to remove what the adapter wrote.
+    // That is not a shortcut: it is exactly the state of a row on disk from before this
+    // build, and it is the only state the grandfathering bridge can fire for.
+    const d = db.getDb()
+    d.prepare('DELETE FROM connection_authorizations WHERE intro_id = ?').run(f.id)
+    d.prepare('DELETE FROM write_evidence WHERE resource_type = ? AND resource_id = ?').run('intro', f.id)
+    d.prepare('DELETE FROM write_auth_mode WHERE resource_type = ? AND resource_id = ?').run('intro', f.id)
+    return f
+  }
 
   seedAuth(f.id, from.keys.publicKey, 'request_intro')
   if (shape === 'requested') return f

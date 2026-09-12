@@ -28,12 +28,13 @@ import type { CanonicalContext } from './write-pipeline.js'
 import { recordCanonicalEvidence } from './write-evidence.js'
 import { cardPairResourceId } from './write-envelope.js'
 import {
-  introFacts, authorizationOf, recordAuthorization, withdrawAuthorization,
+  authorizationOf, recordAuthorization, withdrawAuthorization,
   withdrawArtifacts, materializeStatus, isReleased, contactsExchanged,
   grandfatheredRequestOpen,
 } from './connection-facts.js'
-import { deriveIntroState, isWriteAllowedInState, guardRefusal } from './connection-state.js'
-import type { IntroFacts, IntroState, Operation } from './connection-state.js'
+import { factsOrRefuse, guardState, requireParty } from './intro-guards.js'
+import { deriveIntroState } from './connection-state.js'
+import type { IntroFacts } from './connection-state.js'
 
 const router = Router()
 
@@ -47,33 +48,7 @@ const router = Router()
  *  Stage 4, and the copy must not imply the mechanism reaches further than it does. */
 export const BLOCK_PAIR_REVIEW_COPY = "You won't be matched or introduced through these two cards again."
 
-// ── Shared guards ─────────────────────────────────────────────────────────
-
-/** Load the facts for one intro, or refuse. */
-function factsOrRefuse(introId: string): IntroFacts {
-  const facts = introFacts(introId)
-  if (facts === null) refuseWrite(404, 'intro_not_found', 'no such introduction')
-  return facts as IntroFacts
-}
-
-/** The standing state guard, run against the derivation rather than against any
- *  stored column, with the refusal code the matrix decided for this pair. */
-function guardState(operation: Operation, facts: IntroFacts, now: Date): IntroState {
-  const state = deriveIntroState(facts, now)
-  if (!isWriteAllowedInState(operation, state)) {
-    const r = guardRefusal(operation, state)
-    refuseWrite(409, r.code, r.error)
-  }
-  return state
-}
-
-function requireParty(facts: IntroFacts, actorKey: string, want: 'requester' | 'target' | 'either'): void {
-  const isFrom = actorKey === facts.from_key
-  const isTo = actorKey === facts.to_key
-  if (want === 'requester' && !isFrom) refuseWrite(403, 'not_the_requester', 'only the requester may withdraw its own request')
-  if (want === 'target' && !isTo) refuseWrite(403, 'not_the_target', 'only the target may withdraw its own interest')
-  if (want === 'either' && !isFrom && !isTo) refuseWrite(403, 'not_a_party', 'only a party to this introduction may act on it')
-}
+// ── Local helpers ─────────────────────────────────────────────────────────
 
 /** Blank this actor's own stored contact column, and never the counterparty's. That
  *  asymmetry is the decision: a withdrawal removes what the withdrawer authorized. */
@@ -98,7 +73,7 @@ router.post('/withdraw-request', canonicalWriteRoute({
     const introId = write.envelope.resource.id
     const actorKey = write.envelope.actor_key
     const facts = factsOrRefuse(introId)
-    requireParty(facts, actorKey, 'requester')
+    requireParty(facts, actorKey, 'requester', 'only the requester may withdraw its own request')
 
     const antecedent = authorizationOf(introId, actorKey, 'request_intro')
 
@@ -142,7 +117,7 @@ router.post('/withdraw-interest', canonicalWriteRoute({
     const introId = write.envelope.resource.id
     const actorKey = write.envelope.actor_key
     const facts = factsOrRefuse(introId)
-    requireParty(facts, actorKey, 'target')
+    requireParty(facts, actorKey, 'target', 'only the target may withdraw its own interest')
 
     // Read the release inside this transaction, which is what makes the race in
     // section 14.2 answerable. Once contacts are released Mingle never pretends they
