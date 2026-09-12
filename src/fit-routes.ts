@@ -302,7 +302,7 @@ router.post('/:id/custom', fitGate, rateLimited('fit_answer', 30), (req, res) =>
 
 // ── POST /:id/close - assemble + sign the record ──────────────────────────
 
-router.post('/:id/close', rateLimited('fit_answer', 30), async (req, res) => {
+router.post('/:id/close', fitGate, rateLimited('fit_answer', 30), async (req, res) => {
   const g = partyGuard(req, res, 'fit-close'); if (!g) return
   const { ex } = g
   const out = closeExchangeNow(ex)
@@ -377,7 +377,13 @@ export function sweepExpiredFitExchanges(): { closed: number } {
 
 // Exposed for tests and manual runs, rate limited per client. The scheduler in
 // server.ts calls sweepExpiredFitExchanges directly, not this route.
-router.post('/sweep', rateLimited('fit_sweep', 6), (_req, res) => { res.json(sweepExpiredFitExchanges()) })
+//
+// Behind fitGate as of step 18, which is CONTAINMENT and not repair: this route reads no
+// body, no public key and no signature, so there is nothing to sign and it cannot be
+// canonicalized at all. The release gate still counts it as unrepaired, deliberately,
+// because a route that counts as contained while the flag is off would make the gate
+// circular. Step 25 removes it.
+router.post('/sweep', fitGate, rateLimited('fit_sweep', 6), (_req, res) => { res.json(sweepExpiredFitExchanges()) })
 
 export { verifyReceipt }
 export default router

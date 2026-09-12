@@ -1007,10 +1007,39 @@ test('FIT GATE: settings, maintenance and reads keep working with the flag unset
     assert.ok(JSON.stringify(gp).includes('cadence'), 'the stored dimension reads back')
     const g = await hsGet(alice, 'intro-none')
     assert.match(String(g.error), /no handshake/, 'a GET on a handshake route still runs')
-    assert.equal((await postJson('/api/v3/fit/sweep')).status, 200, 'the fit sweep is not gated')
-    // The rest of the not-gated list. Each route's own validation may refuse the
-    // empty body, which is a pass. What must never come back is the gate.
-    for (const path of ['/api/v4/fit/autonomy', '/api/v4/fit/autonomy/pause', '/api/v3/fit/disclosures', '/api/v3/fit/ex-none/close']) {
+    // The not-gated list, which is now the SETTINGS routes and nothing else. Each route's
+    // own validation may refuse the empty body, which is a pass. What must never come back
+    // is the gate.
+    for (const path of ['/api/v4/fit/autonomy', '/api/v3/fit/disclosures', '/api/v4/fit/policy/commitment']) {
+      const res = await postJson(path)
+      assert.notEqual(res.status, 503, path)
+      assert.notEqual((await res.json()).code, 'fit_disabled', path)
+    }
+  })
+})
+
+test('FIT GATE: step 18 brought the last three ungated fit mutations behind the gate', async () => {
+  // At 909ffe3 these three were mutations with a PARTIAL verdict and no fitGate in their
+  // middleware chain, so "fit is contained" was true of nine of the twelve routes rather
+  // than of the surface. Found mechanically while building the release gate.
+  //
+  // This is CONTAINMENT and not repair. Each one still counts as unrepaired in the release
+  // gate, because a route that counted as unreachable while the flag is off would make the
+  // gate circular.
+  await withFitFlag(undefined, async () => {
+    for (const path of ['/api/v3/fit/sweep', '/api/v3/fit/ex-none/close', '/api/v4/fit/autonomy/pause']) {
+      const res = await postJson(path)
+      assert.equal(res.status, 503, path)
+      assert.equal((await res.json()).code, 'fit_disabled', path)
+    }
+  })
+  // And with the flag set each one reaches its own handler, so the gate is the only thing
+  // that changed. The sweep answers, and the other two refuse the empty body themselves.
+  await withFitFlag('1', async () => {
+    const swept = await postJson('/api/v3/fit/sweep')
+    assert.equal(swept.status, 200)
+    assert.equal(typeof (await swept.json()).closed, 'number')
+    for (const path of ['/api/v3/fit/ex-none/close', '/api/v4/fit/autonomy/pause']) {
       const res = await postJson(path)
       assert.notEqual(res.status, 503, path)
       assert.notEqual((await res.json()).code, 'fit_disabled', path)

@@ -995,7 +995,7 @@ router.post('/autonomy', rateLimited('fitv4_policy', 20), (req, res) => {
 
 // ── POST /autonomy/pause - halt (or resume) all autonomous disclosure ─────
 
-router.post('/autonomy/pause', rateLimited('fitv4_policy', 30), (req, res) => {
+router.post('/autonomy/pause', fitGate, rateLimited('fitv4_policy', 30), (req, res) => {
   const { card_id, paused, public_key, nonce, signature } = req.body ?? {}
   if (typeof card_id !== 'string' || typeof paused !== 'boolean' || typeof nonce !== 'string') { res.status(400).json({ error: 'card_id, paused, nonce required' }); return }
   if (!checkSig(`fit-autonomy-pause:${card_id}:${paused}:${nonce}`, signature, public_key)) { res.status(403).json({ error: 'signature does not verify' }); return }
