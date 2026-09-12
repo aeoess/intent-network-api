@@ -189,12 +189,12 @@ router.post('/withdraw-contact', canonicalWriteRoute({
     const artifacts = withdrawArtifacts(introId, actorKey, 'share_contact')
     recordCanonicalEvidence(write)
     // The state is recomputed, not assigned. If another continuation is live it stays
-    // connecting. If the withdrawn contact was the only one, the basis falls back to the
-    // express_interest authorization, so it regresses to `interested` ONLY when that interest
-    // is inside its own 30 day window. When the interest is older than that, the fallback
-    // deadline is already past and the intro derives `expired` instead. That is a gap in the
-    // settled TTL rule rather than something this route decides, it is pinned by a test in
-    // tests/intro-expiry.test.ts, and the handoff carries the recommendation.
+    // connecting. If the withdrawn contact was the only one it regresses to `interested`,
+    // and the deadline is 30 days from the LATER of the interest authorization and this
+    // withdrawal, per the closed TTL ruling. So withdrawing your own contact line never
+    // expires an introduction that was alive a moment before, which is what it used to do
+    // whenever the interest was more than 30 days old. connection-state.ts carries the
+    // reasoning and tests/intro-expiry.test.ts carries the regression.
     const state = materializeStatus(introId, now)
     return { intro_id: introId, state, artifacts_withdrawn: artifacts }
   },

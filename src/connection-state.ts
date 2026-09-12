@@ -71,6 +71,13 @@ export interface AuthFact {
   live: boolean
   created_at: string
   evidence: 'canonical' | 'legacy_unbound'
+  /** When an accepted signed withdrawal took this authorization out of live, or null.
+   *
+   *  Not a column. It is the recorded_at of the evidence row for the withdrawing act,
+   *  resolved through withdrawn_by, so the only thing that can set it is an accepted
+   *  signed write. A sweep, a read, a poll and an email have no evidence row to point
+   *  at and therefore cannot produce a value here at all. */
+  withdrawn_at?: string | null
 }
 
 export interface IntroFacts {
@@ -120,6 +127,33 @@ function isWithdrawn(facts: IntroFacts): boolean {
 // An accepted continuation sets a NEW expiry from the continuation's own time. It
 // never adds to the previous expiry, so a long-running connection cannot
 // accumulate an unbounded window.
+//
+// THE INTERESTED BASIS, per the closed ruling. When the last live continuation is
+// explicitly withdrawn by an accepted signed action and mutual interest remains, the
+// basis is the LATER of the interest authorization and that withdrawal's accepted
+// time. The reason is that expiry measures inactivity and a withdrawal is activity: a
+// pair demonstrably acting on day 35 should not be killed outright because their
+// interest is from day 1. Without this, withdrawing your own contact line, which is
+// the safest act a user can take, expires the introduction at a clock where it was
+// alive a moment before.
+//
+// Only an ACCEPTED SIGNED withdrawal moves it. A continuation that lapses passively is
+// still live, so it is still the basis and nothing moves at all. Sweeps, reads,
+// polling, email delivery and background jobs write no evidence row, so they cannot
+// produce a withdrawn_at and cannot refresh anything.
+
+function withdrawnContinuationBasis(facts: IntroFacts): number {
+  let latest = 0
+  for (const a of facts.authorizations) {
+    if (a.live) continue
+    if (!(CONTINUATIONS as readonly string[]).includes(a.operation)) continue
+    if (typeof a.withdrawn_at !== 'string' || a.withdrawn_at.length === 0) continue
+    const t = Date.parse(a.withdrawn_at)
+    if (Number.isNaN(t)) continue
+    if (t > latest) latest = t
+  }
+  return latest
+}
 
 export function expiryOf(facts: IntroFacts): string | null {
   if (facts.released) return null // connected has no lifecycle expiry
@@ -130,7 +164,8 @@ export function expiryOf(facts: IntroFacts): string | null {
   }
   const interest = find(facts, 'express_interest')
   if (interest && interest.live) {
-    return new Date(Date.parse(interest.created_at) + TTL_INTERESTED_DAYS * DAY_MS).toISOString()
+    const basis = Math.max(Date.parse(interest.created_at), withdrawnContinuationBasis(facts))
+    return new Date(basis + TTL_INTERESTED_DAYS * DAY_MS).toISOString()
   }
   return new Date(Date.parse(facts.created_at) + TTL_REQUESTED_DAYS * DAY_MS).toISOString()
 }

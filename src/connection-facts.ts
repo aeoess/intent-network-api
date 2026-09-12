@@ -38,6 +38,16 @@ export interface AuthorizationRow {
   live: number
   withdrawn_by: string | null
   created_at: string
+  /** NOT A COLUMN. Resolved from the evidence row of the withdrawing act, joined through
+   *  withdrawn_by against write_evidence.write_ref.
+   *
+   *  A join rather than a column for two reasons. The mechanical one is that no column can
+   *  be added to an existing table at this revision: there is no ALTER TABLE, no
+   *  user_version and no migrations list, and CREATE TABLE IF NOT EXISTS is a no op, so a
+   *  column added to the literal would silently never appear on a deployed database. The
+   *  better one is that this way the value cannot exist without the signed act that
+   *  produced it, so no background job can ever write one. */
+  withdrawn_at: string | null
 }
 
 // ── Reading ───────────────────────────────────────────────────────────────
@@ -47,9 +57,16 @@ export function isReleased(introId: string): boolean {
 }
 
 export function authorizationsFor(introId: string): AuthorizationRow[] {
-  return d().prepare(
-    'SELECT * FROM connection_authorizations WHERE intro_id = ? ORDER BY created_at, operation, actor_key, subject',
-  ).all(introId) as AuthorizationRow[]
+  // write_evidence.write_ref carries a unique index, so the join is one row at most and
+  // cannot multiply the authorization rows. A legacy act has a null write_ref and joins to
+  // nothing, which is correct: there is no envelope to date the withdrawal by.
+  return d().prepare(`
+    SELECT a.*, e.recorded_at AS withdrawn_at
+    FROM connection_authorizations a
+    LEFT JOIN write_evidence e ON e.write_ref = a.withdrawn_by
+    WHERE a.intro_id = ?
+    ORDER BY a.created_at, a.operation, a.actor_key, a.subject
+  `).all(introId) as AuthorizationRow[]
 }
 
 /** The actor's own authorization for one operation, live or not. `subject` carries
@@ -81,6 +98,7 @@ export function introFacts(introId: string): IntroFacts | null {
       live: a.live === 1,
       created_at: a.created_at,
       evidence: a.evidence,
+      withdrawn_at: a.withdrawn_at,
     })),
     released: isReleased(introId),
   }

@@ -63,6 +63,28 @@ function addAuth(introId: string, actorKey: string, operation: string, createdAt
   `).run(introId, actorKey, operation, opts.subject ?? '', 'ev-' + rid(), opts.live === false ? 0 : 1, iso(createdAt))
 }
 
+/** Withdraw an authorization the way an accepted signed action does: an evidence row for
+ *  the withdrawing act, whose recorded_at is the accepted time, named by withdrawn_by.
+ *
+ *  Built this way rather than by writing a withdrawn_at column, because there is no such
+ *  column: the value is a join through write_evidence, which is what makes it impossible
+ *  for anything without a signed act to produce one. */
+function withdrawAuth(introId: string, actorKey: string, operation: string, acceptedAt: number, opts: { subject?: string } = {}): string {
+  const writeRef = 'wr' + randomBytes(31).toString('hex')
+  db.getDb().prepare(`
+    INSERT INTO write_evidence
+      (evidence_id, write_ref, actor_key, operation, resource_type, resource_id,
+       evidence, envelope_json, signature, payload_digest, bound_fields_json, legacy_preimage, recorded_at)
+    VALUES (?, ?, ?, 'withdraw_contact', 'intro', ?, 'canonical', '{}', ?, NULL, '[]', NULL, ?)
+  `).run('ev-w-' + rid(), writeRef, actorKey, introId, 'f'.repeat(128), iso(acceptedAt))
+  const r = db.getDb().prepare(`
+    UPDATE connection_authorizations SET live = 0, withdrawn_by = ?
+    WHERE intro_id = ? AND actor_key = ? AND operation = ? AND subject = ? AND live = 1
+  `).run(writeRef, introId, actorKey, operation, opts.subject ?? '')
+  assert.equal(r.changes, 1, 'the test meant to withdraw a live authorization')
+  return writeRef
+}
+
 function statusOf(id: string): string {
   return (db.getDb().prepare('SELECT status FROM v3_intros WHERE id = ?').get(id) as any).status
 }
@@ -130,20 +152,37 @@ test('EXPIRY: a connecting intro whose LAST continuation was 31 days ago expires
     'day 55 is past interest plus 30 and inside continuation plus 30, and the continuation wins')
 })
 
-test('EXPIRY: a withdrawn continuation moves the basis BACKWARD, which is the one case the deadline comes closer', () => {
+test('EXPIRY: withdrawing the LATER of two live continuations moves the basis backward to the earlier one', () => {
+  // The case where the deadline genuinely comes closer: another live continuation remains, so
+  // the basis is that one, and it is older than the withdrawn act.
+  const i = makeIntro(T0)
+  addAuth(i.id, i.fromKey, 'request_intro', T0)
+  addAuth(i.id, i.toKey, 'express_interest', T0 + 1 * DAY)
+  addAuth(i.id, i.fromKey, 'share_contact', T0 + 10 * DAY)
+  addAuth(i.id, i.toKey, 'fit_request', T0 + 20 * DAY)
+  assert.equal(state.expiryOf(facts.introFacts(i.id)!), iso(T0 + 50 * DAY), 'day 20 is the most recent')
+
+  withdrawAuth(i.id, i.toKey, 'fit_request', T0 + 21 * DAY)
+  const f = facts.introFacts(i.id)!
+  assert.equal(state.expiryOf(f), iso(T0 + 40 * DAY),
+    'back to the share_contact at day 10, and NOT out to the withdrawal at day 21, because a live continuation still decides')
+  assert.equal(state.deriveIntroState(f, new Date(T0 + 45 * DAY)), 'expired',
+    'so a clock that was inside the old window is outside the new one')
+})
+
+test('EXPIRY: a legacy withdrawal with no evidence row falls back to the interest alone', () => {
+  // A row whose withdrawn_by names no evidence row, which is every row withdrawn before the
+  // join existed. There is nothing to date the withdrawal by, so the basis is the interest and
+  // the deadline can only come closer. Fail closed, which is the only safe direction for a
+  // value that moves a deadline outward.
   const i = makeIntro(T0)
   addAuth(i.id, i.fromKey, 'request_intro', T0)
   addAuth(i.id, i.toKey, 'express_interest', T0 + 1 * DAY)
   addAuth(i.id, i.fromKey, 'share_contact', T0 + 20 * DAY)
-  let f = facts.introFacts(i.id)!
-  assert.equal(state.expiryOf(f), iso(T0 + 50 * DAY))
-
-  // Withdraw it. The window measures live activity, and there is now less of it.
   addAuth(i.id, i.fromKey, 'share_contact', T0 + 20 * DAY, { live: false })
-  f = facts.introFacts(i.id)!
-  assert.equal(state.expiryOf(f), iso(T0 + 31 * DAY), 'back to the interest authorization plus 30')
-  assert.equal(state.deriveIntroState(f, new Date(T0 + 40 * DAY)), 'expired',
-    'so a clock that was inside the old window is outside the new one')
+  const f = facts.introFacts(i.id)!
+  assert.equal(f.authorizations.find(a => a.operation === 'share_contact')!.withdrawn_at, null)
+  assert.equal(state.expiryOf(f), iso(T0 + 31 * DAY), 'the interest authorization plus 30, and nothing else')
 })
 
 test('EXPIRY: a released connection has no lifecycle expiry, at a year or at ten', () => {
@@ -222,22 +261,14 @@ test('RENEWAL: the same intro read a thousand times does not move the deadline a
   assert.equal(rows, 2, 'and the sweep inserted no authorization row, so it cannot renew anything')
 })
 
-test('EXPIRY: KNOWN GAP, withdrawing the last continuation past a stale interest expires the intro', () => {
-  // Found by a review and deliberately NOT changed, because the TTL rule it rests on is settled
-  // architecture and this is a gap in that rule rather than a defect in its implementation.
+test('TTL RULING: withdrawing the last continuation past a stale interest leaves the intro interested, not expired', () => {
+  // The closed ruling, as a positive regression. This exact scene used to expire the intro
+  // outright: the basis fell back to a day 1 interest whose own 30 day window had closed on
+  // day 31, so a pair demonstrably active moments earlier was killed by one party rescinding
+  // their own contact line, which is the safest act a user can take.
   //
-  // The two design sentences diverge here. Item 6 of withdraw_contact says the basis "moves
-  // backward to whatever live continuation remains, or to the express_interest authorization if
-  // none does". The same item also says that if the withdrawn contact was the only connecting
-  // class authorization, "the state regresses to interested". When the interest is more than 30
-  // days old those give DIFFERENT answers, and the design does not address the case: its only
-  // statement about the direction is that a withdrawal "cannot resurrect an already lapsed
-  // intro", which is about an intro that had already expired, not one the withdrawal expires.
-  //
-  // The product consequence is real: a pair demonstrably active six days ago is killed outright
-  // by one party rescinding their own contact line, which punishes the safest act a user can
-  // take. My recommendation is in the handoff. Pinned here so the behavior is KNOWN rather than
-  // discovered, and so a later ruling changes a red test rather than a silent answer.
+  // The basis is now the LATER of interest_at and the withdrawal's accepted time, so the
+  // deadline is day 35 plus 30.
   const i = makeIntro(T0)
   addAuth(i.id, i.fromKey, 'request_intro', T0)
   addAuth(i.id, i.toKey, 'express_interest', T0 + 1 * DAY)
@@ -249,13 +280,45 @@ test('EXPIRY: KNOWN GAP, withdrawing the last continuation past a stale interest
   assert.equal(state.expiryOf(before), iso(T0 + 59 * DAY), 'the signed continuation bought until day 59')
   assert.equal(state.isWriteAllowedInState('withdraw_contact', 'connecting'), true, 'so the guard admits the write')
 
-  addAuth(i.id, i.toKey, 'share_contact', T0 + 29 * DAY, { live: false })
+  withdrawAuth(i.id, i.toKey, 'share_contact', T0 + 35 * DAY)
   const after = facts.introFacts(i.id)!
-  assert.equal(state.expiryOf(after), iso(T0 + 31 * DAY), 'the basis falls back to the interest, which is already past')
-  assert.equal(state.deriveIntroState(after, at35), 'expired',
-    'so the intro expires as a RESULT of the withdrawal, at a clock where it was alive before it')
-  assert.deepEqual(state.pendingActions(after, i.fromKey, at35), [], 'and the pair has nothing left but a block')
-  assert.equal(state.materializedStatus('expired'), 'withdrawn')
+  assert.equal(state.expiryOf(after), iso(T0 + 65 * DAY),
+    'the later of the day 1 interest and the day 35 withdrawal, plus 30')
+  assert.equal(state.deriveIntroState(after, at35), 'interested',
+    'so the withdrawal regresses the state rather than ending the introduction')
+  assert.ok(state.pendingActions(after, i.fromKey, at35).includes('share_contact'),
+    'and the pair can still act, which is the whole point of the ruling')
+  // The deadline does not keep moving after that: the withdrawal is one act with one time.
+  assert.equal(state.expiryOf(facts.introFacts(i.id)!), iso(T0 + 65 * DAY))
+  assert.equal(state.deriveIntroState(facts.introFacts(i.id)!, new Date(T0 + 66 * DAY)), 'expired')
+})
+
+test('TTL RULING: a continuation that lapses PASSIVELY does not move the basis', () => {
+  // The negative half of the ruling. Passive expiry, sweeps, reads, polling, email delivery
+  // and background jobs never refresh the basis. A lapsed continuation is still live, so it is
+  // still the basis, and day 59 stays day 59 however long anyone waits or however often
+  // anything reads.
+  const i = makeIntro(T0)
+  addAuth(i.id, i.fromKey, 'request_intro', T0)
+  addAuth(i.id, i.toKey, 'express_interest', T0 + 1 * DAY)
+  addAuth(i.id, i.toKey, 'share_contact', T0 + 29 * DAY)
+  assert.equal(state.expiryOf(facts.introFacts(i.id)!), iso(T0 + 59 * DAY))
+
+  // Day 59 exactly, then long past it, with every read surface exercised and the sweep run.
+  assert.equal(state.deriveIntroState(facts.introFacts(i.id)!, new Date(T0 + 59 * DAY)), 'expired')
+  for (const day of [59, 60, 90, 400]) {
+    const at = new Date(T0 + day * DAY)
+    facts.introProjection(i.id, i.fromKey, at)
+    facts.stateOf(i.id, at)
+    facts.sweepExpiredIntros(at)
+    assert.equal(state.expiryOf(facts.introFacts(i.id)!), iso(T0 + 59 * DAY),
+      `day ${day} moved the basis, so something other than a signed act refreshed it`)
+    assert.equal(state.deriveIntroState(facts.introFacts(i.id)!, at), 'expired')
+  }
+  // And no withdrawn_at was produced, because nothing signed anything.
+  const row = facts.authorizationsFor(i.id).find(a => a.operation === 'share_contact')!
+  assert.equal(row.live, 1, 'a passive lapse does not flip live')
+  assert.equal(row.withdrawn_at, null, 'and there is no withdrawal time to move a basis with')
 })
 
 // ══════════════════════════════════════════════════════════════
