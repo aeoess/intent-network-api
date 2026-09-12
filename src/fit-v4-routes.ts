@@ -979,15 +979,19 @@ const canonicalAutonomyPause = canonicalWriteRoute({
     if (!ownsCard(cardId, actorKey)) {
       refuseWrite(403, 'not_the_card_subject', 'only the card subject may pause that card\'s autonomy')
     }
-    // setPaused only UPDATEs, because paused is a column on the standing scope row. A card
-    // with no scope has no autonomy to pause, and autonomyPermitsDisclosure already returns
-    // false for it, so reporting success here would tell a principal they had stopped
-    // something that was never running. The legacy branch still answers 200 in that case,
-    // which is a pre-existing wart kept for compatibility and recorded in the handoff.
-    if (!autonomyDb.setPaused(cardId, write.payload.paused as boolean)) {
+    // paused is a column on the standing scope row, so a card with no scope has no autonomy
+    // to pause, and autonomyPermitsDisclosure already returns false for it. Reporting success
+    // would tell a principal they had stopped something that was never running. The legacy
+    // branch still answers 200 in that case, which is a pre-existing wart kept for
+    // compatibility and recorded in the handoff.
+    //
+    // Read then refuse then write, rather than write then check the row count. Both are safe
+    // inside the transaction, and this order is the one a scan can see is safe.
+    if (autonomyDb.getScope(cardId) === null) {
       refuseWrite(409, 'no_autonomy_scope',
         'this card has no standing autonomy scope, so there is nothing to pause or resume')
     }
+    autonomyDb.setPaused(cardId, write.payload.paused as boolean)
     recordCanonicalEvidence(write)
     return { card_id: cardId, paused: write.payload.paused }
   },

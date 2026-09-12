@@ -22,6 +22,10 @@ process.env.DB_PATH = join(tmpDir, 'fit.db')
 process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
 // Structured fit runs only when MINGLE_FIT_ENABLED is exactly "1", and this
 // suite exercises the v3 fit exchange.
+// Scoped locally and restored in teardown. Node's test runner gives each file its own
+// process, so this set is already file local, and recording the prior value makes that a
+// property of the file rather than a property of the runner.
+const fitFlagBefore = process.env.MINGLE_FIT_ENABLED
 process.env.MINGLE_FIT_ENABLED = '1'
 
 // The receipt key is required and src carries no fallback that invents one, so
@@ -50,7 +54,11 @@ before(async () => {
   await new Promise<void>(r => { server = app.listen(0, '127.0.0.1', () => r()) })
   base = `http://127.0.0.1:${(server.address() as any).port}`
 })
-after(() => { server?.close(); db.closeDb(); rmSync(tmpDir, { recursive: true, force: true }) })
+after(() => { server?.close(); db.closeDb(); rmSync(tmpDir, { recursive: true, force: true }); restoreFitFlag() })
+function restoreFitFlag(): void {
+  if (fitFlagBefore === undefined) delete process.env.MINGLE_FIT_ENABLED
+  else process.env.MINGLE_FIT_ENABLED = fitFlagBefore
+}
 beforeEach(() => { db.getDb().prepare('DELETE FROM rate_limits').run() })
 
 const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex')

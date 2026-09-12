@@ -19,6 +19,10 @@ process.env.MINGLE_PUBLIC_URL = 'https://mingle.test'
 // Accept opens a fit session only when MINGLE_FIT_ENABLED is exactly "1". This
 // suite runs with it on, so the loop behaves as it did before the gate. The last
 // test runs the loop with the flag off, which is the production setting.
+// Scoped locally and restored in teardown. Node's test runner gives each file its own
+// process, so this set is already file local, and recording the prior value makes that a
+// property of the file rather than a property of the runner.
+const fitFlagBefore = process.env.MINGLE_FIT_ENABLED
 process.env.MINGLE_FIT_ENABLED = '1'
 
 const { createApp } = await import('../src/app.js')
@@ -36,7 +40,11 @@ before(async () => {
   await new Promise<void>(r => { server = app.listen(0, '127.0.0.1', () => r()) })
   base = `http://127.0.0.1:${(server.address() as any).port}`
 })
-after(() => { email.resetTransport(); server?.close(); db.closeDb(); rmSync(tmpDir, { recursive: true, force: true }) })
+after(() => { email.resetTransport(); server?.close(); db.closeDb(); rmSync(tmpDir, { recursive: true, force: true }); restoreFitFlag() })
+function restoreFitFlag(): void {
+  if (fitFlagBefore === undefined) delete process.env.MINGLE_FIT_ENABLED
+  else process.env.MINGLE_FIT_ENABLED = fitFlagBefore
+}
 beforeEach(() => {
   sent.length = 0
   email.setTransport(async e => { sent.push(e); return { ok: true, id: 'mock' } })
