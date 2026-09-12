@@ -44,6 +44,7 @@ const CANONICAL_BOUND: Record<Operation, string[]> = {
   fit_round2: ['operation', 'resource.id', 'payload.dimension_ids', 'payload.antecedent_write_ref'],
   fit_exchange_round2: ['operation', 'resource.id', 'payload.question_ids', 'payload.antecedent_write_ref'],
   fit_exchange_custom: ['operation', 'resource.id', 'payload.questions'],
+  fit_exchange_answers: ['operation', 'resource.id', 'payload.answers'],
 }
 
 /** What a published 3.2.2 legacy preimage covers, per operation, taken from the
@@ -66,6 +67,13 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   fit_exchange_round2: ['id'],
   // Same shape, same omission: fit-custom:${id}:${nonce} covers no character of the text.
   fit_exchange_custom: ['id'],
+  // The one legacy fit exchange preimage that covers content: it is a hash over the
+  // SUBMITTED answers array. `answers_submitted` rather than `answers` deliberately,
+  // because the legacy lane stores a transformed string: a drafted answer is stripUrls'd
+  // and a ledger answer becomes a server composed sentence. So the signature covers what
+  // arrived and not what was stored, and a list naming plain `answers` would let a reader
+  // take it for the stored text.
+  fit_exchange_answers: ['exchange_id', 'answers_submitted'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -83,6 +91,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   first_step_approve: 'fit-firststep-approve:${introId}:${approved_digest}:${nonce}',
   fit_exchange_round2: 'fit-round2:${id}:${nonce}',
   fit_exchange_custom: 'fit-custom:${id}:${nonce}',
+  fit_exchange_answers: 'sha256(JCS({exchange_id, nonce, answers}))',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {

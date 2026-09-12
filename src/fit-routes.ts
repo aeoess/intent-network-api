@@ -192,7 +192,133 @@ router.get('/:id', rateLimited('fit_get', 60), (req, res) => {
 
 // ── POST /:id/answers - signed ticket ─────────────────────────────────────
 
-router.post('/:id/answers', fitGate, rateLimited('fit_answer', 60), async (req, res) => {
+interface SignedAnswer { question_id: string; mode: 'ledger' | 'drafted' | 'skip'; text?: string; ledger_id?: string }
+
+/** The answers a principal signed. Sorted by question_id, no duplicates, and exactly the
+ *  keys each mode needs.
+ *
+ *  SORTED BY QUESTION_ID IS A PROTOCOL RULE HERE, not a tidiness preference. The point of
+ *  this repair is that the stored record recomputes to the signed payload_digest, and JCS
+ *  keeps array order, so the signed order has to be one a reader can recover from storage.
+ *  The answers table has one row per (exchange, question, answerer) and no sequence column,
+ *  so question_id order is the only order storage preserves. */
+function gateAnswers(value: unknown): SignedAnswer[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    refuseWrite(400, 'malformed_payload', 'answers must be a non empty array')
+  }
+  const list = value as unknown[]
+  const out: SignedAnswer[] = []
+  for (const raw of list) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      refuseWrite(400, 'malformed_payload', 'each answer must be an object')
+    }
+    const a = raw as Record<string, unknown>
+    if (typeof a.question_id !== 'string' || a.question_id.length === 0) {
+      refuseWrite(400, 'malformed_payload', 'each answer needs a question_id')
+    }
+    if (a.mode !== 'ledger' && a.mode !== 'drafted' && a.mode !== 'skip') {
+      refuseWrite(400, 'malformed_payload', 'each answer mode must be ledger, drafted, or skip')
+    }
+    const want = a.mode === 'skip' ? ['question_id', 'mode']
+      : a.mode === 'drafted' ? ['question_id', 'mode', 'text']
+      : ['question_id', 'mode', 'ledger_id', 'text']
+    const have = Object.keys(a).sort()
+    const wanted = [...want].sort()
+    if (have.length !== wanted.length || have.some((k, i) => k !== wanted[i])) {
+      refuseWrite(400, 'malformed_payload', `a ${a.mode} answer carries exactly ${want.join(', ')}`)
+    }
+    if (a.mode !== 'skip' && (typeof a.text !== 'string' || a.text.length === 0)) {
+      refuseWrite(400, 'malformed_payload', 'text must be a non empty string')
+    }
+    if (a.mode === 'ledger' && (typeof a.ledger_id !== 'string' || a.ledger_id.length === 0)) {
+      refuseWrite(400, 'malformed_payload', 'a ledger answer needs a ledger_id')
+    }
+    out.push(a as unknown as SignedAnswer)
+  }
+  for (let i = 1; i < out.length; i++) {
+    if (out[i - 1].question_id === out[i].question_id) {
+      refuseWrite(400, 'malformed_payload', `answers carries question_id ${out[i].question_id} twice`)
+    }
+    if (out[i - 1].question_id > out[i].question_id) {
+      refuseWrite(400, 'malformed_payload', 'answers must be sorted by question_id, so the stored record recomputes to the signed digest')
+    }
+  }
+  return out
+}
+
+const canonicalExchangeAnswers = canonicalWriteRoute({
+  operations: ['fit_exchange_answers'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['answers'])
+    const exchangeId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+    const ex = exchangeForWrite(exchangeId, actorKey, now)
+    const ownCardId = fitDb.ownCardOf(ex, actorKey) as string
+    const answers = gateAnswers(write.payload.answers)
+
+    // Valid question ids for this answerer: the bank, plus custom questions the counterpart
+    // addressed to them, which are answerable only in drafted mode.
+    const bankIds = new Set(fitDb.getBank(ex.intent).map(q => q.question_id))
+    const customForMe = new Map(fitDb.customForExchange(ex.id).filter(c => c.asker_key !== actorKey).map(c => [c.id, c]))
+    for (const a of answers) {
+      if (!bankIds.has(a.question_id) && !customForMe.has(a.question_id)) {
+        refuseWrite(400, 'unknown_question_id', `unknown question_id ${a.question_id}`)
+      }
+      if (customForMe.has(a.question_id) && a.mode !== 'drafted') {
+        refuseWrite(400, 'custom_needs_drafted', 'custom questions are answerable only in drafted mode')
+      }
+    }
+
+    // The post-gate runs on every drafted text, as a batch, because it detects contact data
+    // split across answers. A text it would REWRITE is refused rather than cleaned: the
+    // whole repair is that the stored answer IS the signed answer, and a cleaned string is
+    // neither what the principal approved nor something the digest covers.
+    const drafted = answers.filter(a => a.mode === 'drafted')
+    if (drafted.length > 0) {
+      const gate = postGateDrafted(drafted.map(a => ({ question_id: a.question_id, text: a.text as string })))
+      if (!gate.ok) {
+        refuseWrite(400, 'post_gate_refused', gate.reason ?? 'the answer text was refused')
+      }
+      const cleaned = new Map((gate.cleaned ?? []).map(c => [c.question_id, c.text]))
+      for (const a of drafted) {
+        if (cleaned.get(a.question_id) !== a.text) {
+          refuseWrite(400, 'text_not_stored_as_signed',
+            `the answer to ${a.question_id} would be stored in a different form than the one you signed, so it is refused rather than rewritten. Remove any link and re-approve.`)
+        }
+      }
+    }
+
+    // A LEDGER ANSWER NOW BINDS THE TEXT. The matrix gap was that only ledger_id was signed
+    // while the stored sentence quoted the item's text, so the quoted words were warranted
+    // by nothing. The signed text must equal the live item's text exactly, and it is stored
+    // verbatim with NO server composed wrap, because a wrap is a sentence the principal did
+    // not sign attached to words they did.
+    for (const a of answers) {
+      if (a.mode !== 'ledger') continue
+      const live = fitDb.ledgerItemLive(ownCardId, a.ledger_id as string)
+      if (!live) {
+        refuseWrite(409, 'ledger_item_superseded', `ledger item ${a.ledger_id} was superseded, so re-approve and re-answer`)
+      }
+      if ((live as { text: string }).text !== a.text) {
+        refuseWrite(409, 'ledger_text_mismatch',
+          `the signed text for ${a.question_id} is not the text of ledger item ${a.ledger_id}, so it is refused rather than replaced`)
+      }
+    }
+
+    for (const a of answers) {
+      fitDb.upsertAnswer({
+        exchange_id: ex.id, question_id: a.question_id, answerer_key: actorKey, mode: a.mode,
+        ledger_id: a.mode === 'ledger' ? (a.ledger_id as string) : null,
+        text: a.mode === 'skip' ? null : (a.text as string),
+      })
+    }
+    recordCanonicalEvidence(write)
+    return { exchange_id: ex.id, answered: answers.length }
+  },
+})
+
+router.post('/:id/answers', fitGate, canonicalDispatch(canonicalExchangeAnswers), rateLimited('fit_answer', 60), async (req, res) => {
   const id = String(req.params.id)
   const { answers, public_key, nonce, signature } = req.body ?? {}
   if (!Array.isArray(answers) || answers.length === 0 || typeof nonce !== 'string') { res.status(400).json({ error: 'answers and nonce required' }); return }
@@ -204,6 +330,8 @@ router.post('/:id/answers', fitGate, rateLimited('fit_answer', 60), async (req, 
   const ex = fitDb.getExchange(id)
   if (!ex) { res.status(404).json({ error: 'exchange not found' }); return }
   if (!fitDb.isParty(ex, public_key)) { res.status(403).json({ error: 'not a party to this exchange' }); return }
+  const legacyGate = checkLegacyWrite({ resourceType: 'fit_exchange', resourceId: ex.id, actorKey: public_key, introId: ex.intro_id })
+  if (legacyGate !== null) { refuseLegacy(res, 'fit_exchange_answers', ex.id, legacyGate); return }
   const ownCardId = fitDb.ownCardOf(ex, public_key)!
 
   // Valid question ids for this answerer: the bank, plus custom questions the
@@ -247,6 +375,13 @@ router.post('/:id/answers', fitGate, rateLimited('fit_answer', 60), async (req, 
         const text = cleanedByQ.get(a.question_id)!
         fitDb.upsertAnswer({ exchange_id: id, question_id: a.question_id, answerer_key: public_key, mode: 'drafted', text })
       }
+      // Inside the same transaction as the answers, so the record of the act and the act
+      // commit together. Labelled legacy_unbound, and the bound list names the SUBMITTED
+      // answers rather than the stored text, because this lane still cleans and still wraps.
+      recordLegacyEvidence({
+        actorKey: public_key, operation: 'fit_exchange_answers',
+        resourceType: 'fit_exchange', resourceId: ex.id, signature: String(signature ?? ''),
+      })
     })
     tx()
   } catch (e) {

@@ -28,7 +28,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import type { Server } from 'node:http'
 import { generateKeyPair, sign, canonicalize } from 'agent-passport-system'
 
@@ -524,4 +524,213 @@ test('EXCHANGE CUSTOM: an unknown payload field is refused rather than carried a
   assert.equal(res.status, 400)
   assert.equal(res.json.code, 'malformed_payload')
   assert.match(String(res.json.error), /unexpected payload field: urgent/)
+})
+
+// ══════════════════════════════════════════════════════════════
+// answers, canonical
+// ══════════════════════════════════════════════════════════════
+
+/** Recompute the payload digest from what the DATABASE holds, the way a later reader would.
+ *  This is the assertion the legacy lane cannot pass. */
+function digestOfStoredAnswers(exchangeId: string, answererKey: string, operation: string): string {
+  const rows = fitDb.answersForExchange(exchangeId)
+    .filter(r => r.answerer_key === answererKey)
+    .sort((a, b) => (a.question_id < b.question_id ? -1 : 1))
+  const answers = rows.map(r => {
+    if (r.mode === 'skip') return { question_id: r.question_id, mode: r.mode }
+    if (r.mode === 'ledger') return { question_id: r.question_id, mode: r.mode, ledger_id: r.ledger_id, text: r.text }
+    return { question_id: r.question_id, mode: r.mode, text: r.text }
+  })
+  return env.buildEnvelope({
+    operation: operation as any, actorKey: answererKey,
+    resource: { type: 'fit_exchange', id: exchangeId } as any,
+    issuedAt: '2026-01-01T00:00:00.000Z', nonce: 'x'.repeat(22), payload: { answers },
+  }).payloadDigest
+}
+
+async function setLedger(who: any, cardId: string, texts: string[]): Promise<any> {
+  const approved_hash = fitDb.ledgerHash(texts)
+  const nonce = 'l' + rid()
+  const res = await fetch(`${base}/api/v3/fit/disclosures`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      card_id: cardId, items: texts.map(t => ({ text: t })), approved_hash,
+      public_key: who.keys.publicKey, nonce,
+      signature: sign(`set-disclosures:${cardId}:${approved_hash}:${nonce}`, who.keys.privateKey),
+    }),
+  })
+  return { status: res.status, body: await res.json() }
+}
+
+test('EXCHANGE ANSWERS: the stored answer recomputes to the signed payload digest, in all three modes', async () => {
+  // The assertion that fails on the legacy lane, and the whole reason this route is in the
+  // gate: a drafted answer was stripUrls'd and a ledger answer became a server composed
+  // sentence, so the record could not be recomputed from what the principal signed.
+  const ex = await exchange()
+  const ledgerSet = await setLedger(ex.bob, ex.bobCard, ['I have shipped two products to paying customers.'])
+  assert.equal(ledgerSet.status, 201, JSON.stringify(ledgerSet.body))
+  const ledgerId = ledgerSet.body.items[0].id
+  const ledgerText = ledgerSet.body.items[0].text
+
+  const answers = [
+    { question_id: 'cofound-1', mode: 'drafted', text: 'Three evenings a week and most Saturdays.' },
+    { question_id: 'cofound-2', mode: 'ledger', ledger_id: ledgerId, text: ledgerText },
+    { question_id: 'cofound-3', mode: 'skip' },
+  ]
+  const { body, built } = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys, payload: { answers },
+  })
+  const res = await postJson(exUrl(ex.id, '/answers'), body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.answered, 3)
+
+  assert.equal(digestOfStoredAnswers(ex.id, ex.bob.keys.publicKey, 'fit_exchange_answers'), built.payloadDigest,
+    'the stored rows must rebuild the exact payload the principal signed')
+
+  // The ledger answer is stored VERBATIM, with no server composed wrap around it.
+  const rows = fitDb.answersForExchange(ex.id)
+  const ledgerRow = rows.find(r => r.question_id === 'cofound-2')!
+  assert.equal(ledgerRow.text, ledgerText)
+  assert.equal(ledgerRow.text!.includes('Their approved brief states'), false,
+    'a wrap is a sentence the principal did not sign attached to words they did')
+  assert.equal(ledgerRow.ledger_id, ledgerId)
+  assert.equal(rows.find(r => r.question_id === 'cofound-3')!.text, null, 'a skip stores no text')
+
+  const row = evidence.evidenceByWriteRef(built.writeRef)!
+  assert.deepEqual(evidence.boundFieldsOf(row), ['operation', 'resource.id', 'payload.answers'])
+})
+
+test('EXCHANGE ANSWERS: the LEGACY lane still cannot be recomputed, and its evidence says so', async () => {
+  // Kept as it is on purpose: a published 3.2.2 client sends this shape and expects the
+  // wrapped, cleaned storage. What changed is that the act is now RECORDED as weak.
+  const ex = await exchange()
+  const ledgerSet = await setLedger(ex.bob, ex.bobCard, ['I have shipped two products.'])
+  const ledgerId = ledgerSet.body.items[0].id
+  const nonce = 'a' + rid()
+  const answers = [
+    { question_id: 'cofound-1', mode: 'drafted', text: 'See https://example.com/me for the detail.' },
+    { question_id: 'cofound-2', mode: 'ledger', ledger_id: ledgerId },
+  ]
+  const answersHash = createHash('sha256')
+    .update(canonicalize({ exchange_id: ex.id, nonce, answers }), 'utf8').digest('hex')
+  const res = await postJson(exUrl(ex.id, '/answers'), {
+    answers, public_key: ex.bob.keys.publicKey, nonce,
+    signature: sign(answersHash, ex.bob.keys.privateKey),
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+
+  const rows = fitDb.answersForExchange(ex.id)
+  assert.equal(rows.find(r => r.question_id === 'cofound-1')!.text!.includes('https://example.com'), false,
+    'the legacy lane still cleans')
+  assert.ok(rows.find(r => r.question_id === 'cofound-2')!.text!.includes('Their approved brief states'),
+    'and still wraps')
+  assert.notEqual(digestOfStoredAnswers(ex.id, ex.bob.keys.publicKey, 'fit_exchange_answers'), answersHash,
+    'so the stored record does not recompute to the signed hash, which is the gap')
+
+  const ev = evidence.evidenceForResource('fit_exchange', ex.id)
+  assert.equal(ev.length, 1)
+  assert.equal(ev[0].evidence, 'legacy_unbound')
+  assert.deepEqual(evidence.boundFieldsOf(ev[0]), ['exchange_id', 'answers_submitted'])
+  assert.equal(evidence.covers(ev[0], 'payload.answers'), false,
+    'the bound list names what ARRIVED and never the stored text')
+})
+
+test('EXCHANGE ANSWERS: a drafted text the gate would rewrite is refused, and nothing is stored', async () => {
+  const ex = await exchange()
+  const { body } = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'drafted', text: 'Read https://example.com/x first.' }] },
+  })
+  const res = await postJson(exUrl(ex.id, '/answers'), body)
+  assert.equal(res.status, 400)
+  assert.equal(res.json.code, 'text_not_stored_as_signed')
+  assert.deepEqual(fitDb.answersForExchange(ex.id), [])
+})
+
+test('EXCHANGE ANSWERS: a ledger answer whose signed text is not the item text is refused', async () => {
+  const ex = await exchange()
+  const ledgerSet = await setLedger(ex.bob, ex.bobCard, ['I have shipped two products.'])
+  const ledgerId = ledgerSet.body.items[0].id
+
+  // A text of the signer's choosing attached to a real ledger id. This is the substitution
+  // the old route made possible from the other direction: only the id was signed, so the
+  // quoted words were warranted by nothing.
+  const wrong = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'ledger', ledger_id: ledgerId, text: 'I have shipped nine products.' }] },
+  })
+  const res = await postJson(exUrl(ex.id, '/answers'), wrong.body)
+  assert.equal(res.status, 409)
+  assert.equal(res.json.code, 'ledger_text_mismatch')
+  assert.deepEqual(fitDb.answersForExchange(ex.id), [])
+
+  // And an id that names nothing live is its own refusal, so a superseded item is
+  // distinguishable from a mismatched text.
+  const gone = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'ledger', ledger_id: 'nosuchitem', text: 'anything' }] },
+  })
+  const res2 = await postJson(exUrl(ex.id, '/answers'), gone.body)
+  assert.equal(res2.status, 409)
+  assert.equal(res2.json.code, 'ledger_item_superseded')
+})
+
+test('EXCHANGE ANSWERS: the signed list must be sorted, unique and exactly shaped per mode', async () => {
+  const ex = await exchange()
+  const bad: [string, unknown][] = [
+    ['unsorted', [{ question_id: 'cofound-2', mode: 'skip' }, { question_id: 'cofound-1', mode: 'skip' }]],
+    ['duplicated', [{ question_id: 'cofound-1', mode: 'skip' }, { question_id: 'cofound-1', mode: 'skip' }]],
+    ['empty', []],
+    ['a skip carrying text', [{ question_id: 'cofound-1', mode: 'skip', text: 'x' }]],
+    ['a drafted with no text', [{ question_id: 'cofound-1', mode: 'drafted' }]],
+    ['a ledger with no ledger_id', [{ question_id: 'cofound-1', mode: 'ledger', text: 'x' }]],
+    ['a ledger with no text', [{ question_id: 'cofound-1', mode: 'ledger', ledger_id: 'x' }]],
+    ['an unknown mode', [{ question_id: 'cofound-1', mode: 'improvised', text: 'x' }]],
+    ['an extra field', [{ question_id: 'cofound-1', mode: 'drafted', text: 'x', urgent: true }]],
+    ['not an object', ['cofound-1']],
+  ]
+  for (const [why, answers] of bad) {
+    const { body } = signedBody({
+      operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys, payload: { answers },
+    })
+    const res = await postJson(exUrl(ex.id, '/answers'), body)
+    assert.equal(res.status, 400, why)
+    assert.equal(res.json.code, 'malformed_payload', `${why}: ${JSON.stringify(res.json)}`)
+  }
+  assert.deepEqual(fitDb.answersForExchange(ex.id), [])
+})
+
+test('EXCHANGE ANSWERS: a custom question is answerable only in drafted mode, and only by the other party', async () => {
+  const ex = await exchange()
+  const asked = signedBody({
+    operation: 'fit_exchange_custom', resourceId: ex.id, keys: ex.alice.keys, payload: { questions: ['What is your runway?'] },
+  })
+  const askRes = await postJson(exUrl(ex.id, '/custom'), asked.body)
+  assert.equal(askRes.status, 201)
+  const customId = askRes.json.custom_ids[0]
+
+  // Bob may answer it, in drafted mode.
+  const ok = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: customId, mode: 'drafted', text: 'About fourteen months.' }] },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), ok.body)).status, 201)
+
+  // Not in skip mode.
+  const skipped = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys,
+    payload: { answers: [{ question_id: customId, mode: 'skip' }] },
+  })
+  const skipRes = await postJson(exUrl(ex.id, '/answers'), skipped.body)
+  assert.equal(skipRes.status, 400)
+  assert.equal(skipRes.json.code, 'custom_needs_drafted')
+
+  // And Alice cannot answer her own question: it is not in her id set at all.
+  const own = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.alice.keys,
+    payload: { answers: [{ question_id: customId, mode: 'drafted', text: 'Mine to answer?' }] },
+  })
+  const ownRes = await postJson(exUrl(ex.id, '/answers'), own.body)
+  assert.equal(ownRes.status, 400)
+  assert.equal(ownRes.json.code, 'unknown_question_id')
 })
