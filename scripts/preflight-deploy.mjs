@@ -64,9 +64,12 @@ console.log('\n1. receipt keys')
       'export both from the deployment secret store, then re-run. The server refuses to boot without them.')
     note('Checked in THIS shell. If your platform injects them at runtime, run this with the same values.')
   } else {
-    const { derivePublicKey } = await import('agent-passport-system')
+    // publicKeyFromPrivate is the export the server itself uses at server-key.ts:118. Naming
+    // a function that does not exist would have failed here with a message about the wrong
+    // thing, which is the worst failure a preflight can have.
+    const { publicKeyFromPrivate } = await import('agent-passport-system')
     let derived = null
-    try { derived = derivePublicKey(priv) } catch (e) { bad(`MINGLE_RECEIPT_PRIVKEY is not a usable Ed25519 private key: ${e.message}`) }
+    try { derived = publicKeyFromPrivate(priv) } catch (e) { bad(`MINGLE_RECEIPT_PRIVKEY is not a usable Ed25519 private key: ${e.message}`) }
     if (derived !== null) {
       if (derived !== pub) {
         bad(`MINGLE_RECEIPT_PUBKEY does not match the key derived from the private key. Derived ${derived}, configured ${pub}`,
