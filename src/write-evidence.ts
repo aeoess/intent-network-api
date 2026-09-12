@@ -46,6 +46,7 @@ const CANONICAL_BOUND: Record<Operation, string[]> = {
   fit_exchange_round2: ['operation', 'resource.id', 'payload.question_ids', 'payload.antecedent_write_ref'],
   fit_exchange_custom: ['operation', 'resource.id', 'payload.questions'],
   fit_exchange_answers: ['operation', 'resource.id', 'payload.answers'],
+  fit_exchange_close: ['operation', 'resource.id', 'payload.record_digest'],
 }
 
 /** What a published 3.2.2 legacy preimage covers, per operation, taken from the
@@ -81,6 +82,9 @@ const LEGACY_BOUND: Partial<Record<Operation, string[]>> = {
   // fit-qa-round2:${introId}:${nonce} names the intro and nothing about which dimensions
   // are being escalated, which is matrix row 35 in one line.
   fit_round2: ['intro_id'],
+  // fit-close:${id}:${nonce} says close exchange X and never this IS the record, which is
+  // matrix row 42. The digest the closer is attesting to appears nowhere in those bytes.
+  fit_exchange_close: ['id'],
 }
 
 /** The legacy preimage template each adapter accepts, recorded verbatim so a later
@@ -101,6 +105,7 @@ export const LEGACY_PREIMAGES: Partial<Record<Operation, string>> = {
   fit_exchange_answers: 'sha256(JCS({exchange_id, nonce, answers}))',
   fit_answers: 'sha256(JCS({intro_id, nonce, answers}))',
   fit_round2: 'fit-qa-round2:${introId}:${nonce}',
+  fit_exchange_close: 'fit-close:${id}:${nonce}',
 }
 
 export function boundFieldsFor(operation: Operation, evidence: AuthEvidence): string[] {

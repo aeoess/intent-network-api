@@ -52,14 +52,14 @@ export const OPERATIONS = [
  *  continuation and cannot be: the authorization table keys on the intro. */
 export const PROTOCOL_OPERATIONS = [
   'fit_round2', 'fit_answers',
-  'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers',
+  'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers', 'fit_exchange_close',
 ] as const
 export type Operation = typeof OPERATIONS[number] | typeof PROTOCOL_OPERATIONS[number]
 
 /** Operations whose resource is NOT an intro, so the intro state guard is not the right
  *  question to ask about them. Their own guards live beside their routes. */
 export const NON_INTRO_OPERATIONS: readonly Operation[] = [
-  'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers',
+  'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers', 'fit_exchange_close',
 ] as const
 
 /** A continuation is a signed act on a live connection. The first one moves the

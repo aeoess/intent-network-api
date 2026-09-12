@@ -734,3 +734,138 @@ test('EXCHANGE ANSWERS: a custom question is answerable only in drafted mode, an
   assert.equal(ownRes.status, 400)
   assert.equal(ownRes.json.code, 'unknown_question_id')
 })
+
+// ══════════════════════════════════════════════════════════════
+// close, canonical
+// ══════════════════════════════════════════════════════════════
+
+/** The digest of the record as it would be sealed right now, read from the API rather than
+ *  computed in the test, because the point is that a closer can read it before signing. */
+async function pendingDigest(ex: Exchange, who: any): Promise<string> {
+  const nonce = 'g' + rid()
+  const q = new URLSearchParams({
+    public_key: who.keys.publicKey, nonce,
+    signature: sign(`fit-get:${ex.id}:${nonce}`, who.keys.privateKey),
+  })
+  const body = await (await fetch(`${exUrl(ex.id, '')}?${q}`)).json()
+  assert.ok(body.pending_record_digest, JSON.stringify(body))
+  return body.pending_record_digest
+}
+
+test('EXCHANGE CLOSE: the closer signs the record digest, and the sealed record is that one', async () => {
+  const ex = await exchange()
+  const answers = [{ question_id: 'cofound-1', mode: 'drafted', text: 'Three evenings a week.' }]
+  const ans = signedBody({ operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys, payload: { answers } })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), ans.body)).status, 201)
+
+  const digest = await pendingDigest(ex, ex.alice)
+  const { body, built } = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.alice.keys, payload: { record_digest: digest },
+  })
+  const res = await postJson(exUrl(ex.id, '/close'), body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(res.json.closed, true)
+  assert.equal(res.json.record_digest, digest, 'the sealed digest is the one the closer signed')
+
+  const row = fitDb.getExchange(ex.id)!
+  assert.equal(row.state, 'closed')
+  assert.equal(row.record_digest, digest)
+  const ev = evidence.evidenceByWriteRef(built.writeRef)!
+  assert.deepEqual(evidence.boundFieldsOf(ev), ['operation', 'resource.id', 'payload.record_digest'])
+  assert.equal(evidence.covers(ev, 'payload.record_digest'), true)
+})
+
+test('EXCHANGE CLOSE: a record that changed between preview and close is refused', async () => {
+  // The whole repair. The old route let the closer sign a route tag and computed the digest
+  // afterwards, so whatever the record turned out to be was sealed under that signature.
+  const ex = await exchange()
+  const digest = await pendingDigest(ex, ex.alice)
+
+  // Bob answers, which moves the record.
+  const answers = [{ question_id: 'cofound-2', mode: 'drafted', text: 'Late evenings mostly.' }]
+  const ans = signedBody({ operation: 'fit_exchange_answers', resourceId: ex.id, keys: ex.bob.keys, payload: { answers } })
+  assert.equal((await postJson(exUrl(ex.id, '/answers'), ans.body)).status, 201)
+  const moved = await pendingDigest(ex, ex.alice)
+  assert.notEqual(moved, digest, 'an answer moves the record, which is what makes the echo meaningful')
+
+  const stale = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.alice.keys, payload: { record_digest: digest },
+  })
+  const res = await postJson(exUrl(ex.id, '/close'), stale.body)
+  assert.equal(res.status, 409)
+  assert.equal(res.json.code, 'record_digest_stale')
+  assert.match(String(res.json.error), new RegExp(moved), 'the refusal names the digest to sign instead')
+  assert.equal(fitDb.getExchange(ex.id)!.state, 'answering', 'and nothing was sealed')
+
+  // Signing the new one works.
+  const fresh = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.alice.keys, payload: { record_digest: moved },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/close'), fresh.body)).status, 201)
+})
+
+test('EXCHANGE CLOSE: it seals a record past the 72 hour window, because the sweep does too', async () => {
+  // The one exchange act that may run on an expired exchange. Refusing a party what the
+  // scheduled sweep does to them anyway would be perverse, and it is what the legacy close
+  // route has always done, so this is a repair of the signature rather than a change.
+  const ex = await exchange({ expiresAt: new Date(Date.now() - 1000).toISOString() })
+  const digest = await pendingDigest(ex, ex.alice)
+  const { body } = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.alice.keys, payload: { record_digest: digest },
+  })
+  const res = await postJson(exUrl(ex.id, '/close'), body)
+  assert.equal(res.status, 201, JSON.stringify(res.json))
+  assert.equal(fitDb.getExchange(ex.id)!.state, 'closed')
+
+  // And an act that ADDS to the exchange is still refused past the window.
+  const ex2 = await exchange({ expiresAt: new Date(Date.now() - 1000).toISOString() })
+  const ans = signedBody({
+    operation: 'fit_exchange_answers', resourceId: ex2.id, keys: ex2.bob.keys,
+    payload: { answers: [{ question_id: 'cofound-1', mode: 'skip' }] },
+  })
+  const refused = await postJson(exUrl(ex2.id, '/answers'), ans.body)
+  assert.equal(refused.status, 409)
+  assert.equal(refused.json.code, 'exchange_expired')
+})
+
+test('EXCHANGE CLOSE: a second close is refused, and the record is not resealed', async () => {
+  const ex = await exchange()
+  const digest = await pendingDigest(ex, ex.alice)
+  const first = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.alice.keys, payload: { record_digest: digest },
+  })
+  assert.equal((await postJson(exUrl(ex.id, '/close'), first.body)).status, 201)
+  // A replay of the SAME envelope is idempotent and returns the stored answer.
+  const replay = await postJson(exUrl(ex.id, '/close'), first.body)
+  assert.equal(replay.status, 200)
+  assert.equal(replay.json.idempotent, true)
+  // A different envelope on a closed exchange is refused, because the record already exists.
+  const second = signedBody({
+    operation: 'fit_exchange_close', resourceId: ex.id, keys: ex.bob.keys, payload: { record_digest: digest },
+  })
+  const res = await postJson(exUrl(ex.id, '/close'), second.body)
+  assert.equal(res.status, 409)
+  assert.equal(res.json.code, 'exchange_closed')
+})
+
+test('EXCHANGE CLOSE: the legacy lane still closes and is recorded as weak', async () => {
+  const ex = await exchange()
+  const nonce = 'lc' + rid()
+  const res = await postJson(exUrl(ex.id, '/close'), {
+    public_key: ex.alice.keys.publicKey, nonce,
+    signature: sign(`fit-close:${ex.id}:${nonce}`, ex.alice.keys.privateKey),
+  })
+  assert.equal(res.status, 200, JSON.stringify(res.json))
+  assert.equal(res.json.closed, true)
+  const ev = evidence.evidenceForResource('fit_exchange', ex.id)
+  assert.equal(ev.length, 1)
+  assert.deepEqual(evidence.boundFieldsOf(ev[0]), ['id'])
+  assert.equal(evidence.covers(ev[0], 'payload.record_digest'), false,
+    'the digest the closer is attesting to appears in none of those bytes')
+  assert.equal(ev[0].legacy_preimage, 'fit-close:${id}:${nonce}')
+  // The card event landed, which is the check that splitting the seal from the events kept
+  // the legacy path whole.
+  const events = db.getDb().prepare(
+    "SELECT COUNT(*) AS n FROM card_events WHERE event = 'handshake_closed'").get() as any
+  assert.ok(events.n >= 2, 'one for each side')
+})

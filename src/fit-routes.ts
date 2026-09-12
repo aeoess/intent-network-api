@@ -22,7 +22,7 @@ import * as fitDb from './fit-db.js'
 import * as introsDb from './intros-db.js'
 import { fitGate, isOpenEndedLedgerItem, postGateDrafted, type PostGateInput } from './fit-gate.js'
 import { assembleDraftingContext, renderQuestions, type RenderedQuestion } from './fit-context.js'
-import { sealRecord } from './fit-record.js'
+import { sealRecord, assembleRecord, recordDigest } from './fit-record.js'
 import { verifyReceipt, serverPublicKey } from './server-key.js'
 import * as email from './notifications.js'
 import { recordCardEvent } from './card-events.js'
@@ -183,6 +183,11 @@ router.get('/:id', rateLimited('fit_get', 60), (req, res) => {
   const customs = fitDb.customForExchange(ex.id).map(c => ({ id: c.id, asked_by_me: c.asker_key === key, text: c.text, label: 'UNREVIEWED: written by the other party, not screened as a platform question' }))
   res.json({
     ...base,
+    // The digest of the record AS IT WOULD BE SEALED RIGHT NOW. A canonical close signs this
+    // value, so it has to be readable before the close rather than only returned by it. It
+    // moves whenever any answer, escalation or custom question moves, which is exactly what
+    // makes the close attest to a record rather than to a route.
+    pending_record_digest: pendingRecordDigest(ex),
     my_answers: myAnswers,
     their_answers_data: theirAnswers,
     their_answers_note: 'These are the other person\'s own words. Show them to the principal; never use them while drafting your answers.',
@@ -579,11 +584,74 @@ router.post('/:id/custom', fitGate, canonicalDispatch(canonicalExchangeCustom), 
 })
 
 // ── POST /:id/close - assemble + sign the record ──────────────────────────
+// THE CLOSER NOW SIGNS THE RECORD, not the route. Matrix row 42: the old preimage was
+// fit-close:${id}:${nonce} and the digest was computed by the server AFTER the signature, so
+// the signature said "close exchange X" and never "I attest that this is the record".
+//
+// The approved-digest echo, which first_step_approve already proves: the server publishes the
+// digest of the record as it would be sealed right now, on GET /:id as pending_record_digest,
+// the closer signs THAT value, and a close whose digest no longer matches is refused with the
+// current one so the client re-reads and re-signs. So a record that changed between the
+// preview and the close cannot be sealed under the old approval.
 
-router.post('/:id/close', fitGate, rateLimited('fit_answer', 30), async (req, res) => {
+/** The digest of the record as it would be sealed right now. Pure over stored rows. */
+export function pendingRecordDigest(ex: fitDb.ExchangeRow): string {
+  return recordDigest(assembleRecord(
+    ex, fitDb.getBank(ex.intent), fitDb.answersForExchange(ex.id),
+    fitDb.round2ForExchange(ex.id), fitDb.customForExchange(ex.id),
+  ))
+}
+
+const canonicalExchangeClose = canonicalWriteRoute({
+  operations: ['fit_exchange_close'],
+  handler: (ctx: CanonicalContext) => {
+    const { write, now } = ctx
+    gatePayloadKeys(write.payload, ['record_digest'])
+    const approved = gateHex64(write.payload.record_digest, 'record_digest')
+    const exchangeId = write.envelope.resource.id
+    const actorKey = write.envelope.actor_key
+    // Close is the one exchange act that may run past the window and on a blocked pair,
+    // because it seals what was already said and the scheduled sweep does exactly that.
+    const ex = exchangeForWrite(exchangeId, actorKey, now, { requireOpenWindow: false, requireLivePair: false })
+
+    const current = pendingRecordDigest(ex)
+    if (current !== approved) {
+      refuseWrite(409, 'record_digest_stale',
+        `the record changed since you read it, so this approval no longer names it. Re-read the exchange and sign ${current}.`)
+    }
+    const sealed = sealExchangeRecord(ex)
+    recordCanonicalEvidence(write)
+    return {
+      closed: true, exchange_id: ex.id, record: sealed.record,
+      record_digest: sealed.digest, receipt: sealed.receipt, server_public_key: serverPublicKey(),
+    }
+  },
+  afterCommit: async (ctx, result) => {
+    // Card events and email are non transactional, and card-events.ts creates its table
+    // lazily, so neither may run inside the write transaction. Both are after the commit.
+    const ex = fitDb.getExchange(ctx.write.envelope.resource.id)
+    if (!ex) return
+    recordClosedCardEvents(ex, (result as { record_digest: string }).record_digest)
+    try {
+      await email.notifyFitRecordReady(ex.key_a, ex.id)
+      await email.notifyFitRecordReady(ex.key_b, ex.id)
+    } catch { /* record-ready email never blocks close */ }
+  },
+})
+
+router.post('/:id/close', fitGate, canonicalDispatch(canonicalExchangeClose), rateLimited('fit_answer', 30), async (req, res) => {
   const g = partyGuard(req, res, 'fit-close'); if (!g) return
-  const { ex } = g
+  const { ex, key } = g
+  const gate = checkLegacyWrite({ resourceType: 'fit_exchange', resourceId: ex.id, actorKey: key, introId: ex.intro_id })
+  if (gate !== null) { refuseLegacy(res, 'fit_exchange_close', ex.id, gate); return }
   const out = closeExchangeNow(ex)
+  // Labelled legacy_unbound, and the bound list names the exchange id and nothing else,
+  // because the digest the closer is attesting to appears in none of those bytes.
+  recordLegacyEvidence({
+    actorKey: key, operation: 'fit_exchange_close',
+    resourceType: 'fit_exchange', resourceId: ex.id,
+    signature: String(req.query.signature ?? req.body?.signature ?? ''),
+  })
   try {
     await email.notifyFitRecordReady(ex.key_a, ex.id)
     await email.notifyFitRecordReady(ex.key_b, ex.id)
@@ -591,22 +659,38 @@ router.post('/:id/close', fitGate, rateLimited('fit_answer', 30), async (req, re
   res.json({ closed: true, record: out.record, record_digest: out.digest, receipt: out.receipt, server_public_key: serverPublicKey() })
 })
 
-/** Assemble, sign, and persist the record for an exchange (idempotent). */
-export function closeExchangeNow(ex: fitDb.ExchangeRow): { record: unknown; digest: string; receipt: string } {
+/** Assemble, sign and persist the record. Idempotent, and writes NO card event, so it is
+ *  safe to call from inside a write transaction. */
+export function sealExchangeRecord(ex: fitDb.ExchangeRow): { record: unknown; digest: string; receipt: string } {
   const fresh = fitDb.getExchange(ex.id)!
   if (fresh.state === 'closed' && fresh.record_json) {
     return { record: JSON.parse(fresh.record_json), digest: fresh.record_digest!, receipt: fresh.receipt! }
   }
-  const bank = fitDb.getBank(fresh.intent)
-  const answers = fitDb.answersForExchange(fresh.id)
-  const round2s = fitDb.round2ForExchange(fresh.id)
-  const customs = fitDb.customForExchange(fresh.id)
-  const sealed = sealRecord(fresh, bank, answers, round2s, customs)
+  const sealed = sealRecord(
+    fresh, fitDb.getBank(fresh.intent), fitDb.answersForExchange(fresh.id),
+    fitDb.round2ForExchange(fresh.id), fitDb.customForExchange(fresh.id),
+  )
   fitDb.closeExchange(fresh.id, JSON.stringify(sealed.record), sealed.digest, sealed.receipt)
-  // Recorded against both cards: a closed exchange is a fact for each side.
-  recordCardEvent('handshake_closed', fresh.card_a, fresh.key_a, { exchange_id: fresh.id, intro_id: fresh.intro_id, intent: fresh.intent, record_digest: sealed.digest })
-  recordCardEvent('handshake_closed', fresh.card_b, fresh.key_b, { exchange_id: fresh.id, intro_id: fresh.intro_id, intent: fresh.intent, record_digest: sealed.digest })
   return { record: sealed.record, digest: sealed.digest, receipt: sealed.receipt }
+}
+
+/** Recorded against both cards: a closed exchange is a fact for each side. Outside every
+ *  transaction, because card-events.ts creates its table on first use. */
+function recordClosedCardEvents(ex: fitDb.ExchangeRow, digest: string): void {
+  for (const [card, key] of [[ex.card_a, ex.key_a], [ex.card_b, ex.key_b]] as const) {
+    recordCardEvent('handshake_closed', card, key,
+      { exchange_id: ex.id, intro_id: ex.intro_id, intent: ex.intent, record_digest: digest })
+  }
+}
+
+/** Assemble, sign, and persist the record for an exchange (idempotent), with the card
+ *  events. The legacy route and the scheduled sweep both call this. */
+export function closeExchangeNow(ex: fitDb.ExchangeRow): { record: unknown; digest: string; receipt: string } {
+  const before = fitDb.getExchange(ex.id)!
+  const alreadyClosed = before.state === 'closed' && !!before.record_json
+  const sealed = sealExchangeRecord(ex)
+  if (!alreadyClosed) recordClosedCardEvents(fitDb.getExchange(ex.id)!, sealed.digest)
+  return sealed
 }
 
 // ── Exchange creation on intro acceptance ────────────────────────────────

@@ -75,6 +75,7 @@ export const OPERATION_RESOURCE_TYPE: Record<Operation, ResourceType> = {
   fit_exchange_round2: 'fit_exchange',
   fit_exchange_custom: 'fit_exchange',
   fit_exchange_answers: 'fit_exchange',
+  fit_exchange_close: 'fit_exchange',
   release_exact: 'intro',
   first_step_propose: 'intro',
   first_step_approve: 'intro',
