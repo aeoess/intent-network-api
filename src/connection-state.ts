@@ -46,10 +46,17 @@ export const OPERATIONS = [
  *  acts a principal authorizes and so they still need an envelope, an operation name, a
  *  bound field list and a resource type.
  *
- *  Two shapes live here. `fit_round2` names an INTRO, so it counts as a continuation
- *  exactly like the other fit acts. The `fit_exchange_` family names a v3 FIT EXCHANGE,
- *  which has its own 72 hour window and its own state machine, so it is not an intro
- *  continuation and cannot be: the authorization table keys on the intro. */
+ *  Three shapes live here, and the shape is decided by what the act's resource is.
+ *
+ *  `fit_round2` and `fit_answers` name an INTRO, so each counts as a continuation exactly
+ *  like the other fit acts: a signed act by a party on a live connection.
+ *
+ *  The `fit_exchange_` family names a v3 FIT EXCHANGE, which has its own 72 hour window and
+ *  its own state machine, so none of them is an intro continuation and none can be: the
+ *  authorization table keys on the intro.
+ *
+ *  `autonomy_pause` names a CARD. Autonomy is a property of a card's standing policy rather
+ *  than of any introduction, so it touches no intro at all. */
 export const PROTOCOL_OPERATIONS = [
   'fit_round2', 'fit_answers',
   'fit_exchange_round2', 'fit_exchange_custom', 'fit_exchange_answers', 'fit_exchange_close',
