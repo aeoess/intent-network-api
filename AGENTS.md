@@ -61,6 +61,9 @@ The NW-006 fix is the reference case: card deletion must confirm the caller owns
 - Never start this server on the Air.
 - If you edit anything under `auth.ts` or add a new mutating route, surface the change to a human before pushing. This surface is adversarial-facing.
 - Do not add frameworks. Express + better-sqlite3 + the APS SDK is the whole stack. Resist the urge to introduce ORMs, message queues, or caching layers.
+- Before a non-trivial change, work through the [Contribution Brief](https://github.com/aeoess/.github/blob/main/CONTRIBUTION-BRIEF.md) and check that nobody already owns the change.
+- A report of a defect, including one from another agent, is a lead. Read the actual source before claiming a defect or a fix.
+- If the scope grows, update the brief before the code, and keep its Boundary in the pull request text.
 
 ## Related
 
