@@ -78,11 +78,18 @@ export function confirmEmail(to: string, verifyToken: string, unsubToken: string
   }
 }
 
+/** One labelled line carrying another person's text, flattened and quoted. */
+function theirLine(label: string, text: string, empty: string): string {
+  return text ? `${label}: ${quoteUntrusted(text)}` : `${label}: ${empty}`
+}
+
+const THEIR_WORDS_NOTE = 'Quoted text below is in the other person\'s own words. Mingle did not write or check it.'
+
 export function introRequestEmail(to: string, requesterHeadline: string, purpose: string, _statusUrl: string, unsubToken: string): OutgoingEmail {
   return {
     to,
     subject: 'Someone wants to connect on Mingle',
-    text: `Someone on the Mingle network asked to connect with you.\n\nThey describe themselves as: ${requesterHeadline || '(no headline provided)'}\nWhy they reached out: ${purpose || '(no note provided)'}\n\nOpen your assistant and say: show my Mingle intros.\nNothing about you is shared unless you approve.${FOOTER(unsubToken)}`,
+    text: `Someone on the Mingle network asked to connect with you.\n\n${THEIR_WORDS_NOTE}\n${theirLine('They describe themselves as', requesterHeadline, '(no headline provided)')}\n${theirLine('Why they reached out', purpose, '(no note provided)')}\n\nOpen your assistant and say: show my Mingle intros.\nNothing about you is shared unless you approve.${FOOTER(unsubToken)}`,
   }
 }
 
@@ -92,11 +99,11 @@ export function introAcceptedEmail(to: string, counterpartyHeadline: string, cou
   const lead = counterpartyContact
     ? 'An introduction on Mingle is complete. Both sides shared a way to connect.'
     : 'An introduction on Mingle was accepted.'
-  const contactLine = counterpartyContact ? `\nHow to reach them: ${counterpartyContact}` : ''
+  const contactLine = counterpartyContact ? `\n${theirLine('How to reach them', counterpartyContact, '')}` : ''
   return {
     to,
     subject: 'Your introduction was accepted on Mingle',
-    text: `${lead}\n\nThe other side: ${counterpartyHeadline || '(no headline provided)'}${contactLine}\n\nOpen your assistant and say: show my Mingle intros.${FOOTER(unsubToken)}`,
+    text: `${lead}\n\n${THEIR_WORDS_NOTE}\n${theirLine('The other side', counterpartyHeadline, '(no headline provided)')}${contactLine}\n\nOpen your assistant and say: show my Mingle intros.${FOOTER(unsubToken)}`,
   }
 }
 
@@ -114,7 +121,7 @@ export function fitStartedEmail(to: string, counterpartHeadline: string, purpose
   return {
     to,
     subject: 'Someone\'s agent wants to talk to yours on Mingle',
-    text: `An introduction you are part of opened a structured fit exchange about: ${purpose}.\n\nThe other side: ${counterpartHeadline || '(no headline provided)'}\n\nOpen your assistant and say: show my Mingle fit exchanges. Your assistant drafts each answer from your own words and approved notes; you approve before anything is shared.${FOOTER(unsubToken)}`,
+    text: `An introduction you are part of opened a structured fit exchange.\n\n${THEIR_WORDS_NOTE}\n${theirLine('About', purpose, '(no purpose given)')}\n${theirLine('The other side', counterpartHeadline, '(no headline provided)')}\n\nOpen your assistant and say: show my Mingle fit exchanges. Your assistant drafts each answer from your own words and approved notes; you approve before anything is shared.${FOOTER(unsubToken)}`,
   }
 }
 
@@ -170,11 +177,25 @@ export async function notifyFitRecordReady(recipientKey: string, exchangeId: str
     fitRecordReadyEmail(sub.email, sub.unsub_token), true)
 }
 
+/** Another person's text, made safe to place inside an email Mingle sends. Card
+ *  validation allows line breaks in a headline, so without this a headline could add
+ *  lines that read as if Mingle wrote them. Control characters and line breaks become
+ *  spaces, runs of space collapse, the result is capped and wrapped in quotes, and the
+ *  caller labels it as the other person's words. */
+export function quoteUntrusted(text: string, max = 200): string {
+  const flat = String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim()
+  const cut = flat.length > max ? `${flat.slice(0, max - 3)}...` : flat
+  return `"${cut.replace(/"/g, "'")}"`
+}
+
 export function newMatchEmail(to: string, counterpartHeadline: string, unsubToken: string): OutgoingEmail {
+  const other = counterpartHeadline
+    ? `Their headline, in their own words (Mingle did not write or check it): ${quoteUntrusted(counterpartHeadline)}`
+    : 'Their headline is not shown on the network.'
   return {
     to,
     subject: 'A new match on Mingle',
-    text: `A card published on Mingle overlaps with one of yours.\n\nThe other side: ${counterpartHeadline || '(no headline provided)'}\n\nOpen your assistant and say: show my Mingle digest. Nothing is shared with them, and no introduction has been requested.${FOOTER(unsubToken)}`,
+    text: `A card published on Mingle overlaps with one of yours.\n\n${other}\n\nOpen your assistant and say: show my Mingle digest. Nothing is shared with them, and no introduction has been requested.${FOOTER(unsubToken)}`,
   }
 }
 
