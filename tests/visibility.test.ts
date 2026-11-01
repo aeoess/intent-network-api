@@ -204,3 +204,26 @@ test('an old client that renews by resealing the public fetch still works for a 
   const r = await post(`/api/v3/cards/${p.body.card_id}/renew`, { card: seal(renewed, keys) })
   assert.equal(r.status, 201, r.text)
 })
+
+test('search filters decide on visible fields only, so a hidden topic or event cannot be probed', async () => {
+  const keys = generateKeyPair()
+  const p = await post('/api/v3/cards', { card: makeCard(keys, {
+    headline: 'Filter oracle probe HDLMARK-91',
+    intents: ['cofound'],
+    seeking: [{ description: 'Visible seeking', topics: ['visibletopicq'], engagement: 'part_time' }],
+    offering: [{ description: 'Hidden offering', topics: ['hiddentopicx'], provenance: 'principal_statement' }],
+    preferences: [{ key: 'location', value: 'hiddencityz' }],
+    event_ref: { event_id: 'hidden-event-k' },
+    visibility: { headline: 'network', seeking: 'network', intents: 'private', offering: 'private', preferences: 'mutual_intro', event_ref: 'thread_only' },
+  }, 6000) })
+  assert.equal(p.status, 201, p.text)
+  const id = p.body.card_id
+  const ids = async (filters: Record<string, unknown>): Promise<string[]> =>
+    ((await post('/api/v3/cards/search', { ...filters, limit: 50 })).body.results ?? []).map((c: any) => c.card_id)
+  assert.ok((await ids({ topics: ['visibletopicq'] })).includes(id), 'control: a visible topic still finds the card')
+  assert.equal((await ids({ topics: ['hiddentopicx'] })).includes(id), false, 'hidden topic')
+  assert.equal((await ids({ intents: ['cofound'] })).includes(id), false, 'hidden intent')
+  assert.equal((await ids({ location: 'hiddencityz' })).includes(id), false, 'hidden location')
+  assert.equal((await ids({ event_ref: 'hidden-event-k' })).includes(id), false, 'hidden event')
+  assert.equal((await getText('/e/hidden-event-k')).text.includes('HDLMARK-91'), false, 'hidden event wall')
+})

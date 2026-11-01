@@ -153,21 +153,30 @@ export interface V3SearchFilters {
 const SEARCH_CAP = 50
 const MAX_SCAN = 2000
 
-/** The JS-side filter predicate (intents, topics, engagement, location) shared
- *  by the wall search and the paginated agent search. */
-function passesJsFilters(card: V3Card, filters: V3SearchFilters): boolean {
-  if (filters.intents?.length && !filters.intents.some(i => card.intents.includes(i))) return false
+/** The JS-side filter predicate (intents, topics, engagement, location, event)
+ *  shared by the wall search and the paginated agent search. It decides on the
+ *  network-visible view, the same content the result shows. Deciding on the full
+ *  card let a search for a hidden topic or event reveal which cards hold it by
+ *  whether they came back. */
+function passesJsFilters(stored: V3Card, filters: V3SearchFilters): boolean {
+  const card = networkVisibleView(stored as any) as Partial<V3Card>
+  const intents = card.intents ?? []
+  const seeking = card.seeking ?? []
+  const offering = card.offering ?? []
+  const preferences = card.preferences ?? []
+  if (filters.event_ref && card.event_ref?.event_id !== filters.event_ref) return false
+  if (filters.intents?.length && !filters.intents.some(i => intents.includes(i))) return false
   if (filters.topics?.length) {
-    const cardTopics = [...card.seeking, ...card.offering].flatMap(e => e.topics ?? [])
+    const cardTopics = [...seeking, ...offering].flatMap(e => e.topics ?? [])
     if (!filters.topics.some(t => cardTopics.some(ct => ct.toLowerCase().includes(t.toLowerCase())))) return false
   }
   if (filters.engagement) {
-    const engagements = card.seeking.map(s => s.engagement).filter(Boolean) as string[]
-    const prefEngagement = card.preferences.filter(p => p.key === 'engagement').map(p => p.value)
+    const engagements = seeking.map(s => s.engagement).filter(Boolean) as string[]
+    const prefEngagement = preferences.filter(p => p.key === 'engagement').map(p => p.value)
     if (![...engagements, ...prefEngagement].some(e => e.toLowerCase().includes(filters.engagement!.toLowerCase()))) return false
   }
   if (filters.location) {
-    const locPrefs = card.preferences.filter(p => p.key === 'location').map(p => p.value)
+    const locPrefs = preferences.filter(p => p.key === 'location').map(p => p.value)
     if (!locPrefs.some(l => l.toLowerCase().includes(filters.location!.toLowerCase()))) return false
   }
   return true
