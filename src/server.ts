@@ -20,6 +20,7 @@ import { sweepExpiredIntros } from './connection-facts.js'
 import { warmupModel } from './embeddings.js'
 import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
+import { adminAlerts } from './admin-alerts.js'
 import { recomputeAllMatches } from './matches-db.js'
 import { runWeeklyDigest } from './weekly.js'
 import { assertReceiptKeyConfigured, assertTrustedKeySetConfigured } from './server-key.js'
@@ -121,6 +122,8 @@ setInterval(() => {
   // impossible: the freshness window is 10 minutes, so a nonce row always outlives every
   // envelope that could carry it.
   try { purgeWriteNonces() } catch (e) { console.error('[nonce purge]', (e as Error).message) }
+  // Held new-card alerts go out as one summary.
+  adminAlerts.flush().catch(e => console.error('[admin alerts]', (e as Error).message))
 }, 60 * 60 * 1000)
 
 // Weekly digest. The week key dedupes, so at most one email per subscriber per

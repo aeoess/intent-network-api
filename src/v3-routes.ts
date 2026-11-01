@@ -15,6 +15,7 @@ import type { RevocationStatus, V3Card } from './v3-cards.js'
 import * as v3db from './v3-db.js'
 import * as matchesDb from './matches-db.js'
 import * as email from './notifications.js'
+import { adminAlerts } from './admin-alerts.js'
 import { embed } from './embeddings.js'
 import { networkVisibleText, networkVisibleView } from './v3-cards.js'
 import { checkRateLimit, getDb } from './db.js'
@@ -54,7 +55,7 @@ async function finalizePublish(cardId: string, card: V3Card): Promise<void> {
   let created: { other_card_id: string; overlap_count: number; cosine: number | null }[] = []
   try { created = matchesDb.recomputeMatchesForCardDetailed(cardId).created } catch (e) { console.error('[v3] match compute failed:', (e as Error).message) }
   try { await pushNewMatches(cardId, card, created) } catch (e) { console.error('[v3] match push failed:', (e as Error).message) }
-  try { await email.notifyAdmin('New Mingle card', `${card.headline} (${cardId})`) } catch { /* admin ping never affects publish */ }
+  try { await adminAlerts.newCard(cardId, card.headline, card.subject_key) } catch { /* admin ping never affects publish */ }
 }
 
 /** Tell BOTH sides about a pair that did not exist before. Until now a match
