@@ -43,6 +43,19 @@ export function initV3Schema(): void {
       rowid_ref INTEGER PRIMARY KEY,
       card_id TEXT NOT NULL
     );
+
+    -- Operator moderation, kept apart from the signed revocation_status so hiding a
+    -- card never pretends its owner withdrew it. target_type 'card' hides one card,
+    -- 'subject' hides every card of a key, including ones published later.
+    CREATE TABLE IF NOT EXISTS v3_moderation (
+      target_type TEXT NOT NULL CHECK (target_type IN ('card', 'subject')),
+      target TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'hidden' CHECK (status IN ('hidden')),
+      reason TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (target_type, target)
+    );
   `)
   ensureCardHashUnique(d)
   initialized = true
@@ -67,11 +80,52 @@ function d(): Database {
   return getDb()
 }
 
+/** SQL condition: the v3_cards row is not hidden by the operator, neither the card
+ *  itself nor its subject key. Every network-facing read (search, the event wall,
+ *  matching, counts) adds it. Queries using it must name the table v3_cards. */
+const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM v3_moderation m WHERE (m.target_type = 'card' AND m.target = v3_cards.card_id) OR (m.target_type = 'subject' AND m.target = v3_cards.subject_key))`
+
+/** True when the operator hid this card or its subject key. */
+export function isHidden(cardId: string, subjectKey: string): boolean {
+  return !!d().prepare(
+    `SELECT 1 FROM v3_moderation WHERE (target_type = 'card' AND target = ?) OR (target_type = 'subject' AND target = ?)`,
+  ).get(cardId, subjectKey)
+}
+
+/** True when the operator hid every card of this subject key. */
+export function isSubjectHidden(subjectKey: string): boolean {
+  return !!d().prepare(`SELECT 1 FROM v3_moderation WHERE target_type = 'subject' AND target = ?`).get(subjectKey)
+}
+
+export interface ModerationRow { target_type: 'card' | 'subject'; target: string; status: 'hidden'; reason: string; actor: string; at: string }
+
+export function setHidden(targetType: 'card' | 'subject', target: string, reason: string, actor: string): boolean {
+  const res = d().prepare(`INSERT OR IGNORE INTO v3_moderation (target_type, target, reason, actor) VALUES (?, ?, ?, ?)`).run(targetType, target, reason, actor)
+  return res.changes === 1
+}
+
+export function clearHidden(targetType: 'card' | 'subject', target: string): boolean {
+  return d().prepare(`DELETE FROM v3_moderation WHERE target_type = ? AND target = ?`).run(targetType, target).changes === 1
+}
+
+export function listModeration(): ModerationRow[] {
+  return d().prepare(`SELECT * FROM v3_moderation ORDER BY at`).all() as ModerationRow[]
+}
+
+/** Card ids a moderation target covers: the card, or every stored card of the key. */
+export function cardIdsForTarget(targetType: 'card' | 'subject', target: string): { card_id: string; subject_key: string }[] {
+  return (targetType === 'card'
+    ? d().prepare('SELECT card_id, subject_key FROM v3_cards WHERE card_id = ?').all(target)
+    : d().prepare('SELECT card_id, subject_key FROM v3_cards WHERE subject_key = ?').all(target)) as any[]
+}
+
 export interface StoredV3Card {
   card_id: string
   card: V3Card
   revocation_status: RevocationStatus
   expires_at: string
+  /** Hidden by the operator (the card or its key). Separate from revocation_status. */
+  moderated: boolean
 }
 
 export function insertV3Card(cardId: string, card: V3Card, cardHash: string): void {
@@ -90,7 +144,7 @@ export function getV3Card(cardId: string): StoredV3Card | null {
   if (!row) return null
   const card = JSON.parse(row.card_json) as V3Card
   card.revocation_status = row.revocation_status
-  return { card_id: row.card_id, card, revocation_status: row.revocation_status, expires_at: row.expires_at }
+  return { card_id: row.card_id, card, revocation_status: row.revocation_status, expires_at: row.expires_at, moderated: isHidden(row.card_id, card.subject_key ?? '') }
 }
 
 export function setRevocationStatus(cardId: string, subjectKey: string, status: RevocationStatus): boolean {
@@ -188,7 +242,7 @@ function passesJsFilters(stored: V3Card, filters: V3SearchFilters): boolean {
 function semanticWindow(filters: V3SearchFilters, semanticIds: string[], limit: number, createdAfter?: string): Record<string, unknown>[] {
   const ids = [...new Set(semanticIds)]
   if (ids.length === 0) return []
-  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`, `card_id IN (${ids.map(() => '?').join(', ')})`]
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`, NOT_HIDDEN, `card_id IN (${ids.map(() => '?').join(', ')})`]
   const params: unknown[] = [...ids]
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
@@ -212,7 +266,7 @@ function semanticWindow(filters: V3SearchFilters, semanticIds: string[], limit: 
 export function searchV3Cards(filters: V3SearchFilters, semanticIds?: string[], limit = 20): Record<string, unknown>[] {
   const cap = Math.min(limit, SEARCH_CAP)
   if (semanticIds) return semanticWindow(filters, semanticIds, cap)
-  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`, NOT_HIDDEN]
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
@@ -244,7 +298,7 @@ export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}
     if (opts.cursor) throw new Error('a cursor cannot be combined with a semantic search')
     return { results: semanticWindow(filters, opts.semanticIds, limit, opts.createdAfter), next_cursor: null }
   }
-  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`]
+  const where: string[] = [`expires_at > ${SQL_NOW_ISO}`, `revocation_status = 'active'`, NOT_HIDDEN]
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
@@ -291,7 +345,7 @@ export function sweepExpiredV3Cards(): { swept: number } {
 }
 
 export function v3CardCount(): number {
-  return (d().prepare(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`).get() as any).n
+  return (d().prepare(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}`).get() as any).n
 }
 
 // ── Helpers for the match engine, digest, idempotency, and renew ──────────
@@ -300,7 +354,7 @@ export function v3CardCount(): number {
  *  status participates; 'stopped_new_matches' and every terminal status do not. */
 export function listActiveCardsForMatching(cap = 500): { card_id: string; card: V3Card }[] {
   const rows = d().prepare(
-    `SELECT card_id, card_json FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' ORDER BY created_at DESC LIMIT ?`,
+    `SELECT card_id, card_json FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN} ORDER BY created_at DESC LIMIT ?`,
   ).all(cap) as any[]
   return rows.map(r => ({ card_id: r.card_id, card: JSON.parse(r.card_json) as V3Card }))
 }
@@ -318,7 +372,7 @@ export function activeCardIdsForSubject(subjectKey: string): string[] {
  *  through a stale match row. */
 export function isCardMatchable(cardId: string): boolean {
   return !!d().prepare(
-    `SELECT 1 FROM v3_cards WHERE card_id = ? AND expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`,
+    `SELECT 1 FROM v3_cards WHERE card_id = ? AND expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}`,
   ).get(cardId)
 }
 
@@ -412,6 +466,7 @@ export function getSupersedes(newCardId: string): string | null {
 export interface V3CardCounts {
   cards_lifetime: number
   cards_active: number
+  cards_hidden: number
   cards_expired: number
   cards_withdrawn: number
   cards_deleted: number
@@ -438,7 +493,9 @@ export function v3CardCounts(): V3CardCounts {
   const marker = v32DeployMarker()
   return {
     cards_lifetime: one('SELECT COUNT(*) AS n FROM v3_cards'),
-    cards_active: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`),
+    cards_active: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}`),
+    // Active by status but hidden by the operator. Not part of cards_active.
+    cards_hidden: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND NOT (${NOT_HIDDEN})`),
     // Expired counts the sweep's own status AND rows that have passed their
     // expiry but no sweep has reached yet: both are expired in fact.
     cards_expired: one(`SELECT COUNT(*) AS n FROM v3_cards WHERE revocation_status = 'expired' OR (revocation_status = 'active' AND expires_at <= ${SQL_NOW_ISO})`),
@@ -467,6 +524,6 @@ export function v3CardCounts(): V3CardCounts {
       marker,
     ),
     subjects_lifetime: one('SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards'),
-    subjects_active: one(`SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active'`),
+    subjects_active: one(`SELECT COUNT(DISTINCT subject_key) AS n FROM v3_cards WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}`),
   }
 }

@@ -71,6 +71,7 @@ function liveNetworkHeadline(cardId: string): { key: string; headline: string } 
   const stored = v3db.getV3Card(cardId)
   if (!stored) return null
   if (stored.revocation_status !== 'active') return null
+  if (stored.moderated) return null
   if (Date.parse(stored.expires_at) <= Date.now()) return null
   const view = networkVisibleView({ ...stored.card, card_id: cardId }) as any
   if (typeof view.headline !== 'string' || view.headline.length === 0) return null
@@ -157,7 +158,7 @@ const canonicalRequestIntro = canonicalWriteRoute({
     if (!fromStored || fromStored.card.subject_key !== actorKey) {
       refuseWrite(403, 'card_not_the_signers', 'from_card does not belong to the signer')
     }
-    if (fromStored!.revocation_status !== 'active' || Date.parse(fromStored!.expires_at) <= now.getTime()) {
+    if (fromStored!.revocation_status !== 'active' || fromStored!.moderated || Date.parse(fromStored!.expires_at) <= now.getTime()) {
       refuseWrite(400, 'card_not_live', 'from_card is not live')
     }
     const target = liveNetworkHeadline(toCard as string)
@@ -233,7 +234,7 @@ router.post('/request', rateLimited('intro_request', 20), canonicalDispatch(cano
 
   const fromStored = v3db.getV3Card(from_card)
   if (!fromStored || fromStored.card.subject_key !== public_key) { res.status(403).json({ error: 'from_card does not belong to the signer' }); return }
-  if (fromStored.revocation_status !== 'active' || Date.parse(fromStored.expires_at) <= Date.now()) { res.status(400).json({ error: 'from_card is not live' }); return }
+  if (fromStored.revocation_status !== 'active' || fromStored.moderated || Date.parse(fromStored.expires_at) <= Date.now()) { res.status(400).json({ error: 'from_card is not live' }); return }
 
   const target = liveNetworkHeadline(to_card)
   if (!target) { res.status(404).json({ error: 'target card is not available or not network-visible' }); return }

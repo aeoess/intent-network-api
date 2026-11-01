@@ -96,6 +96,10 @@ router.get('/c/:cardId', rateLimited('page_card', 120), (req, res) => {
     secureHtml(res, statusPage(nonce, 'Card unavailable', `This card is ${esc(label)}. Its content is no longer shown. Counterparties may retain what they already received.`), nonce)
     return
   }
+  if (stored.moderated) {
+    secureHtml(res, statusPage(nonce, 'Card unavailable', 'This card is not shown on the network.'), nonce)
+    return
+  }
 
   // Network-visible fields only, per-field visibility respected by the model.
   const view = networkVisibleView({ ...stored.card, card_id: stored.card_id }) as any

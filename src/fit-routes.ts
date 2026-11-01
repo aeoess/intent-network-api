@@ -59,7 +59,7 @@ const fail = (status: number, msg: string): never => { throw new FitError(status
 
 function cardActive(cardId: string): boolean {
   const c = v3db.getV3Card(cardId)
-  return !!c && c.revocation_status === 'active' && Date.parse(c.expires_at) > Date.now()
+  return !!c && c.revocation_status === 'active' && !c.moderated && Date.parse(c.expires_at) > Date.now()
 }
 
 /** Consent sheet for a party, per spec: what this exchange discloses and its limits. */
@@ -726,7 +726,7 @@ export async function createFitExchangeForIntro(intro: introsDb.IntroRow): Promi
   const from = v3db.getV3Card(intro.from_card)
   const to = v3db.getV3Card(intro.to_card)
   if (!from || !to) return null
-  if (from.revocation_status !== 'active' || to.revocation_status !== 'active') return null
+  if (from.revocation_status !== 'active' || to.revocation_status !== 'active' || from.moderated || to.moderated) return null
   if (!Array.isArray(from.card.intents) || !from.card.intents.includes(purpose)) return null
   if (!Array.isArray(to.card.intents) || !to.card.intents.includes(purpose)) return null
   if (fitDb.existsActiveExchangeForIntro(intro.id)) return null

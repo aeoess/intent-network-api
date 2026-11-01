@@ -145,6 +145,9 @@ function verifyCardCrypto(card: Record<string, any>): { ok: true } | { ok: false
  *  active after the route's own check, so the transaction rolls back. */
 class OldCardNotActive extends Error {}
 
+const HIDDEN_KEY_ERROR = 'this key is hidden from the network by the operator, so it cannot publish; contact security@aeoess.com if you think this is wrong'
+const HIDDEN_CARD_ERROR = 'this card is hidden from the network by the operator, so it cannot be renewed or replaced; it can still be withdrawn or deleted'
+
 /** The refusal for signed content that was already taken down. */
 function retiredRefusal(res: any, standing: { card_id: string; revocation_status: string }): void {
   res.status(409).json({ error: `this exact card was already taken down (${standing.revocation_status}) and cannot be published again; publish a new card instead`, card_id: standing.card_id })
@@ -169,6 +172,7 @@ router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', re
 
   if (Date.parse(card.expires_at) <= Date.now()) { res.status(400).json({ error: 'card is already expired' }); return }
   if (card.revocation_status !== 'active') { res.status(400).json({ error: 'a new card must be published with revocation_status active' }); return }
+  if (v3db.isSubjectHidden(card.subject_key)) { res.status(403).json({ error: HIDDEN_KEY_ERROR }); return }
 
   // Idempotency: byte-identical content already live for this subject returns
   // that card, not a duplicate. (The content hash covers timestamps too, so an
@@ -227,6 +231,8 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
   if (!old) { res.status(404).json({ error: 'card to renew not found' }); return }
   if (old.card.subject_key !== card.subject_key) { res.status(403).json({ error: 'not the card subject' }); return }
   if (old.revocation_status !== 'active') { res.status(409).json({ error: `only an active card can be renewed (this one is ${old.revocation_status})` }); return }
+  if (v3db.isSubjectHidden(card.subject_key)) { res.status(403).json({ error: HIDDEN_KEY_ERROR }); return }
+  if (old.moderated) { res.status(409).json({ error: HIDDEN_CARD_ERROR }); return }
   if (!sameContentExceptTimestamps(old.card, card)) {
     res.status(400).json({ error: 'renew requires identical content. Use compose and replace to change a card.' }); return
   }
@@ -290,6 +296,8 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
   if (!old) { res.status(404).json({ error: 'card to replace not found' }); return }
   if (old.card.subject_key !== card.subject_key) { res.status(403).json({ error: 'not the card subject' }); return }
   if (old.revocation_status !== 'active') { res.status(409).json({ error: `only an active card can be replaced (this one is ${old.revocation_status})` }); return }
+  if (v3db.isSubjectHidden(card.subject_key)) { res.status(403).json({ error: HIDDEN_KEY_ERROR }); return }
+  if (old.moderated) { res.status(409).json({ error: HIDDEN_CARD_ERROR }); return }
   const replaceStanding = v3db.cardHashStanding(card.subject_key, card.approval.card_hash)
   if (replaceStanding.kind === 'retired') { retiredRefusal(res, replaceStanding); return }
   if (replaceStanding.kind === 'active') {
@@ -341,7 +349,7 @@ router.get('/cards/:cardId', (req, res) => {
   const stored = v3db.getV3Card(cardId)
   if (!stored) { res.status(404).json({ error: 'card not found' }); return }
   const full = stored.card as unknown as Record<string, any>
-  const live = stored.revocation_status === 'active' && Date.parse(stored.expires_at) > Date.now()
+  const live = stored.revocation_status === 'active' && Date.parse(stored.expires_at) > Date.now() && !stored.moderated
   // card_id stays at the top level only. Clients renew by resealing this object, so
   // for a card whose fields are all network-visible it must equal the stored card
   // minus the envelope, with no field added.
@@ -353,7 +361,7 @@ router.get('/cards/:cardId', (req, res) => {
   } else {
     card = { card_type: full.card_type, revocation_status: stored.revocation_status }
   }
-  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, projection: live ? 'network_visible' : 'status_only', card, ...lineage(cardId) })
+  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, moderation: stored.moderated ? 'hidden' : null, projection: live ? 'network_visible' : 'status_only', card, ...lineage(cardId) })
 })
 
 // ── POST /api/v3/cards/:cardId/owner-read - the full signed card, owner only ─
@@ -382,7 +390,7 @@ router.post('/cards/:cardId/owner-read', rateLimited('verb', req => String(req.b
   } catch (e: any) {
     res.status(403).json({ error: `owner-read signature verification failed: ${e.message}` }); return
   }
-  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, projection: 'owner_full', card: stored.card, ...lineage(cardId) })
+  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, moderation: stored.moderated ? 'hidden' : null, projection: 'owner_full', card: stored.card, ...lineage(cardId) })
 })
 
 // ── POST /api/v3/cards/search - explicit fields + semantic, filtered ─────

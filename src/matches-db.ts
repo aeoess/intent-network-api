@@ -134,7 +134,7 @@ export interface RecomputeResult {
 
 export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult {
   const stored = v3db.getV3Card(cardId)
-  if (!stored || stored.revocation_status !== 'active' || Date.parse(stored.expires_at) <= Date.now()) {
+  if (!stored || stored.revocation_status !== 'active' || stored.moderated || Date.parse(stored.expires_at) <= Date.now()) {
     deleteMatchRowsForCard(cardId)
     return { live: 0, created: [] }
   }

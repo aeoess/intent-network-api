@@ -79,6 +79,8 @@ export const CARD_EVENTS = [
   'card_authority_revoked',
   'card_stopped_new_matches',
   'card_server_copy_deleted',
+  'card_hidden',
+  'card_unhidden',
   'embedding_stored',
   'embedding_failed',
   'matching_started',

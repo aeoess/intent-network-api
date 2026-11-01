@@ -22,7 +22,7 @@ import * as introsDb from './intros-db.js'
 
 function cardActive(cardId: string, now: Date): boolean {
   const c = v3db.getV3Card(cardId)
-  return !!c && c.revocation_status === 'active' && Date.parse(c.expires_at) > now.getTime()
+  return !!c && c.revocation_status === 'active' && !c.moderated && Date.parse(c.expires_at) > now.getTime()
 }
 
 export interface ExchangeGuardOptions {
