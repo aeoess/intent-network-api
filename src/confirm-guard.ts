@@ -40,10 +40,44 @@ function d() {
     CREATE INDEX IF NOT EXISTS idx_confirm_log_addr ON v3_confirm_log(addr_hash, at);
     CREATE INDEX IF NOT EXISTS idx_confirm_log_key ON v3_confirm_log(subject_key, at);
     CREATE INDEX IF NOT EXISTS idx_confirm_log_ip ON v3_confirm_log(ip, at);
-    CREATE INDEX IF NOT EXISTS idx_confirm_log_at ON v3_confirm_log(at);`)
+    CREATE INDEX IF NOT EXISTS idx_confirm_log_at ON v3_confirm_log(at);
+    CREATE TABLE IF NOT EXISTS v3_confirm_allowances (
+      ip TEXT PRIMARY KEY,
+      per_day INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );`)
     ready = true
   }
   return db
+}
+
+// An operator allowance raises the daily per-address limit for one client address,
+// for example an event on venue wifi where many attendees sign up for email. It has a
+// reason, an actor and an expiry (24 hours unless set), and stops applying on its own.
+// Inside its own per-day cap, that address is not held to the service-wide hourly budget.
+export function allowSourceEmail(ip: string, perDay: number, reason: string, actor: string, opts: { hours?: number; nowMs?: number } = {}) {
+  const hours = opts.hours ?? 24
+  if (!ip.trim() || !reason.trim() || !actor.trim()) throw new Error('ip, reason and actor are required')
+  if (!(perDay > 0 && perDay <= 1000)) throw new Error('per_day must be between 1 and 1000')
+  if (!(hours > 0 && hours <= 24 * 14)) throw new Error('hours must be between 0 and 336')
+  const now = opts.nowMs ?? Date.now()
+  d().prepare(`INSERT INTO v3_confirm_allowances (ip, per_day, reason, actor, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(ip) DO UPDATE SET per_day = excluded.per_day, reason = excluded.reason, actor = excluded.actor, created_at = excluded.created_at, expires_at = excluded.expires_at`)
+    .run(ip.trim(), perDay, reason, actor, new Date(now).toISOString(), new Date(now + hours * 3600 * 1000).toISOString())
+  return activeAllowance(ip.trim(), now)
+}
+export function activeAllowance(ip: string | undefined, nowMs = Date.now()): { ip: string; per_day: number; reason: string; actor: string; expires_at: string } | null {
+  if (!ip) return null
+  return (d().prepare('SELECT ip, per_day, reason, actor, expires_at FROM v3_confirm_allowances WHERE ip = ? AND expires_at > ?').get(ip, new Date(nowMs).toISOString()) as any) ?? null
+}
+export function liftAllowance(ip: string): boolean {
+  return d().prepare('DELETE FROM v3_confirm_allowances WHERE ip = ?').run(ip.trim()).changes === 1
+}
+export function listAllowances() {
+  return d().prepare('SELECT * FROM v3_confirm_allowances ORDER BY created_at').all()
 }
 
 const hashAddr = (addr: string) => createHash('sha256').update(addr.trim().toLowerCase()).digest('hex')
@@ -84,10 +118,14 @@ export function reserveConfirm(subjectKey: string, addr: string, ip: string | un
     if (named.length >= ADDRESSES_PER_KEY_PER_DAY && !named.some(r => r.addr_hash === h)) {
       return { ok: false, hold: false, reason: `one key can ask for confirmation of at most ${ADDRESSES_PER_KEY_PER_DAY} different addresses per 24 hours` }
     }
-    if (!isLoopback(ip) && n('SELECT COUNT(*) n FROM v3_confirm_log WHERE ip = ? AND at > ?', ip, day) >= confirmsPerSourcePerDay()) {
+    const allowance = activeAllowance(ip, nowMs)
+    const perSource = Math.max(confirmsPerSourcePerDay(), allowance?.per_day ?? 0)
+    if (!isLoopback(ip) && n('SELECT COUNT(*) n FROM v3_confirm_log WHERE ip = ? AND at > ?', ip, day) >= perSource) {
       return { ok: false, hold: false, reason: 'too many confirmation emails requested from this network address today' }
     }
-    if (n('SELECT COUNT(*) n FROM v3_confirm_log WHERE at > ?', hour) >= confirmsPerHour()) {
+    // An address with an operator allowance is bounded by that allowance instead of the
+    // service-wide hourly budget, which an event alone could otherwise use up.
+    if (!allowance && n('SELECT COUNT(*) n FROM v3_confirm_log WHERE at > ?', hour) >= confirmsPerHour()) {
       return { ok: false, hold: false, reason: 'Mingle is sending too many confirmation emails right now; try again in an hour' }
     }
     const r = db.prepare('INSERT INTO v3_confirm_log (at, subject_key, addr_hash, ip) VALUES (?, ?, ?, ?)').run(new Date(nowMs).toISOString(), subjectKey, h, ip ?? null)

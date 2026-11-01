@@ -72,6 +72,20 @@ export function createApp() {
   app.use('/api/v4/fit', fitV4Routes)
 
   // ── Health check ──
+  // RFC 9116 security contact. security@ is the address the Mingle security policy names,
+  // signal@ is the second route. Expires must be renewed before the date below.
+  app.get('/.well-known/security.txt', (_req, res) => {
+    res.type('text/plain').send([
+      'Contact: mailto:security@aeoess.com',
+      'Contact: mailto:signal@aeoess.com',
+      'Expires: 2027-10-31T00:00:00.000Z',
+      'Preferred-Languages: en',
+      'Canonical: https://api.aeoess.com/.well-known/security.txt',
+      'Policy: https://github.com/aeoess/mingle-mcp/blob/main/SECURITY.md',
+      '',
+    ].join('\n'))
+  })
+
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', version: '0.4.0', uptime: process.uptime() })
   })

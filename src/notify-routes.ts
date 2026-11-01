@@ -12,6 +12,7 @@ import { checkRateLimit } from './db.js'
 import * as notifyDb from './notify-db.js'
 import * as email from './notifications.js'
 import { unlessRestricted } from './source-blocks.js'
+import { keyedLimit, SUBSCRIBE_LIMIT } from './keyed-limits.js'
 import { reserveConfirm, releaseConfirm, hourlyBudgetUsed } from './confirm-guard.js'
 import * as v3db from './v3-db.js'
 
@@ -35,7 +36,7 @@ function rateLimited(action: string, limit: number) {
 // ── POST /subscribe {subject_key, email, nonce, signature, prefs?} ────────
 // signature is over `${email}:${nonce}` by subject_key.
 
-router.post('/subscribe', unlessRestricted('subscribe'), rateLimited('notif_subscribe', 10), async (req, res) => {
+router.post('/subscribe', unlessRestricted('subscribe'), keyedLimit({ ...SUBSCRIBE_LIMIT, keyOf: req => req.body?.subject_key }), async (req, res) => {
   const { subject_key, email: addr, nonce, signature, prefs } = req.body ?? {}
   if (typeof subject_key !== 'string' || typeof addr !== 'string' || typeof nonce !== 'string' || typeof signature !== 'string') {
     res.status(400).json({ error: 'subject_key, email, nonce, signature required' }); return

@@ -30,6 +30,23 @@ if (cmd === 'restrict-source' || cmd === 'lift-source') {
   process.exit(0)
 }
 
+// Email allowance for one address (an event on shared wifi):
+//   node scripts/moderate.mjs allow-source-email <ip> <per_day> "<reason>" <actor> [hours] [--apply]
+//   node scripts/moderate.mjs lift-source-email <ip> [--apply]
+//   node scripts/moderate.mjs list-email-allowances
+const guard = await import('../dist/confirm-guard.js')
+if (cmd === 'list-email-allowances') { console.log(JSON.stringify(guard.listAllowances(), null, 1)); process.exit(0) }
+if (cmd === 'allow-source-email' || cmd === 'lift-source-email') {
+  const ip = type
+  if (!ip) { console.error('usage: allow-source-email <ip> <per_day> "<reason>" <actor> [hours] [--apply] | lift-source-email <ip> [--apply]'); process.exit(2) }
+  const rest = process.argv.slice(2).filter(x => x !== '--apply')
+  const perDay = Number(rest[2]); const reason = rest[3] ?? ''; const actor = rest[4] ?? ''; const hours = rest[5] ? Number(rest[5]) : undefined
+  if (!apply) { console.log(JSON.stringify({ dry_run: true, cmd, ip, per_day: perDay, hours: hours ?? 24, current: guard.activeAllowance(ip) }, null, 1)); process.exit(0) }
+  const result = cmd === 'allow-source-email' ? guard.allowSourceEmail(ip, perDay, reason, actor, { hours }) : guard.liftAllowance(ip)
+  console.log(JSON.stringify({ applied: true, cmd, ip, result }, null, 1))
+  process.exit(0)
+}
+
 if (cmd === 'list') {
   console.log(JSON.stringify(v3db.listModeration(), null, 1))
   process.exit(0)
