@@ -377,18 +377,27 @@ export function getIntrosForAgent(agentId: string): { sent: IntroRequest[]; rece
 // Rate Limiting
 // ══════════════════════════════════════
 
-export function checkRateLimit(publicKey: string, action: string, maxPerHour: number): { allowed: boolean; remaining: number } {
+// Sliding window count over hourly buckets. A fixed clock-hour window let a caller
+// spend the whole limit at 05:59 and again at 06:00. The estimate adds the previous
+// hour's count weighted by how much of it still falls inside the last 60 minutes, so
+// a burst across the boundary is held to about the limit. Compared with the fixed
+// window it can only refuse more, never less. The previous bucket is at most 2 hours
+// old, and purgeExpired keeps 2 hours.
+export function checkRateLimit(publicKey: string, action: string, maxPerHour: number, nowMs = Date.now()): { allowed: boolean; remaining: number } {
   const d = getDb()
-  const windowStart = new Date()
+  const windowStart = new Date(nowMs)
   windowStart.setMinutes(0, 0, 0)
   const window = windowStart.toISOString()
+  const prevWindow = new Date(windowStart.getTime() - 3600 * 1000).toISOString()
+  const elapsed = (nowMs - windowStart.getTime()) / (3600 * 1000)
 
-  const row = d.prepare(
+  const countAt = (w: string): number => ((d.prepare(
     'SELECT count FROM rate_limits WHERE public_key = ? AND action = ? AND window_start = ?'
-  ).get(publicKey, action, window) as any
+  ).get(publicKey, action, w) as any)?.count || 0)
 
-  const current = row?.count || 0
-  if (current >= maxPerHour) {
+  const current = countAt(window)
+  const estimate = current + countAt(prevWindow) * (1 - elapsed)
+  if (current >= maxPerHour || estimate >= maxPerHour) {
     return { allowed: false, remaining: 0 }
   }
 
@@ -399,7 +408,7 @@ export function checkRateLimit(publicKey: string, action: string, maxPerHour: nu
     ON CONFLICT(public_key, action, window_start) DO UPDATE SET count = count + 1
   `).run(publicKey, action, window)
 
-  return { allowed: true, remaining: maxPerHour - current - 1 }
+  return { allowed: true, remaining: Math.max(0, Math.floor(maxPerHour - estimate - 1)) }
 }
 
 // ══════════════════════════════════════
