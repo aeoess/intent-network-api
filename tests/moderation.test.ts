@@ -101,6 +101,9 @@ test('hiding a key takes all its cards off the network without forging a withdra
   const after = v3db.v3CardCounts()
   assert.equal(after.cards_active, before.cards_active - 2)
   assert.equal(after.cards_hidden, before.cards_hidden + 2)
+  const stats = JSON.parse((await getText('/api/stats')).text)
+  assert.equal(stats.v3.cards_active, after.cards_active, 'public stats still count active cards')
+  assert.equal('cards_hidden' in stats.v3, false, 'but not how many the operator hid')
 
   const g = JSON.parse((await getText(`/api/v3/cards/${p1.body.card_id}`)).text)
   assert.equal(g.revocation_status, 'active', 'the signed status is not rewritten')

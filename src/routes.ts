@@ -582,7 +582,10 @@ router.get('/stats', (_req, res) => {
 /** The v3 network, counted live from the v3 tables and the event ledger on
  *  every request. Nothing here reads a stored counter. */
 function v3Stats(): Record<string, number> {
-  const cards = v3db.v3CardCounts()
+  // cards_hidden is an operator figure. These stats are public, and the count of cards the
+  // operator hid tells a prober how much of its traffic was caught. scripts/moderate.mjs
+  // list reports it instead.
+  const { cards_hidden: _operatorOnly, ...cards } = v3db.v3CardCounts()
   return {
     ...cards,
     matches_current: db.tableCount('v3_matches'),

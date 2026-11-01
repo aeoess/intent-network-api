@@ -1,6 +1,7 @@
 // Operator moderation, run on the server with shell access. Dry run unless --apply.
 //
 //   node scripts/moderate.mjs list
+//   node scripts/moderate.mjs counts
 //   node scripts/moderate.mjs hide subject <subject_key> "<reason>" <actor> [--apply]
 //   node scripts/moderate.mjs hide card <card_id> "<reason>" <actor> [--apply]
 //   node scripts/moderate.mjs unhide subject|card <target> <actor> [--apply]
@@ -51,8 +52,13 @@ if (cmd === 'list') {
   console.log(JSON.stringify(v3db.listModeration(), null, 1))
   process.exit(0)
 }
+// The card counts including cards_hidden, which the public /api/stats leaves out.
+if (cmd === 'counts') {
+  console.log(JSON.stringify(v3db.v3CardCounts(), null, 1))
+  process.exit(0)
+}
 if (!['hide', 'unhide'].includes(cmd) || !['card', 'subject'].includes(type) || !target) {
-  console.error('usage: list | hide card|subject <target> "<reason>" <actor> [--apply] | unhide card|subject <target> <actor> [--apply]')
+  console.error('usage: list | counts | hide card|subject <target> "<reason>" <actor> [--apply] | unhide card|subject <target> <actor> [--apply]')
   process.exit(2)
 }
 const cards = v3db.cardIdsForTarget(type, target)
