@@ -23,6 +23,7 @@ import { v2Enabled, V2_INDEX_KEYS } from './v2-gate.js'
 import { initWriteSchema } from './write-db.js'
 import { legacyWindowClosed, legacyWriteCutoffAt } from './db.js'
 import { WRITE_DOMAIN } from './write-envelope.js'
+import { blockedSourceWrites } from './source-blocks.js'
 
 export function createApp() {
   // The write subsystem tables, created here as well as at server boot. server.ts is not
@@ -46,6 +47,8 @@ export function createApp() {
     allowedHeaders: ['Content-Type', 'X-Agent-Id', 'X-Public-Key'],
   }))
   app.use((express as any).json({ limit: '100kb' }))
+  // Operator block on POST, PUT, PATCH and DELETE from one address (GET stays open). See source-blocks.ts.
+  app.use(blockedSourceWrites)
 
   // ── Routes ──
   app.use('/api', routes)

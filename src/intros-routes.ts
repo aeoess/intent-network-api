@@ -163,6 +163,8 @@ const canonicalRequestIntro = canonicalWriteRoute({
     }
     const target = liveNetworkHeadline(toCard as string)
     if (!target) refuseWrite(404, 'target_unavailable', 'target card is not available or not network-visible')
+    // Two cards of one key are one principal. An intro between them introduces nobody.
+    if (target!.key === actorKey) refuseWrite(400, 'same_key', 'cannot request an intro between two cards of the same key')
     if (introsDb.isBlocked(fromCard as string, toCard as string)) {
       refuseWrite(403, 'pair_blocked', 'this pair cannot be introduced')
     }
@@ -238,6 +240,7 @@ router.post('/request', rateLimited('intro_request', 20), canonicalDispatch(cano
 
   const target = liveNetworkHeadline(to_card)
   if (!target) { res.status(404).json({ error: 'target card is not available or not network-visible' }); return }
+  if (target.key === public_key) { res.status(400).json({ error: 'cannot request an intro between two cards of the same key' }); return }
 
   if (introsDb.isBlocked(from_card, to_card)) { res.status(403).json({ error: 'this pair cannot be introduced' }); return }
   if (introsDb.hasPendingBetween(from_card, to_card)) { res.status(409).json({ error: 'a pending intro already exists for this pair' }); return }

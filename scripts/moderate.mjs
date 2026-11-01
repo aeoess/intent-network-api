@@ -13,6 +13,21 @@ const [cmd, type, target, a3, a4] = process.argv.slice(2)
 const apply = process.argv.includes('--apply')
 const v3db = await import('../dist/v3-db.js')
 const mod = await import('../dist/moderation.js')
+const blocks = await import('../dist/source-blocks.js')
+
+// Address blocks:
+//   node scripts/moderate.mjs list-sources
+//   node scripts/moderate.mjs block-source <ip> "<reason>" <actor> [--apply]
+//   node scripts/moderate.mjs unblock-source <ip> [--apply]
+if (cmd === 'list-sources') { console.log(JSON.stringify(blocks.listBlockedSources(), null, 1)); process.exit(0) }
+if (cmd === 'block-source' || cmd === 'unblock-source') {
+  const ip = type
+  if (!ip) { console.error('usage: block-source <ip> "<reason>" <actor> [--apply] | unblock-source <ip> [--apply]'); process.exit(2) }
+  if (!apply) { console.log(JSON.stringify({ dry_run: true, cmd, ip, currently_blocked: blocks.isSourceBlocked(ip) }, null, 1)); process.exit(0) }
+  const changed = cmd === 'block-source' ? blocks.blockSource(ip, target ?? '', a3 ?? '') : blocks.unblockSource(ip)
+  console.log(JSON.stringify({ applied: true, cmd, ip, changed }, null, 1))
+  process.exit(0)
+}
 
 if (cmd === 'list') {
   console.log(JSON.stringify(v3db.listModeration(), null, 1))
