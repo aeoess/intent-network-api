@@ -122,15 +122,16 @@ test('two cards of the same key never match each other, a different key still ma
 
 test('one source cannot publish past the per-source limit by rotating keys, and loopback is exempt', async () => {
   const limit = Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 10)
-  const src = { 'X-Forwarded-For': '203.0.113.77' }
+  // Production shape: client address, then the CDN edge appends its own.
+  const src = { 'X-Forwarded-For': '203.0.113.77, 84.17.44.229' }
   for (let i = 0; i < limit; i++) {
     const r = await publish(makeCard(generateKeyPair(), { headline: `Source limit probe ${i}` }), src)
     assert.equal(r.status, 201, `publish ${i}: ${JSON.stringify(r.body)}`)
   }
   const over = await publish(makeCard(generateKeyPair(), { headline: 'Source limit probe over' }), src)
   assert.equal(over.status, 429, JSON.stringify(over.body))
-  // A different source is unaffected.
-  const otherSrc = await publish(makeCard(generateKeyPair(), { headline: 'Source limit other source' }), { 'X-Forwarded-For': '198.51.100.4' })
+  // A different client behind the same edge node is unaffected.
+  const otherSrc = await publish(makeCard(generateKeyPair(), { headline: 'Source limit other source' }), { 'X-Forwarded-For': '198.51.100.4, 84.17.44.229' })
   assert.equal(otherSrc.status, 201, JSON.stringify(otherSrc.body))
   // Loopback with no forwarded header is the operator and never hits the source cap.
   const local = await publish(makeCard(generateKeyPair(), { headline: 'Source limit loopback' }))
