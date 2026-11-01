@@ -28,6 +28,25 @@ export const REVOCATION_STATUSES = ['active', 'stopped_new_matches', 'superseded
 
 export const DEFAULT_TTL_DAYS = 21
 
+// Time bounds the server applies at write time (publish, renew, replace). created_at
+// is signed, so the server never rewrites it. It refuses a card whose created_at is
+// more than 5 minutes ahead of server time (search orders by created_at, so a future
+// date would hold a card at the top) or more than 24 hours old (a batch signed long
+// before it is sent), and a lifetime over 60 days, the client's own maximum.
+export const MAX_TTL_DAYS = 60
+export const CREATED_AT_FUTURE_SKEW_MS = 5 * 60 * 1000
+export const CREATED_AT_PAST_SKEW_MS = 24 * 3600 * 1000
+
+export function timeBoundsError(card: { created_at: string; expires_at: string }, nowMs = Date.now()): string | null {
+  const created = Date.parse(card.created_at)
+  const expires = Date.parse(card.expires_at)
+  if (created > nowMs + CREATED_AT_FUTURE_SKEW_MS) return `created_at is more than 5 minutes ahead of server time (${new Date(nowMs).toISOString()}); sign the card with the current time`
+  if (created < nowMs - CREATED_AT_PAST_SKEW_MS) return 'created_at is more than 24 hours old; sign the card again with the current time'
+  // One minute of slack for the time a client spends between stamping and signing.
+  if (expires - created > MAX_TTL_DAYS * 86400000 + 60000) return `a card can live at most ${MAX_TTL_DAYS} days from its created_at`
+  return null
+}
+
 export type CardType = typeof CARD_TYPES[number]
 export type RevocationStatus = typeof REVOCATION_STATUSES[number]
 

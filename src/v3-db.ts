@@ -58,7 +58,17 @@ export function initV3Schema(): void {
     );
   `)
   ensureCardHashUnique(d)
+  ensureReceivedAt(d)
   initialized = true
+}
+
+/** received_at is the server's own clock when the row was stored. created_at is
+ *  signed by the client and bounded at write time, received_at is what the server
+ *  saw. Added as a nullable column, so rows from before it, and rows written by
+ *  older code after a rollback, read as null. */
+function ensureReceivedAt(db: Database): void {
+  const cols = db.prepare('PRAGMA table_info(v3_cards)').all() as { name: string }[]
+  if (!cols.some(c => c.name === 'received_at')) db.exec('ALTER TABLE v3_cards ADD COLUMN received_at TEXT')
 }
 
 /** One stored row per (subject_key, card_hash). The route checks already refuse a
@@ -130,8 +140,8 @@ export interface StoredV3Card {
 
 export function insertV3Card(cardId: string, card: V3Card, cardHash: string): void {
   d().prepare(`
-    INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, event_ref_id, created_at, expires_at, revocation_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, event_ref_id, created_at, expires_at, revocation_status, received_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   `).run(
     cardId, card.card_type, card.subject_key, cardHash, JSON.stringify(card),
     card.headline, JSON.stringify(card.intents), card.event_ref?.event_id ?? null,

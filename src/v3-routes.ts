@@ -10,7 +10,7 @@
 import { Router } from 'express'
 import { createHash, randomBytes } from 'node:crypto'
 import { verify, canonicalize } from 'agent-passport-system'
-import { cardContentHash, canonicalCardContent, validateV3Card } from './v3-cards.js'
+import { cardContentHash, canonicalCardContent, validateV3Card, timeBoundsError } from './v3-cards.js'
 import type { RevocationStatus, V3Card } from './v3-cards.js'
 import * as v3db from './v3-db.js'
 import * as matchesDb from './matches-db.js'
@@ -171,6 +171,7 @@ router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', re
   if ('error' in crypto) { res.status(403).json({ error: crypto.error }); return }
 
   if (Date.parse(card.expires_at) <= Date.now()) { res.status(400).json({ error: 'card is already expired' }); return }
+  { const t = timeBoundsError(card); if (t) { res.status(400).json({ error: t }); return } }
   if (card.revocation_status !== 'active') { res.status(400).json({ error: 'a new card must be published with revocation_status active' }); return }
   if (v3db.isSubjectHidden(card.subject_key)) { res.status(403).json({ error: HIDDEN_KEY_ERROR }); return }
 
@@ -225,6 +226,7 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
   const crypto = verifyCardCrypto(card)
   if ('error' in crypto) { res.status(403).json({ error: crypto.error }); return }
   if (Date.parse(card.expires_at) <= Date.now()) { res.status(400).json({ error: 'renewed card is already expired' }); return }
+  { const t = timeBoundsError(card); if (t) { res.status(400).json({ error: t }); return } }
   if (card.revocation_status !== 'active') { res.status(400).json({ error: 'a renewed card must be active' }); return }
 
   const old = v3db.getV3Card(oldId)
@@ -290,6 +292,7 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
   const crypto = verifyCardCrypto(card)
   if ('error' in crypto) { res.status(403).json({ error: crypto.error }); return }
   if (Date.parse(card.expires_at) <= Date.now()) { res.status(400).json({ error: 'replacement card is already expired' }); return }
+  { const t = timeBoundsError(card); if (t) { res.status(400).json({ error: t }); return } }
   if (card.revocation_status !== 'active') { res.status(400).json({ error: 'a replacement card must be published with revocation_status active' }); return }
 
   const old = v3db.getV3Card(oldId)
