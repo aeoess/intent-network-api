@@ -85,7 +85,12 @@ router.post('/subscribe', unlessRestricted('subscribe'), rateLimited('notif_subs
   // email, and the response reports the stored state. The confirmation is the
   // only email an unverified address receives.
   const verified = notifyDb.getSubscription(subject_key)?.verified ?? false
-  const sent = verified || holdSend ? { sent: false } : await email.sendConfirmation(addr, verifyToken, unsubToken)
+  // A transport that throws is treated like one that reports a failure: the
+  // reservation goes back and the sign-up is stored without an email.
+  let sent: { sent: boolean; reason?: string } = { sent: false }
+  if (!verified && !holdSend) {
+    try { sent = await email.sendConfirmation(addr, verifyToken, unsubToken) } catch (e) { sent = { sent: false, reason: (e as Error).message } }
+  }
   if (reservation !== null && !sent.sent) releaseConfirm(reservation)
   res.status(201).json({ subscribed: true, verified, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
 })

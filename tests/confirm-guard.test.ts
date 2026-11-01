@@ -172,3 +172,15 @@ test('five keys asking for the same address at the same moment produce one email
   assert.equal(sent.length - before, 1, JSON.stringify(rs.map(r => r.status)))
   assert.equal(rs.filter(r => r.status === 201).length, 1)
 })
+
+test('a transport that throws releases the reservation and the sign-up still answers', async () => {
+  db.getDb().prepare('DELETE FROM v3_confirm_log').run()
+  email.setTransport(async () => { throw new Error('socket hang up') })
+  const k = generateKeyPair()
+  const r = await subscribe(k, 'thrown@mingle-test.org')
+  assert.equal(r.status, 201, JSON.stringify(r.body))
+  assert.equal(r.body.confirmation_sent, false)
+  assert.equal((db.getDb().prepare('SELECT COUNT(*) n FROM v3_confirm_log').get() as any).n, 0, 'the reservation went back')
+  email.setTransport(async (e) => { sent.push(e); return { ok: true, id: 'mock' } })
+  assert.equal((await subscribe(k, 'thrown@mingle-test.org')).body.confirmation_sent, true, 'the person can try again')
+})
