@@ -206,7 +206,7 @@ router.post('/cards', unlessRestricted('publish'), sourceLimited('publish_source
 
   const cardId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   try {
-    v3db.insertV3Card(cardId, card, card.approval.card_hash)
+    v3db.insertV3Card(cardId, card, card.approval.card_hash, v3db.sourceHashOf(req.ip))
   } catch (e) {
     // A concurrent writer stored this exact card between the check and the insert.
     if (v3db.isCardHashConflict(e) && answerExisting()) return
@@ -258,7 +258,7 @@ router.post('/cards/:cardId/renew', unlessRestricted('publish'), rateLimited('re
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   try {
     getDb().transaction(() => {
-      v3db.insertV3Card(newId, card, card.approval.card_hash)
+      v3db.insertV3Card(newId, card, card.approval.card_hash, v3db.sourceHashOf(req.ip))
       if (!v3db.supersedeIfActive(oldId, card.subject_key)) throw new OldCardNotActive()
       v3db.removeFromIndex(oldId)
       matchesDb.deleteMatchArtifacts(oldId)
@@ -315,7 +315,7 @@ router.post('/cards/:cardId/replace', unlessRestricted('publish'), rateLimited('
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   try {
     getDb().transaction(() => {
-      v3db.insertV3Card(newId, card, card.approval.card_hash)
+      v3db.insertV3Card(newId, card, card.approval.card_hash, v3db.sourceHashOf(req.ip))
       if (!v3db.supersedeIfActive(oldId, card.subject_key)) throw new OldCardNotActive()
       v3db.removeFromIndex(oldId)
       matchesDb.deleteMatchArtifacts(oldId)
@@ -435,12 +435,14 @@ router.post('/cards/search', rateLimited('search', req => String(req.headers['x-
       return
     }
   }
-  const { results, next_cursor } = v3db.searchV3CardsPaged(
+  const { results, next_cursor, folded } = v3db.searchV3CardsPaged(
     { card_type, intents, topics, engagement, location, event_ref },
     { semanticIds, limit: Number(limit) || 20, createdAfter: created_after, cursor: decodedCursor },
   )
   const encoded = next_cursor ? Buffer.from(JSON.stringify(next_cursor)).toString('base64url') : null
-  res.json({ count: results.length, results, next_cursor: encoded })
+  // folded_for_fairness counts matching cards left off this page: more than 3 of one
+  // key, or near identical repeats from one source (see page-fairness.ts).
+  res.json({ count: results.length, results, next_cursor: encoded, folded_for_fairness: folded ?? 0 })
 })
 
 // ── Revocation verbs (invariant 7) ───────────────────────────────────────

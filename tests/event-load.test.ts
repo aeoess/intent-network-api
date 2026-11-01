@@ -167,9 +167,12 @@ test('COORDINATED one source spreads near identical cards across 20 keys into th
   const wall = await search({ event_ref: EVENT, limit: 50 }, newSource(), viewer.publicKey)
   const ids: string[] = (wall.body.results ?? []).map((c: any) => c.card_id)
   metric('coord.event_search_top50', { real: ids.filter(i => realIds.has(i)).length, coordinated: ids.filter(i => theirs.has(i)).length })
+  assert.equal(ids.filter(i => realIds.has(i)).length, 25, 'every attendee is still on the first page of the event')
+  assert.ok(ids.filter(i => theirs.has(i)).length <= 3, 'the coordinated source shows at most 3 near identical cards')
   const topical = await search({ topics: ['robotics'], limit: 50 }, newSource(), viewer.publicKey)
   const tids: string[] = (topical.body.results ?? []).map((c: any) => c.card_id)
   metric('coord.topic_search_top50', { real: tids.filter(i => realIds.has(i)).length, coordinated: tids.filter(i => theirs.has(i)).length })
+  assert.ok(tids.filter(i => realIds.has(i)).length >= 1, 'the real robotics attendees are on the page')
 
   const touching = matchesTouchingReal()
   const fromThem = touching.filter(m => theirs.has(m.card_a) || theirs.has(m.card_b)).length
@@ -181,3 +184,25 @@ test('COORDINATED one source spreads near identical cards across 20 keys into th
 })
 
 const SOURCE_CAP_E = Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 60)
+
+test('EVENT with an operator email allowance every attendee can confirm their email', async () => {
+  const { allowSourceEmail } = await import('../src/confirm-guard.js')
+  const hall = newSource()
+  allowSourceEmail(hall['X-Forwarded-For'].split(',')[0], 40, 'test event', 'operator-test', { hours: 6 })
+  const before = sentMail.length; const rs = []
+  for (let i = 0; i < 25; i++) rs.push(await subscribe(generateKeyPair(), `hall${i}@event-mail.org`, hall))
+  metric('event.email_signup_with_allowance', { ...tally(rs), emails_sent: sentMail.length - before })
+  assert.equal(sentMail.length - before, 25)
+})
+
+test('FAIRNESS a key shows at most 3 cards on a page, and similar cards from different networks are never folded', async () => {
+  const k = generateKeyPair(); const h = newSource()
+  for (let i = 0; i < 5; i++) await publish(makeCard(k, { headline: `Fairness key card ${i} on ${TOPICS[i]}`, event_ref: { event_id: 'fair-1' }, seeking: [{ description: `Partners in ${TOPICS[i]}`, topics: [TOPICS[i]], engagement: 'part_time' }] }, i * 1000), h)
+  const r = await search({ event_ref: 'fair-1' }, newSource(), generateKeyPair().publicKey)
+  assert.equal((r.body.results ?? []).length, 3)
+  assert.equal(r.body.folded_for_fairness, 2)
+  const same = { headline: 'Same wording on two networks', event_ref: { event_id: 'fair-2' } }
+  for (let i = 0; i < 5; i++) await publish(makeCard(generateKeyPair(), same), newSource())
+  const r2 = await search({ event_ref: 'fair-2' }, newSource(), generateKeyPair().publicKey)
+  assert.equal((r2.body.results ?? []).length, 5, 'the same words from five networks are five people')
+})

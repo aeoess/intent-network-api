@@ -7,10 +7,12 @@
 // in a separate vec table so 48h matching never sees v3 rows.
 
 import type { Database } from 'better-sqlite3'
+import { createHash } from 'node:crypto'
 import { getDb, getSchemaMarker, SQL_NOW_ISO, V3_2_MARKER_KEY } from './db.js'
 import type { RevocationStatus, V3Card } from './v3-cards.js'
 import { networkVisibleView } from './v3-cards.js'
 import { recordCardEvent } from './card-events.js'
+import { pageFairness } from './page-fairness.js'
 
 let initialized = false
 
@@ -69,6 +71,16 @@ export function initV3Schema(): void {
 function ensureReceivedAt(db: Database): void {
   const cols = db.prepare('PRAGMA table_info(v3_cards)').all() as { name: string }[]
   if (!cols.some(c => c.name === 'received_at')) db.exec('ALTER TABLE v3_cards ADD COLUMN received_at TEXT')
+  // A salted hash of the publishing client address, server side only and never
+  // returned. Search uses it to fold near identical cards from one source.
+  if (!cols.some(c => c.name === 'source_hash')) db.exec('ALTER TABLE v3_cards ADD COLUMN source_hash TEXT')
+}
+
+const SOURCE_SALT = process.env.MINGLE_SOURCE_SALT ?? 'mingle-source-v1'
+/** The stored form of a publishing address. Loopback (the operator) stores nothing. */
+export function sourceHashOf(ip: string | undefined): string | null {
+  if (!ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return null
+  return createHash('sha256').update(SOURCE_SALT + ':' + ip).digest('hex').slice(0, 32)
 }
 
 /** One stored row per (subject_key, card_hash). The route checks already refuse a
@@ -138,14 +150,14 @@ export interface StoredV3Card {
   moderated: boolean
 }
 
-export function insertV3Card(cardId: string, card: V3Card, cardHash: string): void {
+export function insertV3Card(cardId: string, card: V3Card, cardHash: string, sourceHash: string | null = null): void {
   d().prepare(`
-    INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, event_ref_id, created_at, expires_at, revocation_status, received_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    INSERT INTO v3_cards (card_id, card_type, subject_key, card_hash, card_json, headline, intents_json, event_ref_id, created_at, expires_at, revocation_status, received_at, source_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?)
   `).run(
     cardId, card.card_type, card.subject_key, cardHash, JSON.stringify(card),
     card.headline, JSON.stringify(card.intents), card.event_ref?.event_id ?? null,
-    card.created_at, card.expires_at, card.revocation_status,
+    card.created_at, card.expires_at, card.revocation_status, sourceHash,
   )
 }
 
@@ -257,16 +269,18 @@ function semanticWindow(filters: V3SearchFilters, semanticIds: string[], limit: 
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
   if (createdAfter) { where.push('created_at > ?'); params.push(createdAfter) }
-  const rows = d().prepare(`SELECT card_id, card_json FROM v3_cards WHERE ${where.join(' AND ')}`).all(...params) as any[]
+  const rows = d().prepare(`SELECT card_id, subject_key, source_hash, card_json FROM v3_cards WHERE ${where.join(' AND ')}`).all(...params) as any[]
   const byId = new Map(rows.map(r => [r.card_id as string, r]))
 
   const results: Record<string, unknown>[] = []
+  const fair = pageFairness()
   for (const id of ids) {
     const row = byId.get(id)
     if (!row) continue
     const card = JSON.parse(row.card_json) as V3Card
     card.revocation_status = 'active'
     if (!passesJsFilters(card, filters)) continue
+    if (!fair.admit(row.subject_key, row.source_hash, card)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     if (results.length >= limit) break
   }
@@ -280,13 +294,15 @@ export function searchV3Cards(filters: V3SearchFilters, semanticIds?: string[], 
   const params: unknown[] = []
   if (filters.card_type) { where.push('card_type = ?'); params.push(filters.card_type) }
   if (filters.event_ref) { where.push('event_ref_id = ?'); params.push(filters.event_ref) }
-  const rows = d().prepare(`SELECT card_id, card_json FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 500`).all(...params) as any[]
+  const rows = d().prepare(`SELECT card_id, subject_key, source_hash, card_json FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT 500`).all(...params) as any[]
 
   const results: Record<string, unknown>[] = []
+  const fair = pageFairness()
   for (const row of rows) {
     const card = JSON.parse(row.card_json) as V3Card
     card.revocation_status = 'active'
     if (!passesJsFilters(card, filters)) continue
+    if (!fair.admit(row.subject_key, row.source_hash, card)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     if (results.length >= cap) break
   }
@@ -302,7 +318,7 @@ export interface PageOpts { semanticIds?: string[]; limit?: number; createdAfter
  *  within the scan window). With semanticIds it is one ranked window instead:
  *  distance order, cut at the limit, next_cursor always null. A cursor cannot
  *  be combined with semanticIds. */
-export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}): { results: Record<string, unknown>[]; next_cursor: PageCursor | null } {
+export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}): { results: Record<string, unknown>[]; next_cursor: PageCursor | null; folded?: number } {
   const limit = Math.min(Math.max(1, opts.limit ?? 20), SEARCH_CAP)
   if (opts.semanticIds) {
     if (opts.cursor) throw new Error('a cursor cannot be combined with a semantic search')
@@ -318,20 +334,23 @@ export function searchV3CardsPaged(filters: V3SearchFilters, opts: PageOpts = {}
     params.push(opts.cursor.created_at, opts.cursor.created_at, opts.cursor.card_id)
   }
   const rows = d().prepare(
-    `SELECT card_id, card_json, created_at FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC, card_id DESC LIMIT ?`,
+    `SELECT card_id, subject_key, source_hash, card_json, created_at FROM v3_cards WHERE ${where.join(' AND ')} ORDER BY created_at DESC, card_id DESC LIMIT ?`,
   ).all(...params, MAX_SCAN) as any[]
 
   const results: Record<string, unknown>[] = []
   let last: PageCursor | null = null
+  // Folded cards sit behind the cursor and are not shown again in this run of pages.
+  const fair = pageFairness()
   for (const row of rows) {
     const card = JSON.parse(row.card_json) as V3Card
     card.revocation_status = 'active'
     if (!passesJsFilters(card, filters)) continue
+    if (!fair.admit(row.subject_key, row.source_hash, card)) continue
     results.push(networkVisibleView({ ...card, card_id: row.card_id }))
     last = { created_at: row.created_at, card_id: row.card_id }
     if (results.length >= limit) break
   }
-  return { results, next_cursor: results.length >= limit ? last : null }
+  return { results, next_cursor: results.length >= limit ? last : null, folded: fair.folded }
 }
 
 // ── Expiry sweep with index removal ──────────────────────────────────────
