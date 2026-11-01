@@ -294,19 +294,58 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
 })
 
 // ── GET /api/v3/cards/:cardId - fetch, status always shown ───────────────
+// Unauthenticated, so it returns a server-made projection, never the stored card.
+// A live card shows only its network-visible content (the same view search and
+// the /c page use), plus subject_key, the visibility map and delegation_ref so a
+// client can tell the card is its own and which fields are withheld (not what
+// they say). A card that is no longer live shows its status only. The signed
+// envelope is never returned here: it covers the full card, not this projection,
+// and returning it let anyone republish a card after its owner took it down.
+// The owner reads the full signed card through POST /cards/:cardId/owner-read.
+
+function lineage(cardId: string): { superseded_by: unknown; supersedes: unknown } {
+  return { superseded_by: v3db.getSupersededBy(cardId), supersedes: v3db.getSupersedes(cardId) }
+}
 
 router.get('/cards/:cardId', (req, res) => {
   const cardId = String(req.params.cardId)
   const stored = v3db.getV3Card(cardId)
   if (!stored) { res.status(404).json({ error: 'card not found' }); return }
-  // Surface the supersession chain so a renewed card and its predecessor link.
-  const superseded_by = v3db.getSupersededBy(cardId)
-  const supersedes = v3db.getSupersedes(cardId)
-  // The signed envelope stays on the server. Returning signature and approval let
-  // anyone republish a card after its owner withdrew it (the publish duplicate check
-  // only looks at live cards). Clients reseal from content, so they never needed them.
-  const { signature: _sig, approval: _appr, ...card } = stored.card as unknown as Record<string, unknown>
-  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, card, superseded_by, supersedes })
+  const full = stored.card as unknown as Record<string, any>
+  const live = stored.revocation_status === 'active' && Date.parse(stored.expires_at) > Date.now()
+  const card = live
+    ? { ...networkVisibleView({ ...stored.card, card_id: stored.card_id }), subject_key: full.subject_key, visibility: full.visibility, delegation_ref: full.delegation_ref ?? null }
+    : { card_id: stored.card_id, card_type: full.card_type, revocation_status: stored.revocation_status }
+  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, projection: live ? 'network_visible' : 'status_only', card, ...lineage(cardId) })
+})
+
+// ── POST /api/v3/cards/:cardId/owner-read - the full signed card, owner only ─
+// The subject signs "owner-read:<cardId>:<issued_at>" with issued_at within five
+// minutes of server time, so a captured request stops working within minutes.
+// Returns the stored card with its signature and approval, which is what renew
+// needs to reseal identical content and what the owner needs to verify it.
+
+const OWNER_READ_SKEW_MS = 5 * 60 * 1000
+
+router.post('/cards/:cardId/owner-read', rateLimited('verb', req => String(req.body?.public_key ?? '')), (req, res) => {
+  const cardId = String(req.params.cardId)
+  const { public_key, signature, issued_at } = req.body ?? {}
+  if (typeof public_key !== 'string' || typeof signature !== 'string' || typeof issued_at !== 'string') {
+    res.status(401).json({ error: 'public_key, signature and issued_at required' }); return
+  }
+  const t = Date.parse(issued_at)
+  if (Number.isNaN(t) || Math.abs(Date.now() - t) > OWNER_READ_SKEW_MS) {
+    res.status(401).json({ error: 'issued_at must be an ISO time within 5 minutes of server time' }); return
+  }
+  const stored = v3db.getV3Card(cardId)
+  if (!stored) { res.status(404).json({ error: 'card not found' }); return }
+  if (stored.card.subject_key !== public_key) { res.status(403).json({ error: 'not the card subject' }); return }
+  try {
+    if (!verify(`owner-read:${cardId}:${issued_at}`, signature, public_key)) { res.status(403).json({ error: 'owner-read signature does not verify' }); return }
+  } catch (e: any) {
+    res.status(403).json({ error: `owner-read signature verification failed: ${e.message}` }); return
+  }
+  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, projection: 'owner_full', card: stored.card, ...lineage(cardId) })
 })
 
 // ── POST /api/v3/cards/search - explicit fields + semantic, filtered ─────
