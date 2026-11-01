@@ -121,7 +121,7 @@ test('two cards of the same key never match each other, a different key still ma
 })
 
 test('one source cannot publish past the per-source limit by rotating keys, and loopback is exempt', async () => {
-  const limit = Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 10)
+  const limit = Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 60)
   // Production shape: client address, then the CDN edge appends its own.
   const src = { 'X-Forwarded-For': '203.0.113.77, 84.17.44.229' }
   for (let i = 0; i < limit; i++) {

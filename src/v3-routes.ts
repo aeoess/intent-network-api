@@ -25,7 +25,10 @@ import type { CardEvent } from './card-events.js'
 
 const router = Router()
 
-const LIMITS = { publish: 10, publish_source: Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 10), search: 30, verb: 30, renew: 10, replace: 10, sweep: 6 }
+const LIMITS = { publish: 10, // Per client address, across keys. Sized to stop floods, not offices or event walls:
+  // a venue network with dozens of attendees is normal Mingle use. Slow key rotation
+  // under this cap is handled by operator moderation and source restriction instead.
+  publish_source: Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 60), search: 30, verb: 30, renew: 10, replace: 10, sweep: 6 }
 
 /** Loopback is the operator and the test suite, never a proxied client. */
 function isLoopback(ip: string | undefined): boolean {
