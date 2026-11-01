@@ -236,6 +236,23 @@ test('ABUSE one key makes Mingle email addresses it chooses', async () => {
   assert.deepEqual(statuses(rs).slice(0, 2), [429, 429], 'reserved test domains refused')
 })
 
+test('ABUSE rotated keys from one source each name a different address', async () => {
+  const h = newSource(); const before = sentMail.length; const rs = []
+  for (let i = 0; i < 20; i++) {
+    // Spread over a day, so the hourly request limit is not what stops it.
+    db.getDb().prepare("DELETE FROM rate_limits WHERE public_key LIKE 'notif:%'").run()
+    rs.push(await subscribe(generateKeyPair(), `rotated${i}@harness-mail.org`, h))
+  }
+  const sentNow = sentMail.length - before
+  assert.ok(sentNow <= Number(process.env.MINGLE_CONFIRMS_PER_SOURCE_PER_DAY ?? 10), `emails sent: ${sentNow}`)
+})
+
+test('LEGIT three people on one venue network each confirm their own email', async () => {
+  const h = newSource(); const before = sentMail.length
+  for (let i = 0; i < 3; i++) assert.equal((await subscribe(generateKeyPair(), `attendee${i}@harness-mail.org`, h)).status, 201)
+  assert.equal(sentMail.length - before, 3)
+})
+
 test('ABUSE withdraw, replace and respond on guessed ids change nothing', async () => {
   const h = newSource(); const k = generateKeyPair()
   const ids = ['card_gridstora_261013_5089', 'v3-connection-4c81de02', 'card_nonexistent_zzz']

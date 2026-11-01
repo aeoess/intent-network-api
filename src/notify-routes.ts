@@ -12,7 +12,7 @@ import { checkRateLimit } from './db.js'
 import * as notifyDb from './notify-db.js'
 import * as email from './notifications.js'
 import { unlessRestricted } from './source-blocks.js'
-import { confirmRefusal, recordConfirm } from './confirm-guard.js'
+import { reserveConfirm, releaseConfirm, hourlyBudgetUsed } from './confirm-guard.js'
 import * as v3db from './v3-db.js'
 
 const router = Router()
@@ -53,14 +53,21 @@ router.post('/subscribe', unlessRestricted('subscribe'), rateLimited('notif_subs
   const before = notifyDb.getSubscription(subject_key)
   const sameAddress = before?.email === addr
   const willSend = !(before?.verified && sameAddress)
-  // A pref update on the same, still unconfirmed address that already got its
-  // confirmations today is saved without another email, and keeps the token the
-  // earlier email carries so that link still works. Only a new address is refused.
+  // The email guard reserves the confirmation before anything is stored or sent
+  // (see confirm-guard.ts). A hold is the same key asking again for its own pending
+  // address: prefs are saved, no email goes out, and the token the earlier email
+  // carries stays valid. Every other refusal stores nothing.
   let holdSend = false
+  let reservation: number | null = null
   if (willSend) {
-    const refusal = confirmRefusal(subject_key, addr)
-    if (refusal && sameAddress && refusal.startsWith('a confirmation was already sent')) holdSend = true
-    else if (refusal) { res.status(429).json({ error: refusal }); return }
+    const decision = reserveConfirm(subject_key, addr, req.ip)
+    const refused = decision as { ok: boolean; hold?: boolean; reason?: string; id?: number }
+    if (refused.ok) reservation = refused.id ?? null
+    else if (refused.hold && sameAddress) holdSend = true
+    else {
+      if (hourlyBudgetUsed()) email.notifyAdmin('Mingle: confirmation email budget reached', 'The hourly budget for confirmation emails is used up. Sign-ups are refused until it frees. Check the Resend log for bounces.').catch(() => {})
+      res.status(429).json({ error: refused.hold ? 'a confirmation for this address was sent recently; use the link in that email' : refused.reason }); return
+    }
   }
   // Merge, never reset. A pref the request names is set. A pref it omits keeps
   // what is stored, or the new-subscription default when nothing is stored yet.
@@ -79,7 +86,7 @@ router.post('/subscribe', unlessRestricted('subscribe'), rateLimited('notif_subs
   // only email an unverified address receives.
   const verified = notifyDb.getSubscription(subject_key)?.verified ?? false
   const sent = verified || holdSend ? { sent: false } : await email.sendConfirmation(addr, verifyToken, unsubToken)
-  if (sent.sent) recordConfirm(subject_key, addr, req.ip)
+  if (reservation !== null && !sent.sent) releaseConfirm(reservation)
   res.status(201).json({ subscribed: true, verified, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
 })
 
