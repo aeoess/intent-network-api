@@ -178,6 +178,9 @@ test('COORDINATED one source spreads near identical cards across 20 keys into th
   const fromThem = touching.filter(m => theirs.has(m.card_a) || theirs.has(m.card_b)).length
   metric('coord.matches_touching_real_cards', { before: realMatchesBefore, after: touching.length, with_coordinated_card: fromThem })
   metric('coord.matching_runs', ev('matching_started') - runsBefore)
+  assert.ok(fromThem <= 6 * 25, `near identical repeats do not match: ${fromThem} matches with coordinated cards`)
+  assert.ok(ev('matching_started') - runsBefore <= 10, 'repeats skip the matching run')
+  assert.equal(touching.length - fromThem, realMatchesBefore, 'the real attendees still match each other exactly as before')
   const sameKey = (db.getDb().prepare('SELECT COUNT(*) n FROM v3_matches x JOIN v3_cards a ON a.card_id=x.card_a JOIN v3_cards b ON b.card_id=x.card_b WHERE a.subject_key = b.subject_key').get() as any).n
   assert.equal(sameKey, 0, 'no key matches its own cards')
   metric('coord.match_emails_sent', sentMail.filter(e => /new match/i.test((e as any).subject ?? '')).length)

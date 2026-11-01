@@ -22,8 +22,8 @@ export const PAGE_PER_KEY = 3
 export const SIMILAR = 0.9
 export const NEAR_DUPLICATES_PER_PAGE = 3
 
-const words = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 3))
-function overlap(a: Set<string>, b: Set<string>): number {
+export const words = (t: string) => new Set(t.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 3))
+export function overlap(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0
   let both = 0
   for (const w of a) if (b.has(w)) both++

@@ -12,7 +12,8 @@ import { getDb, getSchemaMarker, SQL_NOW_ISO, V3_2_MARKER_KEY } from './db.js'
 import type { RevocationStatus, V3Card } from './v3-cards.js'
 import { networkVisibleView } from './v3-cards.js'
 import { recordCardEvent } from './card-events.js'
-import { pageFairness } from './page-fairness.js'
+import { pageFairness, words, overlap, SIMILAR, NEAR_DUPLICATES_PER_PAGE } from './page-fairness.js'
+import { networkVisibleText } from './v3-cards.js'
 
 let initialized = false
 
@@ -106,6 +107,53 @@ function d(): Database {
  *  itself nor its subject key. Every network-facing read (search, the event wall,
  *  matching, counts) adds it. Queries using it must name the table v3_cards. */
 const NOT_HIDDEN = `NOT EXISTS (SELECT 1 FROM v3_moderation m WHERE (m.target_type = 'card' AND m.target = v3_cards.card_id) OR (m.target_type = 'subject' AND m.target = v3_cards.subject_key))`
+
+/** True when this card repeats, in nearly the same words, at least
+ *  NEAR_DUPLICATES_PER_PAGE earlier live cards from the same publishing source. Matching
+ *  skips such a card: on 2026-11-01 a test showed 60 near identical cards from one source
+ *  creating 1,500 matches against real cards. "Earlier" (created_at, then card_id) keeps
+ *  the hourly recompute deterministic, so the first copies match like any card and the
+ *  repeats never do. A card with no stored source is never a repeat. */
+export function isNearDuplicateRepeat(cardId: string): boolean {
+  const me = d().prepare('SELECT card_id, source_hash, created_at, card_json FROM v3_cards WHERE card_id = ?').get(cardId) as any
+  if (!me?.source_hash) return false
+  const mine = words(networkVisibleText(JSON.parse(me.card_json) as V3Card))
+  const earlier = d().prepare(
+    `SELECT card_json FROM v3_cards WHERE source_hash = ? AND card_id != ? AND revocation_status = 'active' AND expires_at > ${SQL_NOW_ISO}
+       AND (created_at < ? OR (created_at = ? AND card_id < ?)) ORDER BY created_at DESC LIMIT 200`,
+  ).all(me.source_hash, cardId, me.created_at, me.created_at, cardId) as any[]
+  let similar = 0
+  for (const r of earlier) {
+    if (overlap(words(networkVisibleText(JSON.parse(r.card_json) as V3Card)), mine) >= SIMILAR && ++similar >= NEAR_DUPLICATES_PER_PAGE) return true
+  }
+  return false
+}
+
+/** Every live card that is a near duplicate repeat, by the rule above, computed per
+ *  source group in one pass and cached for 10 seconds, so the hourly recompute of all
+ *  cards does not redo the comparison for every candidate. */
+let repeatCache: { at: number; ids: Set<string> } | null = null
+export function nearDuplicateRepeatIds(nowMs = Date.now()): Set<string> {
+  if (repeatCache && nowMs - repeatCache.at < 10_000) return repeatCache.ids
+  const rows = d().prepare(
+    `SELECT card_id, source_hash, created_at, card_json FROM v3_cards WHERE source_hash IS NOT NULL AND revocation_status = 'active' AND expires_at > ${SQL_NOW_ISO}
+       ORDER BY source_hash, created_at, card_id`,
+  ).all() as any[]
+  const ids = new Set<string>()
+  let group: { id: string; w: Set<string> }[] = []
+  let src: string | null = null
+  for (const r of rows) {
+    if (r.source_hash !== src) { group = []; src = r.source_hash }
+    const w = words(networkVisibleText(JSON.parse(r.card_json) as V3Card))
+    let similar = 0
+    for (const g of group) if (overlap(g.w, w) >= SIMILAR && ++similar >= NEAR_DUPLICATES_PER_PAGE) break
+    if (similar >= NEAR_DUPLICATES_PER_PAGE) ids.add(r.card_id)
+    group.push({ id: r.card_id, w })
+  }
+  repeatCache = { at: nowMs, ids }
+  return ids
+}
+export function clearNearDuplicateCache(): void { repeatCache = null }
 
 /** True when the operator hid this card or its subject key. */
 export function isHidden(cardId: string, subjectKey: string): boolean {

@@ -130,6 +130,8 @@ export function recomputeMatchesForCard(cardId: string): number {
 export interface RecomputeResult {
   live: number
   created: { other_card_id: string; overlap_count: number; cosine: number | null }[]
+  /** Set when matching did not run for this card, and why. */
+  skipped?: 'near_duplicate'
 }
 
 export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult {
@@ -138,8 +140,13 @@ export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult
     deleteMatchRowsForCard(cardId)
     return { live: 0, created: [] }
   }
+  if (v3db.isNearDuplicateRepeat(cardId)) {
+    deleteMatchRowsForCard(cardId)
+    return { live: 0, created: [], skipped: 'near_duplicate' }
+  }
   const myVec = getMatchVector(cardId)
   const candidates = v3db.listActiveCardsForMatching(500)
+  const repeats = v3db.nearDuplicateRepeatIds()
   recordCardEvent('matching_started', cardId, stored.card.subject_key, { candidate_count: candidates.length })
   const created: RecomputeResult['created'] = []
   let n = 0
@@ -147,6 +154,8 @@ export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult
     if (cand.card_id === cardId) continue
     // Two cards signed by one key are one participant. Matching them only creates noise.
     if (cand.card.subject_key === stored.card.subject_key) continue
+    // A near duplicate repeat from one source is not matched from either side.
+    if (repeats.has(cand.card_id)) { deletePair(cardId, cand.card_id); continue }
     const cos = myVec ? cosOf(myVec, getMatchVector(cand.card_id)) : null
     const [aId] = order(cardId, cand.card_id)
     const aCard = aId === cardId ? stored.card : cand.card
