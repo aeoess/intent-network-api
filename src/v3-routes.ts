@@ -138,6 +138,11 @@ function verifyCardCrypto(card: Record<string, any>): { ok: true } | { ok: false
 
 // ── POST /api/v3/cards - publish (signature + hash binding) ──────────────
 
+/** The refusal for signed content that was already taken down. */
+function retiredRefusal(res: any, standing: { card_id: string; revocation_status: string }): void {
+  res.status(409).json({ error: `this exact card was already taken down (${standing.revocation_status}) and cannot be published again; publish a new card instead`, card_id: standing.card_id })
+}
+
 function sourceLimited(action: keyof typeof LIMITS) {
   return (req: any, res: any, next: any) => {
     if (isLoopback(req.ip)) { next(); return }
@@ -161,19 +166,26 @@ router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', re
   // Idempotency: byte-identical content already live for this subject returns
   // that card, not a duplicate. (The content hash covers timestamps too, so an
   // identical hash means a genuinely identical card.)
-  const retired = v3db.findRetiredCardByHash(card.subject_key, card.approval.card_hash)
-  if (retired) {
-    res.status(409).json({ error: `this exact card was already taken down (${retired.revocation_status}) and cannot be published again; publish a new card instead`, card_id: retired.card_id })
-    return
+  // A retired hash is refused: replaying it would undo the owner's takedown.
+  const answerExisting = (): boolean => {
+    const standing = v3db.cardHashStanding(card.subject_key, card.approval.card_hash)
+    if (standing.kind === 'retired') { retiredRefusal(res, standing); return true }
+    if (standing.kind === 'active') {
+      res.status(200).json({ published: true, idempotent: true, card_id: standing.card_id, card_hash: card.approval.card_hash, expires_at: standing.expires_at, revocation_status: standing.revocation_status })
+      return true
+    }
+    return false
   }
-  const dup = v3db.findActiveCardByHash(card.subject_key, card.approval.card_hash)
-  if (dup) {
-    res.status(200).json({ published: true, idempotent: true, card_id: dup.card_id, card_hash: card.approval.card_hash, expires_at: dup.expires_at, revocation_status: dup.revocation_status })
-    return
-  }
+  if (answerExisting()) return
 
   const cardId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
-  v3db.insertV3Card(cardId, card, card.approval.card_hash)
+  try {
+    v3db.insertV3Card(cardId, card, card.approval.card_hash)
+  } catch (e) {
+    // A concurrent writer stored this exact card between the check and the insert.
+    if (v3db.isCardHashConflict(e) && answerExisting()) return
+    throw e
+  }
   recordCardEvent('card_published', cardId, card.subject_key, { card_type: card.card_type, expires_at: card.expires_at, card_hash: card.approval.card_hash })
   await finalizePublish(cardId, card)
 
@@ -202,9 +214,21 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
   if (!sameContentExceptTimestamps(old.card, card)) {
     res.status(400).json({ error: 'renew requires identical content. Use compose and replace to change a card.' }); return
   }
+  // The renewed card must be new signed content. An earlier signed version (for
+  // example the one this card already superseded) cannot come back as the renewal.
+  const renewStanding = v3db.cardHashStanding(card.subject_key, card.approval.card_hash)
+  if (renewStanding.kind === 'retired') { retiredRefusal(res, renewStanding); return }
+  if (renewStanding.kind === 'active') {
+    res.status(409).json({ error: 'this exact card is already live, so it cannot be the renewal; sign it with new timestamps', card_id: renewStanding.card_id }); return
+  }
 
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
-  v3db.insertV3Card(newId, card, card.approval.card_hash)
+  try {
+    v3db.insertV3Card(newId, card, card.approval.card_hash)
+  } catch (e) {
+    if (v3db.isCardHashConflict(e)) { res.status(409).json({ error: 'this exact card was stored by a concurrent request' }); return }
+    throw e
+  }
   // Recorded against both ids so either end of the chain finds the renewal.
   recordCardEvent('card_renewed', newId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
   recordCardEvent('card_renewed', oldId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
@@ -241,7 +265,9 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
   if (!old) { res.status(404).json({ error: 'card to replace not found' }); return }
   if (old.card.subject_key !== card.subject_key) { res.status(403).json({ error: 'not the card subject' }); return }
   if (old.revocation_status !== 'active') { res.status(409).json({ error: `only an active card can be replaced (this one is ${old.revocation_status})` }); return }
-  if (v3db.findActiveCardByHash(card.subject_key, card.approval.card_hash)) {
+  const replaceStanding = v3db.cardHashStanding(card.subject_key, card.approval.card_hash)
+  if (replaceStanding.kind === 'retired') { retiredRefusal(res, replaceStanding); return }
+  if (replaceStanding.kind === 'active') {
     res.status(409).json({ error: 'this exact card is already live, so it cannot be the replacement' }); return
   }
 
@@ -255,6 +281,7 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
       v3db.recordSupersession(oldId, newId)
     })()
   } catch (e) {
+    if (v3db.isCardHashConflict(e)) { res.status(409).json({ error: 'this exact card was stored by a concurrent request, nothing changed' }); return }
     console.error('[v3] replace rolled back:', (e as Error).message)
     res.status(500).json({ error: 'replace failed and nothing changed' }); return
   }

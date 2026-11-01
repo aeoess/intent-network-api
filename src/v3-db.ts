@@ -44,7 +44,22 @@ export function initV3Schema(): void {
       card_id TEXT NOT NULL
     );
   `)
+  ensureCardHashUnique(d)
   initialized = true
+}
+
+/** One stored row per (subject_key, card_hash). The route checks already refuse a
+ *  repeat, and the index makes the database refuse it too, so a second process
+ *  or a future async gap between check and insert cannot store the same signed
+ *  card twice. If old duplicate rows exist the index cannot be built, so this
+ *  logs and leaves the route checks as the only guard rather than failing boot. */
+function ensureCardHashUnique(db: Database): void {
+  const dup = db.prepare('SELECT 1 FROM v3_cards GROUP BY subject_key, card_hash HAVING COUNT(*) > 1 LIMIT 1').get()
+  if (dup) {
+    console.warn('[v3] duplicate (subject_key, card_hash) rows exist, unique index not created')
+    return
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_v3_cards_subject_hash ON v3_cards(subject_key, card_hash)')
 }
 
 function d(): Database {
@@ -307,14 +322,32 @@ export function findActiveCardByHash(subjectKey: string, cardHash: string): { ca
   return row ?? null
 }
 
-/** Any earlier card of this subject with this exact content hash that is no longer
- *  live (withdrawn, deleted, superseded, revoked, stopped, expired). Publishing that
- *  exact signed card again would undo the owner's own takedown. */
-export function findRetiredCardByHash(subjectKey: string, cardHash: string): { card_id: string; revocation_status: string } | null {
+/** Where this exact signed content stands for this subject, across every stored
+ *  status. 'active' is a live card with this hash (an idempotent retry). 'retired'
+ *  is any earlier card with this hash that is no longer live (withdrawn, deleted,
+ *  superseded, revoked, stopped, expired, or past expiry and not yet swept).
+ *  Publishing, renewing to, or replacing with that exact signed card again would
+ *  undo the owner's own takedown, so every write path refuses 'retired'. */
+export type HashStanding =
+  | { kind: 'none' }
+  | { kind: 'active'; card_id: string; expires_at: string; revocation_status: string }
+  | { kind: 'retired'; card_id: string; revocation_status: string }
+
+export function cardHashStanding(subjectKey: string, cardHash: string): HashStanding {
   const row = d().prepare(
-    `SELECT card_id, revocation_status FROM v3_cards WHERE subject_key = ? AND card_hash = ? AND revocation_status != 'active' ORDER BY created_at DESC LIMIT 1`,
+    `SELECT card_id, expires_at, revocation_status, (expires_at > ${SQL_NOW_ISO}) AS live FROM v3_cards WHERE subject_key = ? AND card_hash = ? ORDER BY created_at DESC LIMIT 1`,
   ).get(subjectKey, cardHash) as any
-  return row ?? null
+  if (!row) return { kind: 'none' }
+  if (row.revocation_status === 'active' && row.live) {
+    return { kind: 'active', card_id: row.card_id, expires_at: row.expires_at, revocation_status: row.revocation_status }
+  }
+  return { kind: 'retired', card_id: row.card_id, revocation_status: row.revocation_status === 'active' ? 'expired' : row.revocation_status }
+}
+
+/** True when an insert failed on the (subject_key, card_hash) unique index, so a
+ *  concurrent writer stored the same signed content first. */
+export function isCardHashConflict(e: unknown): boolean {
+  return (e as { code?: string })?.code === 'SQLITE_CONSTRAINT_UNIQUE'
 }
 
 /** The card's stored content (for renew's identical-content check). */
