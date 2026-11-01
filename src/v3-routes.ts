@@ -16,6 +16,7 @@ import * as v3db from './v3-db.js'
 import * as matchesDb from './matches-db.js'
 import * as email from './notifications.js'
 import { adminAlerts } from './admin-alerts.js'
+import { unlessRestricted } from './source-blocks.js'
 import { embed } from './embeddings.js'
 import { networkVisibleText, networkVisibleView } from './v3-cards.js'
 import { checkRateLimit, getDb } from './db.js'
@@ -163,7 +164,7 @@ function sourceLimited(action: keyof typeof LIMITS) {
   }
 }
 
-router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
+router.post('/cards', unlessRestricted('publish'), sourceLimited('publish_source'), rateLimited('publish', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
   const card = req.body?.card
   const validation = validateV3Card(card)
   if ('error' in validation) { res.status(400).json({ error: validation.error }); return }
@@ -219,7 +220,7 @@ router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', re
 // and signs it, exactly like publishing. Renew verifies it is the same subject
 // and the same content, publishes the fresh card, and supersedes the old one.
 
-router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
+router.post('/cards/:cardId/renew', unlessRestricted('publish'), rateLimited('renew', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
   const oldId = String(req.params.cardId)
   const card = req.body?.card
   const validation = validateV3Card(card)
@@ -285,7 +286,7 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
 // they were. Embedding, matching and email run after the commit, in
 // finalizePublish, which is async and stays outside the transaction.
 
-router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
+router.post('/cards/:cardId/replace', unlessRestricted('publish'), rateLimited('replace', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
   const oldId = String(req.params.cardId)
   const card = req.body?.card
   const validation = validateV3Card(card)

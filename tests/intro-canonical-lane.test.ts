@@ -896,3 +896,26 @@ test('GATE: the two refusals share a body and a status, and differ only in the r
   assert.equal(gate.LEGACY_REFUSAL.code, 'client_upgrade_required')
   assert.equal(gate.LEGACY_REFUSAL.error, 'Update Mingle to continue this connection.')
 })
+
+test('CANONICAL REQUEST: an intro between two cards of the same key is refused and writes nothing', async () => {
+  const a = makeCard('same key A ' + randomBytes(3).toString('hex'))
+  const b = makeCard('same key B ' + randomBytes(3).toString('hex'))
+  // Re-sign b under a's key, so both cards belong to one principal.
+  b.keys = a.keys
+  b.card.subject_key = a.keys.publicKey
+  delete b.card.signature; delete b.card.approval
+  const h = cardContentHash(b.card)
+  b.card.approval = { card_hash: h, approved_at: new Date().toISOString(), principal_signature: sign(h, a.keys.privateKey) }
+  const { signature: _s, ...unsigned } = b.card
+  b.card.signature = sign(canonicalize(unsigned), a.keys.privateKey)
+  const p: Pair = { from: a, to: b, fromCard: await publish(a), toCard: await publish(b) }
+  const before = (db.getDb().prepare('SELECT COUNT(*) n FROM v3_intros').get() as any).n
+  const r = await canonicalRequest(p)
+  assert.equal(r.status, 400, JSON.stringify(r.json))
+  assert.equal(r.json.code, 'same_key')
+  assert.equal((db.getDb().prepare('SELECT COUNT(*) n FROM v3_intros').get() as any).n, before, 'no intro row')
+  // Control: the same requester to a card of another key goes through on this lane.
+  const other = makeCard('same key control ' + randomBytes(3).toString('hex'))
+  const ok = await canonicalRequest({ from: a, to: other, fromCard: p.fromCard, toCard: await publish(other) })
+  assert.ok(ok.status === 200 || ok.status === 201, JSON.stringify(ok.json))
+})

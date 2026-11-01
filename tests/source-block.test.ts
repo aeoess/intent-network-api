@@ -1,6 +1,8 @@
-// Address block and same-key intros: a blocked address cannot publish, search or
-// request intros but can still GET, other addresses are unaffected, and an intro
-// between two cards of one key is refused. Synthetic keys and data only.
+// Scoped, temporary address restriction and same-key intros. A restricted address
+// cannot publish, renew, replace, request intros or sign up for email, but can still
+// search, fetch, withdraw and delete. Spoofed forwarding headers change nothing, the
+// restriction expires on its own, and an intro between two cards of one key is
+// refused. Synthetic keys and data only.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -65,7 +67,11 @@ function seal(card: Record<string, any>, keys: Keys): Record<string, any> {
 
 
 
-const BAD = { 'X-Forwarded-For': '203.0.113.9, 84.17.44.229' }
+// Production shape: [anything the client sent], client address, edge address.
+const REAL = '203.0.113.9'
+const AS_REAL = { 'X-Forwarded-For': `${REAL}, 84.17.44.229` }
+const SPOOF_AWAY = { 'X-Forwarded-For': `6.6.6.6, ${REAL}, 84.17.44.229` }
+const FRAME_OTHER = { 'X-Forwarded-For': `${REAL}, 198.51.100.20, 84.17.44.229` }
 const OTHER = { 'X-Forwarded-For': '198.51.100.20, 84.17.44.229' }
 async function req(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
   const r = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', ...headers }, body: body === undefined ? undefined : JSON.stringify(body) })
@@ -77,32 +83,60 @@ const intro = (keys: Keys, from: string, to: string, headers: Record<string, str
   return req('POST', '/api/v3/intros/request', { from_card: from, to_card: to, purpose: 'collaborate', note: 'hi', public_key: keys.publicKey, nonce,
     signature: sign(`intro-request:${from}:${to}:collaborate:${nonce}`, keys.privateKey) }, headers)
 }
+const subscribe = (keys: Keys, email: string, headers: Record<string, string> = {}) => {
+  const nonce = `s-${Math.random().toString(16).slice(2)}`
+  return req('POST', '/api/v3/notifications/subscribe', { subject_key: keys.publicKey, email, nonce, signature: sign(`${email}:${nonce}`, keys.privateKey) }, headers)
+}
+const verb = (keys: Keys, id: string, name: string, headers: Record<string, string> = {}) =>
+  req('POST', `/api/v3/cards/${id}/${name}`, { public_key: keys.publicKey, signature: sign(`${name}:${id}`, keys.privateKey) }, headers)
 
-test('a blocked address cannot write or search, can still GET, and other addresses are unaffected', async () => {
+test('a restricted address cannot add to the network, and can still search, fetch, withdraw and delete', async () => {
   const k = generateKeyPair()
-  const before = await req('POST', '/api/v3/cards', { card: makeCard(k, { headline: 'Block control before' }) }, BAD)
-  assert.equal(before.status, 201, 'control: the address can publish before the block')
-  assert.equal(blocks.blockSource('203.0.113.9', 'probe source', 'operator-test'), true)
-  const pub = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Block after' }) }, BAD)
+  const mine = await req('POST', '/api/v3/cards', { card: makeCard(k, { headline: 'Restriction owner card' }) }, AS_REAL)
+  const other = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Restriction other card' }) }, OTHER)
+  assert.deepEqual([mine.status, other.status], [201, 201], 'control: both publish before the restriction')
+  blocks.restrictSource(REAL, 'probe source', 'operator-test')
+
+  const pub = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Restriction new card' }) }, AS_REAL)
   assert.equal(pub.status, 403, pub.text)
-  assert.match(pub.body.error, /blocked by the operator/)
-  assert.equal((await req('POST', '/api/v3/cards/search', { limit: 5 }, BAD)).status, 403, 'search is a POST and is blocked too')
-  const other = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Other address' }) }, OTHER)
-  assert.equal(other.status, 201, 'another client behind the same edge is unaffected')
-  assert.equal((await intro(k, before.body.card_id, other.body.card_id, BAD)).status, 403, 'intro requests are writes')
-  assert.equal((await req('GET', `/api/v3/cards/${before.body.card_id}`, undefined, BAD)).status, 200, 'GET stays open')
-  assert.equal((await req('GET', '/health', undefined, BAD)).status, 200)
-  assert.equal(blocks.unblockSource('203.0.113.9'), true)
-  assert.equal((await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Block lifted' }) }, BAD)).status, 201)
+  assert.match(pub.body.error, /paused by the operator until .*withdrawing or deleting your own cards still works/)
+  assert.equal((await req('POST', `/api/v3/cards/${mine.body.card_id}/renew`, { card: makeCard(k, { headline: 'Restriction owner card' }, 1000) }, AS_REAL)).status, 403)
+  assert.equal((await req('POST', `/api/v3/cards/${mine.body.card_id}/replace`, { card: makeCard(k, { headline: 'Restriction replaced' }, 2000) }, AS_REAL)).status, 403)
+  assert.equal((await intro(k, mine.body.card_id, other.body.card_id, AS_REAL)).status, 403)
+  assert.equal((await subscribe(k, 'restricted@aeoess-test.org', AS_REAL)).status, 403)
+
+  assert.equal((await req('POST', '/api/v3/cards/search', { limit: 5 }, AS_REAL)).status, 200, 'search stays open')
+  assert.equal((await req('GET', `/api/v3/cards/${mine.body.card_id}`, undefined, AS_REAL)).status, 200, 'fetch stays open')
+  assert.equal((await verb(k, mine.body.card_id, 'withdraw', AS_REAL)).status, 200, 'the owner can still take the card down')
+  assert.equal((await verb(k, mine.body.card_id, 'delete-server-copy', AS_REAL)).status, 200, 'and delete it')
+  blocks.liftRestriction(REAL)
 })
 
-test('blocking needs an address, a reason and an actor, and blocking twice is a no-op', () => {
-  assert.throws(() => blocks.blockSource('', 'r', 'a'))
-  assert.throws(() => blocks.blockSource('203.0.113.50', ' ', 'a'))
-  assert.equal(blocks.blockSource('203.0.113.50', 'r', 'a'), true)
-  assert.equal(blocks.blockSource('203.0.113.50', 'r', 'a'), false)
-  assert.ok(blocks.listBlockedSources().some(b => b.ip === '203.0.113.50'))
-  blocks.unblockSource('203.0.113.50')
+test('forwarding headers a client adds can neither escape a restriction nor put one on someone else', async () => {
+  blocks.restrictSource(REAL, 'probe source', 'operator-test')
+  const escape = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Spoof escape' }) }, SPOOF_AWAY)
+  assert.equal(escape.status, 403, 'a fake leading address does not hide the real one')
+  const framed = await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Spoof frame' }) }, FRAME_OTHER)
+  assert.equal(framed.status, 201, 'naming the restricted address in a header does not restrict the real client')
+  blocks.liftRestriction(REAL)
+})
+
+test('a restriction expires on its own, can be narrowed to one scope, and needs a reason and an actor', async () => {
+  const past = Date.now() - 25 * 3600 * 1000
+  blocks.restrictSource(REAL, 'old', 'operator-test', { nowMs: past })
+  assert.equal(blocks.isRestricted(REAL, 'publish'), false, 'a 24 hour restriction set 25 hours ago no longer applies')
+  assert.equal((await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'After expiry' }) }, AS_REAL)).status, 201)
+
+  blocks.restrictSource(REAL, 'subscribe only', 'operator-test', { scopes: ['subscribe'], hours: 1 })
+  assert.equal(blocks.isRestricted(REAL, 'subscribe'), true)
+  assert.equal(blocks.isRestricted(REAL, 'publish'), false)
+  assert.equal((await req('POST', '/api/v3/cards', { card: makeCard(generateKeyPair(), { headline: 'Scope publish open' }) }, AS_REAL)).status, 201)
+  blocks.liftRestriction(REAL)
+
+  assert.throws(() => blocks.restrictSource('', 'r', 'a'))
+  assert.throws(() => blocks.restrictSource(REAL, ' ', 'a'))
+  assert.throws(() => blocks.restrictSource(REAL, 'r', 'a', { hours: 0 }))
+  assert.throws(() => blocks.restrictSource(REAL, 'r', 'a', { scopes: ['search' as any] }))
 })
 
 test('an intro between two cards of the same key is refused, to another key it goes through', async () => {

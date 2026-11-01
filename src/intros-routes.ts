@@ -48,6 +48,7 @@ import {
 import { writeArtifact } from './private-artifacts.js'
 import { factsForWrite, guardState, requireParty } from './intro-guards.js'
 import { checkLegacyWrite, checkLegacyCreate, refuseLegacy } from './legacy-write-gate.js'
+import { unlessRestricted } from './source-blocks.js'
 
 const router = Router()
 const MAX_NOTE = 200
@@ -223,7 +224,7 @@ const canonicalRequestIntro = canonicalWriteRoute({
 // next(), so mounting it before the limiter meant the legacy lane paid a 20 per IP cap and the
 // canonical lane paid nothing. The asymmetry favoured the newer lane, which is the wrong way
 // round for a surface that is about to become the only one.
-router.post('/request', rateLimited('intro_request', 20), canonicalDispatch(canonicalRequestIntro), asyncRoute(async (req, res) => {
+router.post('/request', unlessRestricted('intro_request'), rateLimited('intro_request', 20), canonicalDispatch(canonicalRequestIntro), asyncRoute(async (req, res) => {
   const { from_card, to_card, purpose, note, public_key, nonce, signature } = req.body ?? {}
   if (typeof from_card !== 'string' || typeof to_card !== 'string' || typeof nonce !== 'string') {
     res.status(400).json({ error: 'from_card, to_card, nonce required' }); return

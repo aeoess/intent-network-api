@@ -11,6 +11,9 @@ import { verify } from 'agent-passport-system'
 import { checkRateLimit } from './db.js'
 import * as notifyDb from './notify-db.js'
 import * as email from './notifications.js'
+import { unlessRestricted } from './source-blocks.js'
+import { confirmRefusal, recordConfirm } from './confirm-guard.js'
+import * as v3db from './v3-db.js'
 
 const router = Router()
 
@@ -32,7 +35,7 @@ function rateLimited(action: string, limit: number) {
 // ── POST /subscribe {subject_key, email, nonce, signature, prefs?} ────────
 // signature is over `${email}:${nonce}` by subject_key.
 
-router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) => {
+router.post('/subscribe', unlessRestricted('subscribe'), rateLimited('notif_subscribe', 10), async (req, res) => {
   const { subject_key, email: addr, nonce, signature, prefs } = req.body ?? {}
   if (typeof subject_key !== 'string' || typeof addr !== 'string' || typeof nonce !== 'string' || typeof signature !== 'string') {
     res.status(400).json({ error: 'subject_key, email, nonce, signature required' }); return
@@ -43,6 +46,22 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
   } catch (e: any) {
     res.status(403).json({ error: `signature verification failed: ${e.message}` }); return
   }
+  // A key the operator hid from the network does not get mail sent on its behalf.
+  if (v3db.isSubjectHidden(subject_key)) { res.status(403).json({ error: 'this key is hidden from the network by the operator' }); return }
+  // A new or changed address gets a confirmation email, so it passes the email guard
+  // first. An unchanged, already confirmed address sends nothing and is not checked.
+  const before = notifyDb.getSubscription(subject_key)
+  const sameAddress = before?.email === addr
+  const willSend = !(before?.verified && sameAddress)
+  // A pref update on the same, still unconfirmed address that already got its
+  // confirmations today is saved without another email, and keeps the token the
+  // earlier email carries so that link still works. Only a new address is refused.
+  let holdSend = false
+  if (willSend) {
+    const refusal = confirmRefusal(subject_key, addr)
+    if (refusal && sameAddress && refusal.startsWith('a confirmation was already sent')) holdSend = true
+    else if (refusal) { res.status(429).json({ error: refusal }); return }
+  }
   // Merge, never reset. A pref the request names is set. A pref it omits keeps
   // what is stored, or the new-subscription default when nothing is stored yet.
   // upsertSubscription writes the whole object, so the merge has to happen here.
@@ -51,7 +70,7 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
   for (const k of PREF_KEYS) {
     if (prefs && typeof prefs === 'object' && prefs[k] !== undefined) effective[k] = !!prefs[k]
   }
-  const verifyToken = randomBytes(24).toString('hex')
+  const verifyToken = holdSend && before ? before.verify_token : randomBytes(24).toString('hex')
   const unsubToken = existing?.unsub_token ?? randomBytes(24).toString('hex')
   notifyDb.upsertSubscription(subject_key, addr, verifyToken, unsubToken, effective)
   // upsertSubscription keeps a confirmed row confirmed when the address is
@@ -59,7 +78,8 @@ router.post('/subscribe', rateLimited('notif_subscribe', 10), async (req, res) =
   // email, and the response reports the stored state. The confirmation is the
   // only email an unverified address receives.
   const verified = notifyDb.getSubscription(subject_key)?.verified ?? false
-  const sent = verified ? { sent: false } : await email.sendConfirmation(addr, verifyToken, unsubToken)
+  const sent = verified || holdSend ? { sent: false } : await email.sendConfirmation(addr, verifyToken, unsubToken)
+  if (sent.sent) recordConfirm(subject_key, addr, req.ip)
   res.status(201).json({ subscribed: true, verified, confirmation_sent: sent.sent, email_enabled: email.isEmailEnabled(), prefs: effective })
 })
 

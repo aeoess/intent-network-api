@@ -15,17 +15,18 @@ const v3db = await import('../dist/v3-db.js')
 const mod = await import('../dist/moderation.js')
 const blocks = await import('../dist/source-blocks.js')
 
-// Address blocks:
+// Address restrictions (new publish, renew, replace, intro requests, email sign-up only):
 //   node scripts/moderate.mjs list-sources
-//   node scripts/moderate.mjs block-source <ip> "<reason>" <actor> [--apply]
-//   node scripts/moderate.mjs unblock-source <ip> [--apply]
-if (cmd === 'list-sources') { console.log(JSON.stringify(blocks.listBlockedSources(), null, 1)); process.exit(0) }
-if (cmd === 'block-source' || cmd === 'unblock-source') {
+//   node scripts/moderate.mjs restrict-source <ip> "<reason>" <actor> [hours] [--apply]
+//   node scripts/moderate.mjs lift-source <ip> [--apply]
+if (cmd === 'list-sources') { console.log(JSON.stringify(blocks.listRestrictions(), null, 1)); process.exit(0) }
+if (cmd === 'restrict-source' || cmd === 'lift-source') {
   const ip = type
-  if (!ip) { console.error('usage: block-source <ip> "<reason>" <actor> [--apply] | unblock-source <ip> [--apply]'); process.exit(2) }
-  if (!apply) { console.log(JSON.stringify({ dry_run: true, cmd, ip, currently_blocked: blocks.isSourceBlocked(ip) }, null, 1)); process.exit(0) }
-  const changed = cmd === 'block-source' ? blocks.blockSource(ip, target ?? '', a3 ?? '') : blocks.unblockSource(ip)
-  console.log(JSON.stringify({ applied: true, cmd, ip, changed }, null, 1))
+  if (!ip) { console.error('usage: restrict-source <ip> "<reason>" <actor> [hours] [--apply] | lift-source <ip> [--apply]'); process.exit(2) }
+  const hours = a4 && a4 !== '--apply' ? Number(a4) : undefined
+  if (!apply) { console.log(JSON.stringify({ dry_run: true, cmd, ip, hours: hours ?? blocks.DEFAULT_RESTRICTION_HOURS, current: blocks.activeRestriction(ip) }, null, 1)); process.exit(0) }
+  const result = cmd === 'restrict-source' ? blocks.restrictSource(ip, target ?? '', a3 ?? '', { hours }) : blocks.liftRestriction(ip)
+  console.log(JSON.stringify({ applied: true, cmd, ip, result }, null, 1))
   process.exit(0)
 }
 
