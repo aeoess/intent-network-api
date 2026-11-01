@@ -176,7 +176,6 @@ test('renew works from the owner-read card, and the public projection cannot sta
   // the server refuses it as changed content (this is what an old client hits).
   const pub = JSON.parse((await getText(`/api/v3/cards/${id}`)).text).card
   const fromPublic: Record<string, any> = { ...pub }
-  delete fromPublic.card_id
   fromPublic.created_at = new Date(Date.now() + 3000).toISOString()
   fromPublic.expires_at = new Date(Date.now() + 3000 + 21 * 86400000).toISOString()
   fromPublic.revocation_status = 'active'
@@ -190,4 +189,18 @@ test('renew works from the owner-read card, and the public projection cannot sta
   renewed.revocation_status = 'active'
   const good = await post(`/api/v3/cards/${id}/renew`, { card: seal(renewed, keys) })
   assert.equal(good.status, 201, good.text)
+})
+
+test('an old client that renews by resealing the public fetch still works for a network-only card', async () => {
+  // Mirrors mingle-mcp resealForRenew: copy fetched.card, drop the envelope, new timestamps, seal.
+  const keys = generateKeyPair()
+  const p = await post('/api/v3/cards', { card: makeCard(keys, { headline: 'Old client renew probe' }) })
+  assert.equal(p.status, 201, p.text)
+  const fetched = JSON.parse((await getText(`/api/v3/cards/${p.body.card_id}`)).text)
+  const renewed: Record<string, any> = { ...fetched.card }
+  renewed.created_at = new Date(Date.now() + 5000).toISOString()
+  renewed.expires_at = new Date(Date.now() + 5000 + 21 * 86400000).toISOString()
+  renewed.revocation_status = 'active'
+  const r = await post(`/api/v3/cards/${p.body.card_id}/renew`, { card: seal(renewed, keys) })
+  assert.equal(r.status, 201, r.text)
 })

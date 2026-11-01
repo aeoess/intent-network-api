@@ -313,9 +313,17 @@ router.get('/cards/:cardId', (req, res) => {
   if (!stored) { res.status(404).json({ error: 'card not found' }); return }
   const full = stored.card as unknown as Record<string, any>
   const live = stored.revocation_status === 'active' && Date.parse(stored.expires_at) > Date.now()
-  const card = live
-    ? { ...networkVisibleView({ ...stored.card, card_id: stored.card_id }), subject_key: full.subject_key, visibility: full.visibility, delegation_ref: full.delegation_ref ?? null }
-    : { card_id: stored.card_id, card_type: full.card_type, revocation_status: stored.revocation_status }
+  // card_id stays at the top level only. Clients renew by resealing this object, so
+  // for a card whose fields are all network-visible it must equal the stored card
+  // minus the envelope, with no field added.
+  // A deleted row holds only a marker, so the view is built for live cards only.
+  let card: Record<string, unknown>
+  if (live) {
+    const { card_id: _id, ...view } = networkVisibleView(stored.card)
+    card = { ...view, subject_key: full.subject_key, visibility: full.visibility, delegation_ref: full.delegation_ref ?? null }
+  } else {
+    card = { card_type: full.card_type, revocation_status: stored.revocation_status }
+  }
   res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, projection: live ? 'network_visible' : 'status_only', card, ...lineage(cardId) })
 })
 
