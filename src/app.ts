@@ -32,6 +32,9 @@ export function createApp() {
   // outside any transaction, which is the whole reason it is not lazy on first use.
   initWriteSchema()
   const app = express()
+  // One proxy hop (Railway's edge) sits in front of the app. Without this, req.ip is
+  // the proxy's address and every IP-keyed rate limit is one bucket shared by everyone.
+  ;(app as unknown as { set(name: string, value: unknown): void }).set('trust proxy', 1)
 
   // ── Middleware ──
   app.use(helmet())

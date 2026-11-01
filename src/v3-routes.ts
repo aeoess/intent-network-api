@@ -23,7 +23,12 @@ import type { CardEvent } from './card-events.js'
 
 const router = Router()
 
-const LIMITS = { publish: 10, search: 30, verb: 30, renew: 10, replace: 10, sweep: 6 }
+const LIMITS = { publish: 10, publish_source: Number(process.env.MINGLE_PUBLISH_PER_SOURCE ?? 10), search: 30, verb: 30, renew: 10, replace: 10, sweep: 6 }
+
+/** Loopback is the operator and the test suite, never a proxied client. */
+function isLoopback(ip: string | undefined): boolean {
+  return !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+}
 
 /** Store the semantic index vector, compute owner-only matches, and ping the
  *  operator. Shared by publish and renew. Never throws into the response. */
@@ -133,7 +138,16 @@ function verifyCardCrypto(card: Record<string, any>): { ok: true } | { ok: false
 
 // ── POST /api/v3/cards - publish (signature + hash binding) ──────────────
 
-router.post('/cards', rateLimited('publish', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
+function sourceLimited(action: keyof typeof LIMITS) {
+  return (req: any, res: any, next: any) => {
+    if (isLoopback(req.ip)) { next(); return }
+    const check = checkRateLimit(`src:${req.ip}`, `v3_${action}`, LIMITS[action])
+    if (!check.allowed) { res.status(429).json({ error: 'Rate limit exceeded for this source', retryAfterSeconds: 3600 }); return }
+    next()
+  }
+}
+
+router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', req => String(req.body?.card?.subject_key ?? '')), async (req, res) => {
   const card = req.body?.card
   const validation = validateV3Card(card)
   if ('error' in validation) { res.status(400).json({ error: validation.error }); return }
@@ -147,6 +161,11 @@ router.post('/cards', rateLimited('publish', req => String(req.body?.card?.subje
   // Idempotency: byte-identical content already live for this subject returns
   // that card, not a duplicate. (The content hash covers timestamps too, so an
   // identical hash means a genuinely identical card.)
+  const retired = v3db.findRetiredCardByHash(card.subject_key, card.approval.card_hash)
+  if (retired) {
+    res.status(409).json({ error: `this exact card was already taken down (${retired.revocation_status}) and cannot be published again; publish a new card instead`, card_id: retired.card_id })
+    return
+  }
   const dup = v3db.findActiveCardByHash(card.subject_key, card.approval.card_hash)
   if (dup) {
     res.status(200).json({ published: true, idempotent: true, card_id: dup.card_id, card_hash: card.approval.card_hash, expires_at: dup.expires_at, revocation_status: dup.revocation_status })
@@ -256,7 +275,11 @@ router.get('/cards/:cardId', (req, res) => {
   // Surface the supersession chain so a renewed card and its predecessor link.
   const superseded_by = v3db.getSupersededBy(cardId)
   const supersedes = v3db.getSupersedes(cardId)
-  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, card: stored.card, superseded_by, supersedes })
+  // The signed envelope stays on the server. Returning signature and approval let
+  // anyone republish a card after its owner withdrew it (the publish duplicate check
+  // only looks at live cards). Clients reseal from content, so they never needed them.
+  const { signature: _sig, approval: _appr, ...card } = stored.card as unknown as Record<string, unknown>
+  res.json({ card_id: stored.card_id, revocation_status: stored.revocation_status, expires_at: stored.expires_at, card, superseded_by, supersedes })
 })
 
 // ── POST /api/v3/cards/search - explicit fields + semantic, filtered ─────

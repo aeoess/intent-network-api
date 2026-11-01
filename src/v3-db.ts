@@ -307,6 +307,16 @@ export function findActiveCardByHash(subjectKey: string, cardHash: string): { ca
   return row ?? null
 }
 
+/** Any earlier card of this subject with this exact content hash that is no longer
+ *  live (withdrawn, deleted, superseded, revoked, stopped, expired). Publishing that
+ *  exact signed card again would undo the owner's own takedown. */
+export function findRetiredCardByHash(subjectKey: string, cardHash: string): { card_id: string; revocation_status: string } | null {
+  const row = d().prepare(
+    `SELECT card_id, revocation_status FROM v3_cards WHERE subject_key = ? AND card_hash = ? AND revocation_status != 'active' ORDER BY created_at DESC LIMIT 1`,
+  ).get(subjectKey, cardHash) as any
+  return row ?? null
+}
+
 /** The card's stored content (for renew's identical-content check). */
 export function getV3CardContent(cardId: string): V3Card | null {
   const row = d().prepare('SELECT card_json FROM v3_cards WHERE card_id = ?').get(cardId) as any

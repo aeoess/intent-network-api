@@ -145,6 +145,8 @@ export function recomputeMatchesForCardDetailed(cardId: string): RecomputeResult
   let n = 0
   for (const cand of candidates) {
     if (cand.card_id === cardId) continue
+    // Two cards signed by one key are one participant. Matching them only creates noise.
+    if (cand.card.subject_key === stored.card.subject_key) continue
     const cos = myVec ? cosOf(myVec, getMatchVector(cand.card_id)) : null
     const [aId] = order(cardId, cand.card_id)
     const aCard = aId === cardId ? stored.card : cand.card
