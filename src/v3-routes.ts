@@ -37,6 +37,9 @@ async function finalizePublish(cardId: string, card: V3Card): Promise<void> {
     const text = networkVisibleText(card)
     if (text.length > 0) {
       const vec = await embed(text)
+      // The card may have been taken down while the embedding ran. Do not put it
+      // back in the index or match it.
+      if (!v3db.isCardMatchable(cardId)) { recordCardEvent('publish_finalize_skipped', cardId, card.subject_key, { reason: 'not active after embedding' }); return }
       if (vec) {
         v3db.storeV3Embedding(cardId, vec); matchesDb.storeMatchVector(cardId, vec)
         recordCardEvent('embedding_stored', cardId, card.subject_key, { dims: vec.length })
@@ -138,6 +141,10 @@ function verifyCardCrypto(card: Record<string, any>): { ok: true } | { ok: false
 
 // ── POST /api/v3/cards - publish (signature + hash binding) ──────────────
 
+/** Thrown inside a renew or replace transaction when the old card stopped being
+ *  active after the route's own check, so the transaction rolls back. */
+class OldCardNotActive extends Error {}
+
 /** The refusal for signed content that was already taken down. */
 function retiredRefusal(res: any, standing: { card_id: string; revocation_status: string }): void {
   res.status(409).json({ error: `this exact card was already taken down (${standing.revocation_status}) and cannot be published again; publish a new card instead`, card_id: standing.card_id })
@@ -177,6 +184,15 @@ router.post('/cards', sourceLimited('publish_source'), rateLimited('publish', re
     return false
   }
   if (answerExisting()) return
+  // The same words signed again with new timestamps are a new hash, so the hash
+  // check above misses them. One subject holds one live copy of a given content:
+  // to extend it, renew it.
+  for (const liveId of v3db.activeCardIdsForSubject(card.subject_key)) {
+    const live = v3db.getV3Card(liveId)
+    if (live && sameContentExceptTimestamps(live.card as any, card)) {
+      res.status(409).json({ error: 'a live card with this exact content already exists for this key; renew it instead of publishing it again', card_id: liveId }); return
+    }
+  }
 
   const cardId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   try {
@@ -222,23 +238,32 @@ router.post('/cards/:cardId/renew', rateLimited('renew', req => String(req.body?
     res.status(409).json({ error: 'this exact card is already live, so it cannot be the renewal; sign it with new timestamps', card_id: renewStanding.card_id }); return
   }
 
+  // Inserting the renewed card and superseding the old one commit together, before
+  // any async work. If the old card was taken down or already renewed after the
+  // check above, the conditional supersede fails and nothing is stored, so a
+  // withdrawal that committed first always wins and a card has one successor.
   const newId = `v3-${card.card_type}-${Date.now()}-${randomBytes(4).toString('hex')}`
   try {
-    v3db.insertV3Card(newId, card, card.approval.card_hash)
+    getDb().transaction(() => {
+      v3db.insertV3Card(newId, card, card.approval.card_hash)
+      if (!v3db.supersedeIfActive(oldId, card.subject_key)) throw new OldCardNotActive()
+      v3db.removeFromIndex(oldId)
+      matchesDb.deleteMatchArtifacts(oldId)
+      v3db.recordSupersession(oldId, newId)
+    })()
   } catch (e) {
-    if (v3db.isCardHashConflict(e)) { res.status(409).json({ error: 'this exact card was stored by a concurrent request' }); return }
-    throw e
+    if (e instanceof OldCardNotActive) {
+      const now = v3db.getV3Card(oldId)
+      res.status(409).json({ error: `the card changed while renewing (now ${now?.revocation_status ?? 'missing'}), nothing was renewed`, superseded_by: v3db.getSupersededBy(oldId) }); return
+    }
+    if (v3db.isCardHashConflict(e)) { res.status(409).json({ error: 'this exact card was stored by a concurrent request, nothing changed' }); return }
+    console.error('[v3] renew rolled back:', (e as Error).message)
+    res.status(500).json({ error: 'renew failed and nothing changed' }); return
   }
   // Recorded against both ids so either end of the chain finds the renewal.
   recordCardEvent('card_renewed', newId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
   recordCardEvent('card_renewed', oldId, card.subject_key, { old_card_id: oldId, new_card_id: newId, expires_at: card.expires_at })
   await finalizePublish(newId, card)
-
-  // Supersede the old version and clean its index + match artifacts.
-  v3db.setRevocationStatus(oldId, card.subject_key, 'superseded')
-  v3db.removeFromIndex(oldId)
-  matchesDb.deleteMatchArtifacts(oldId)
-  v3db.recordSupersession(oldId, newId)
 
   res.status(201).json({ renewed: true, new_card_id: newId, superseded: oldId, card_hash: card.approval.card_hash, expires_at: card.expires_at })
 })
@@ -275,12 +300,16 @@ router.post('/cards/:cardId/replace', rateLimited('replace', req => String(req.b
   try {
     getDb().transaction(() => {
       v3db.insertV3Card(newId, card, card.approval.card_hash)
-      v3db.setRevocationStatus(oldId, card.subject_key, 'superseded')
+      if (!v3db.supersedeIfActive(oldId, card.subject_key)) throw new OldCardNotActive()
       v3db.removeFromIndex(oldId)
       matchesDb.deleteMatchArtifacts(oldId)
       v3db.recordSupersession(oldId, newId)
     })()
   } catch (e) {
+    if (e instanceof OldCardNotActive) {
+      const now = v3db.getV3Card(oldId)
+      res.status(409).json({ error: `the card changed while replacing (now ${now?.revocation_status ?? 'missing'}), nothing was replaced`, superseded_by: v3db.getSupersededBy(oldId) }); return
+    }
     if (v3db.isCardHashConflict(e)) { res.status(409).json({ error: 'this exact card was stored by a concurrent request, nothing changed' }); return }
     console.error('[v3] replace rolled back:', (e as Error).message)
     res.status(500).json({ error: 'replace failed and nothing changed' }); return
@@ -436,6 +465,12 @@ for (const [verb, status] of Object.entries(VERB_STATUS)) {
     const cardId = String(req.params.cardId)
     const key = requireVerbSignature(req, res, cardId, verb)
     if (!key) return
+    // A superseded or deleted card is final for this id. Changing its status would
+    // say nothing about the live successor, so the caller is told which card that is.
+    const current = v3db.getV3Card(cardId)?.revocation_status
+    if (current === 'superseded' || current === 'deleted') {
+      res.status(409).json({ error: `this card is ${current}; act on its successor instead`, card_id: cardId, revocation_status: current, superseded_by: v3db.getSupersededBy(cardId) }); return
+    }
     v3db.setRevocationStatus(cardId, key, status)
     if (verb !== 'supersede') v3db.removeFromIndex(cardId)
     // A card that is no longer active must not keep generating matches.

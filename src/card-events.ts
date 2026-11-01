@@ -82,6 +82,7 @@ export const CARD_EVENTS = [
   'embedding_stored',
   'embedding_failed',
   'matching_started',
+  'publish_finalize_skipped',
   'match_created',
   'match_removed',
   'match_dismissed',

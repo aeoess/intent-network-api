@@ -353,6 +353,18 @@ export function cardHashStanding(subjectKey: string, cardHash: string): HashStan
   return { kind: 'retired', card_id: row.card_id, revocation_status: row.revocation_status === 'active' ? 'expired' : row.revocation_status }
 }
 
+/** Supersede a card only if it is still active and unexpired, in one statement.
+ *  Renew and replace call this inside the transaction that inserts the successor,
+ *  so a takedown that committed first makes the whole renew or replace roll back,
+ *  and two successors of one card cannot both commit. */
+export function supersedeIfActive(cardId: string, subjectKey: string): boolean {
+  const res = d().prepare(`
+    UPDATE v3_cards SET revocation_status = 'superseded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE card_id = ? AND subject_key = ? AND revocation_status = 'active' AND expires_at > ${SQL_NOW_ISO}
+  `).run(cardId, subjectKey)
+  return res.changes === 1
+}
+
 /** True when an insert failed on the (subject_key, card_hash) unique index, so a
  *  concurrent writer stored the same signed content first. */
 export function isCardHashConflict(e: unknown): boolean {
