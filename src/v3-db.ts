@@ -252,6 +252,33 @@ export function removeFromIndex(cardId: string): void {
   d().prepare('DELETE FROM v3_embedding_cards WHERE card_id = ?').run(cardId)
 }
 
+/** True when the card has a row in the semantic index. */
+export function hasV3Embedding(cardId: string): boolean {
+  return !!d().prepare('SELECT 1 FROM v3_embedding_cards WHERE card_id = ?').get(cardId)
+}
+
+/** Live, unhidden cards with no row in the semantic index, oldest first. These
+ *  are cards whose embedding failed at publish, for example because the model
+ *  was still loading. Read only. */
+export function listMatchableCardsWithoutEmbedding(limit: number): { card_id: string; subject_key: string; card_json: string }[] {
+  return d().prepare(`
+    SELECT card_id, subject_key, card_json FROM v3_cards
+    WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}
+      AND NOT EXISTS (SELECT 1 FROM v3_embedding_cards ec WHERE ec.card_id = v3_cards.card_id)
+    ORDER BY created_at, card_id
+    LIMIT ?
+  `).all(limit) as any[]
+}
+
+/** How many live, unhidden cards have no row in the semantic index. */
+export function countMatchableCardsWithoutEmbedding(): number {
+  return (d().prepare(`
+    SELECT COUNT(*) AS n FROM v3_cards
+    WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}
+      AND NOT EXISTS (SELECT 1 FROM v3_embedding_cards ec WHERE ec.card_id = v3_cards.card_id)
+  `).get() as any).n
+}
+
 export function semanticSearchV3(queryVec: Float32Array, limit: number): { card_id: string; distance: number }[] {
   const rows = d().prepare(`
     SELECT c.card_id AS card_id, e.distance AS distance
