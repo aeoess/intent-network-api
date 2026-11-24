@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Server } from 'node:http'
-import { generateKeyPair, sign, canonicalize, createIntentCard } from 'agent-passport-system'
+import { generateKeyPair, sign, canonicalize } from 'agent-passport-system'
+import { createIntentCard } from './intent-card-helper.js'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-email-test-'))
 process.env.DB_PATH = join(tmpDir, 'email.db')

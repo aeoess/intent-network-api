@@ -11,9 +11,7 @@ import { embed, embedBatch } from './embeddings.js'
 import * as notify from './notifications.js'
 import * as v3db from './v3-db.js'
 import * as cardEvents from './card-events.js'
-import {
-  computeRelevance, verifyIntentCard, isCardExpired,
-} from 'agent-passport-system'
+import { verifyIntentCard, isCardExpired } from './intent-card.js'
 
 // Network-visible headline for a 48h card (public by design): alias, then
 // topic, then the agent id. Never any private field (48h cards have none).
