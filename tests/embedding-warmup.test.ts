@@ -339,3 +339,30 @@ test('a publish whose vector lands after the pass stored the same card adds no s
   assert.equal(semanticRows(id), 1, 'the publish found the vectors in place and wrote no second row')
   assert.ok(matchesDb.getMatchVector(id))
 })
+
+test('a model error on one card does not stop the pass for the next', async () => {
+  await index.indexMissingEmbeddings()
+  const m = pendingModel()
+  const bad = await publish('Glassblower', 'furnace glass art')
+  const good = await publish('Bookbinder', 'hand sewn bindings')
+  onEmbed = text => { if (text.includes('Glassblower')) throw new Error('inference failed') }
+  const errors: string[] = []
+  const orig = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  let r: Awaited<typeof m.started>
+  try {
+    m.ready()
+    r = await m.started
+  } finally {
+    console.error = orig
+    onEmbed = () => {}
+  }
+  assert.equal(r!.failed, 1)
+  assert.equal(r!.indexed, 1)
+  assert.equal(semanticRows(bad.id), 0)
+  assert.equal(semanticRows(good.id), 1)
+  assert.ok(errors.some(e => e.includes(bad.id) && e.includes('inference failed')), JSON.stringify(errors))
+  // The failed card stays selectable and is indexed once the model can embed it.
+  await index.indexMissingEmbeddings()
+  assert.equal(semanticRows(bad.id), 1)
+})

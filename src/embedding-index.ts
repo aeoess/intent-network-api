@@ -53,7 +53,7 @@ export interface IndexPassResult {
    *  computed, cards another writer indexed first, and cards with no network
    *  visible text. */
   skipped: number
-  /** Cards whose write failed. Nothing was written for them. */
+  /** Cards whose embedding or write failed. Nothing was written for them. */
   failed: number
   /** True when the pass stopped at its limit with cards left to embed. */
   limit_reached: boolean
@@ -88,7 +88,16 @@ export async function indexMissingEmbeddings(limit = 500): Promise<IndexPassResu
       const text = networkVisibleText(card)
       if (text.length === 0) { skipped++; continue }
       embedded++
-      const vec = await embed(text)
+      let vec: Float32Array | null
+      try {
+        vec = await embed(text)
+      } catch (e) {
+        // One input the model cannot process is that card's failure, not the pass's.
+        failed++
+        console.error(`[embeddings] Index pass could not embed ${row.card_id}:`, (e as Error).message)
+        continue
+      }
+      // null means the model is not loaded, which no later card can change.
       if (!vec) break scan
       let result: StoreVectorsResult
       try {
