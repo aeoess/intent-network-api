@@ -257,26 +257,31 @@ export function hasV3Embedding(cardId: string): boolean {
   return !!d().prepare('SELECT 1 FROM v3_embedding_cards WHERE card_id = ?').get(cardId)
 }
 
-/** Live, unhidden cards with no row in the semantic index, oldest first. These
- *  are cards whose embedding failed at publish, for example because the model
- *  was still loading. Read only. */
-export function listMatchableCardsWithoutEmbedding(limit: number): { card_id: string; subject_key: string; card_json: string }[] {
+/** The SQL condition for a live, unhidden card that is missing a vector in the
+ *  semantic index, in the match vector table, or in both. */
+const MISSING_A_VECTOR = `expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}
+      AND (NOT EXISTS (SELECT 1 FROM v3_embedding_cards ec WHERE ec.card_id = v3_cards.card_id)
+        OR NOT EXISTS (SELECT 1 FROM v3_match_vectors mv WHERE mv.card_id = v3_cards.card_id))`
+
+/** Live, unhidden cards missing either vector, oldest first, from after the
+ *  given position. Read only. The caller makes sure v3_match_vectors exists. */
+export function listCardsMissingVectors(
+  limit: number,
+  after?: { created_at: string; card_id: string },
+): { card_id: string; subject_key: string; card_json: string; created_at: string }[] {
+  const from = after ? 'AND (created_at > ? OR (created_at = ? AND card_id > ?))' : ''
+  const params: unknown[] = after ? [after.created_at, after.created_at, after.card_id, limit] : [limit]
   return d().prepare(`
-    SELECT card_id, subject_key, card_json FROM v3_cards
-    WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}
-      AND NOT EXISTS (SELECT 1 FROM v3_embedding_cards ec WHERE ec.card_id = v3_cards.card_id)
+    SELECT card_id, subject_key, card_json, created_at FROM v3_cards
+    WHERE ${MISSING_A_VECTOR} ${from}
     ORDER BY created_at, card_id
     LIMIT ?
-  `).all(limit) as any[]
+  `).all(...params) as any[]
 }
 
-/** How many live, unhidden cards have no row in the semantic index. */
-export function countMatchableCardsWithoutEmbedding(): number {
-  return (d().prepare(`
-    SELECT COUNT(*) AS n FROM v3_cards
-    WHERE expires_at > ${SQL_NOW_ISO} AND revocation_status = 'active' AND ${NOT_HIDDEN}
-      AND NOT EXISTS (SELECT 1 FROM v3_embedding_cards ec WHERE ec.card_id = v3_cards.card_id)
-  `).get() as any).n
+/** How many live, unhidden cards are missing either vector. */
+export function countCardsMissingVectors(): number {
+  return (d().prepare(`SELECT COUNT(*) AS n FROM v3_cards WHERE ${MISSING_A_VECTOR}`).get() as any).n
 }
 
 export function semanticSearchV3(queryVec: Float32Array, limit: number): { card_id: string; distance: number }[] {

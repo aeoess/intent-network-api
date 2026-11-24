@@ -44,9 +44,9 @@ after(() => { email.resetTransport(); server?.close(); db.closeDb(); rmSync(tmpD
 /** A stand-in for the model: a stable 384 dimension vector from the words of
  *  the text, so texts that share words are close. `onEmbed` lets a test act
  *  while a vector is being computed. */
-let onEmbed: (text: string) => void = () => {}
+let onEmbed: (text: string) => void | Promise<void> = () => {}
 const fakeModel = async (text: string) => {
-  onEmbed(text)
+  await onEmbed(text)
   const v = new Float32Array(384)
   for (const w of text.toLowerCase().split(/\W+/).filter(Boolean)) {
     v[createHash('sha256').update(w).digest()[0]! % 384] += 1
@@ -104,6 +104,18 @@ async function search(query: string): Promise<{ status: number; ids: string[] }>
   return { status: res.status, ids: (body.results ?? []).map((r: any) => r.card_id) }
 }
 
+function semanticRows(id: string): number {
+  return (db.getDb().prepare('SELECT COUNT(*) AS n FROM v3_embedding_cards WHERE card_id = ?').get(id) as any).n
+}
+
+/** Start a warmup the test finishes by hand. */
+function pendingModel() {
+  const model = deferred<any>()
+  embeddings.setModelLoaderForTests(() => model.promise)
+  const started = index.startEmbeddings()
+  return { ready: () => model.resolve(fakeModel), started }
+}
+
 function row(id: string): unknown {
   return db.getDb().prepare('SELECT card_json, revocation_status, expires_at, card_hash FROM v3_cards WHERE card_id = ?').get(id)
 }
@@ -143,7 +155,7 @@ test('a card published while the model loads becomes searchable once it is ready
   const result = await started
   onEmbed = () => {}
   assert.equal(loads, 1, 'one model load for overlapping warmup calls')
-  assert.deepEqual(result, { indexed: 1, skipped: 1, remaining: 0 })
+  assert.deepEqual(result, { indexed: 1, skipped: 1, failed: 0, limit_reached: false, remaining: 0 })
 
   assert.equal(v3db.hasV3Embedding(early.id), true)
   assert.ok(matchesDb.getMatchVector(early.id), 'the hourly sweep gets a vector to match with')
@@ -160,7 +172,7 @@ test('a card published while the model loads becomes searchable once it is ready
   assert.deepEqual(row(racing.id), { ...racingBefore, revocation_status: 'withdrawn' })
 
   // Running the pass again indexes nothing and adds no second index row.
-  assert.deepEqual(await index.indexMissingEmbeddings(), { indexed: 0, skipped: 0, remaining: 0 })
+  assert.deepEqual(await index.indexMissingEmbeddings(), { indexed: 0, skipped: 0, failed: 0, limit_reached: false, remaining: 0 })
   const rows = db.getDb().prepare('SELECT COUNT(*) AS n FROM v3_embedding_cards WHERE card_id = ?').get(early.id) as any
   assert.equal(rows.n, 1)
 })
@@ -194,4 +206,136 @@ test('a model that never loads holds no request open', async () => {
   await publish('Night sky guide', 'telescope evenings')
   assert.equal((await search('telescope')).status, 500)
   assert.ok(Date.now() - t < 5000, 'publish and search answered without waiting for the model')
+})
+
+test('a vector computed from text the card no longer shows is not written', async () => {
+  const m = pendingModel()
+  const card = await publish('Beekeeper', 'hive inspections and honey harvests')
+  const changed = buildCard('Retired beekeeper', 'nothing offered now').card
+  onEmbed = text => {
+    if (text.includes('hive inspections')) {
+      // The same card id with different network visible content, while its vector is computed.
+      db.getDb().prepare('UPDATE v3_cards SET card_json = ? WHERE card_id = ?').run(JSON.stringify(changed), card.id)
+    }
+  }
+  m.ready()
+  const r = await m.started
+  onEmbed = () => {}
+  assert.ok(r!.skipped >= 1)
+  assert.equal(semanticRows(card.id), 0)
+  assert.equal(matchesDb.getMatchVector(card.id), null)
+
+  // The next pass embeds the text the card shows now.
+  await index.indexMissingEmbeddings()
+  assert.equal(semanticRows(card.id), 1)
+  const expected = (await fakeModel('Retired beekeeper nothing offered now')).data
+  assert.deepEqual(Array.from(matchesDb.getMatchVector(card.id)!), Array.from(expected))
+})
+
+test('a failure on the second write leaves neither vector, and a later pass stores both', async () => {
+  const m = pendingModel()
+  const card = await publish('Clock repairer', 'antique pendulum clock repair')
+  const d = db.getDb()
+  const vecRowsBefore = (d.prepare('SELECT COUNT(*) AS n FROM v3_embeddings').get() as any).n
+  d.exec(`CREATE TRIGGER fail_match_vector BEFORE INSERT ON v3_match_vectors BEGIN SELECT RAISE(ABORT, 'forced failure'); END`)
+  const errors: string[] = []
+  const orig = console.error
+  console.error = (...a: unknown[]) => { errors.push(a.join(' ')) }
+  try {
+    m.ready()
+    const r = await m.started
+    assert.ok(r!.failed >= 1)
+    assert.equal(r!.indexed, 0, 'no card is indexed while the second write fails')
+  } finally {
+    console.error = orig
+    d.exec('DROP TRIGGER fail_match_vector')
+  }
+  assert.ok(errors.some(e => e.includes('forced failure')), JSON.stringify(errors))
+  assert.equal(semanticRows(card.id), 0, 'the semantic row was rolled back with the failed write')
+  assert.equal((d.prepare('SELECT COUNT(*) AS n FROM v3_embeddings').get() as any).n, vecRowsBefore)
+  assert.equal(matchesDb.getMatchVector(card.id), null)
+
+  await index.indexMissingEmbeddings()
+  assert.equal(semanticRows(card.id), 1)
+  assert.ok(matchesDb.getMatchVector(card.id))
+  assert.ok((await search('antique pendulum clock')).ids.includes(card.id))
+})
+
+test('a card missing only its match vector gets that one, and keeps its single semantic row', async () => {
+  const card = await publish('Kite maker', 'stunt kite building')
+  assert.equal(semanticRows(card.id), 1)
+  db.getDb().prepare('DELETE FROM v3_match_vectors WHERE card_id = ?').run(card.id)
+  await index.indexMissingEmbeddings()
+  assert.equal(semanticRows(card.id), 1)
+  assert.ok(matchesDb.getMatchVector(card.id))
+})
+
+test('publishes that overlap the model becoming ready each end with one row in each index', async () => {
+  db.getDb().prepare('DELETE FROM rate_limits').run()
+  const m = pendingModel()
+  const titles = Array.from({ length: 12 }, (_, i) => `Overlap tester ${i}`)
+  const publishing = Promise.all(titles.map((t, i) => publish(t, `overlap topic number ${i}`)))
+  // Ready while the publishes are in flight, so some embed before and some after.
+  setImmediate(() => m.ready())
+  const cards = await publishing
+  await m.started
+  await index.indexMissingEmbeddings()
+  for (const c of cards) {
+    assert.equal(semanticRows(c.id), 1, `${c.id} has one semantic row`)
+    assert.ok(matchesDb.getMatchVector(c.id), `${c.id} has a match vector`)
+  }
+})
+
+test('cards skipped without an embedding do not hold back later cards', async () => {
+  await index.indexMissingEmbeddings()
+  assert.equal(v3db.countCardsMissingVectors(), 0, 'no leftover cards from earlier tests')
+  const m = pendingModel()
+  const unreadable = await publish('Puzzle setter', 'crossword puzzles')
+  const later = await publish('Map collector', 'old sea charts')
+  db.getDb().prepare(`UPDATE v3_cards SET card_json = 'not json' WHERE card_id = ?`).run(unreadable.id)
+  embeddings.setModelLoaderForTests(async () => fakeModel)
+  void m
+  assert.equal(await embeddings.warmupModel(), true)
+  const r = await index.indexMissingEmbeddings(1)
+  assert.equal(r.indexed, 1, 'the limit counts embeddings, not skipped cards')
+  assert.ok(semanticRows(later.id) === 1)
+  assert.equal(semanticRows(unreadable.id), 0)
+  db.getDb().prepare('DELETE FROM v3_cards WHERE card_id = ?').run(unreadable.id)
+})
+
+test('the pass stops at its limit and says so', async () => {
+  const m = pendingModel()
+  const a = await publish('Limit tester one', 'first limit topic')
+  const b = await publish('Limit tester two', 'second limit topic')
+  embeddings.setModelLoaderForTests(async () => fakeModel)
+  void m
+  assert.equal(await embeddings.warmupModel(), true)
+  const r = await index.indexMissingEmbeddings(1)
+  assert.equal(r.indexed, 1)
+  assert.equal(r.limit_reached, true)
+  assert.equal(r.remaining, 1)
+  assert.equal((await index.indexMissingEmbeddings(1)).limit_reached, false)
+  assert.equal(semanticRows(a.id) + semanticRows(b.id), 2)
+})
+
+test('a publish whose vector lands after the pass stored the same card adds no second row', async () => {
+  embeddings.setModelLoaderForTests(async () => fakeModel)
+  assert.equal(await embeddings.warmupModel(), true)
+  const gate = deferred<void>()
+  let held = false
+  onEmbed = async text => {
+    if (text.includes('Gatekeeper') && !held) { held = true; await gate.promise }
+  }
+  const publishing = publish('Gatekeeper', 'garden gate carpentry')
+  for (let i = 0; !held; i++) { assert.ok(i < 1000); await new Promise(r => setImmediate(r)) }
+  // The publish is waiting on its vector. The card row exists, so the pass stores it first.
+  const id = (db.getDb().prepare(`SELECT card_id FROM v3_cards WHERE headline = 'Gatekeeper'`).get() as any).card_id
+  await index.indexMissingEmbeddings()
+  assert.equal(semanticRows(id), 1)
+  gate.resolve()
+  const card = await publishing
+  onEmbed = () => {}
+  assert.equal(card.id, id)
+  assert.equal(semanticRows(id), 1, 'the publish found the vectors in place and wrote no second row')
+  assert.ok(matchesDb.getMatchVector(id))
 })
