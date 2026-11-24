@@ -18,6 +18,7 @@ import * as email from './notifications.js'
 import { adminAlerts } from './admin-alerts.js'
 import { unlessRestricted } from './source-blocks.js'
 import { embed } from './embeddings.js'
+import { storeCardVectors } from './embedding-index.js'
 import { networkVisibleText, networkVisibleView } from './v3-cards.js'
 import { checkRateLimit, getDb } from './db.js'
 import { recordCardEvent } from './card-events.js'
@@ -46,7 +47,9 @@ async function finalizePublish(cardId: string, card: V3Card): Promise<void> {
       // back in the index or match it.
       if (!v3db.isCardMatchable(cardId)) { recordCardEvent('publish_finalize_skipped', cardId, card.subject_key, { reason: 'not active after embedding' }); return }
       if (vec) {
-        v3db.storeV3Embedding(cardId, vec); matchesDb.storeMatchVector(cardId, vec)
+        // One transaction with the recheck, and no second row when the startup
+        // index pass stored this card's vectors while this embedding ran.
+        if (storeCardVectors(cardId, text, vec) === 'not_current') { recordCardEvent('publish_finalize_skipped', cardId, card.subject_key, { reason: 'content not current after embedding' }); return }
         recordCardEvent('embedding_stored', cardId, card.subject_key, { dims: vec.length })
       } else {
         recordCardEvent('embedding_failed', cardId, card.subject_key, { error: 'embedding model not ready (embed returned null)' })

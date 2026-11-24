@@ -17,7 +17,7 @@ import { createApp } from './app.js'
 import { getDb, purgeExpired, closeDb, stampCanonicalMcpReleaseOnce } from './db.js'
 import { initWriteSchema, purgeWriteNonces } from './write-db.js'
 import { sweepExpiredIntros } from './connection-facts.js'
-import { warmupModel } from './embeddings.js'
+import { startEmbeddings } from './embedding-index.js'
 import { sweepExpiredFitExchanges } from './fit-routes.js'
 import { sweepExpiredV3Cards } from './v3-db.js'
 import { adminAlerts } from './admin-alerts.js'
@@ -135,7 +135,8 @@ app.listen(PORT, () => {
   console.log(`Database: ${process.env.DB_PATH || 'data/intent-network.db'}`)
   console.log(`Endpoints: http://localhost:${PORT}/`)
   // Warm up embedding model in background (don't block startup)
-  warmupModel().catch(e => console.error('[embeddings] Warmup failed:', e.message))
+  // and then index the cards published while it was loading
+  void startEmbeddings()
 })
 
 // ── Graceful shutdown ──
