@@ -11,9 +11,7 @@ import { embed, embedBatch } from './embeddings.js'
 import * as notify from './notifications.js'
 import * as v3db from './v3-db.js'
 import * as cardEvents from './card-events.js'
-import {
-  computeRelevance, verifyIntentCard, isCardExpired,
-} from 'agent-passport-system'
+import { verifyIntentCard, isCardExpired, isCanonicalTimestamp } from './intent-card.js'
 
 // Network-visible headline for a 48h card (public by design): alias, then
 // topic, then the agent id. Never any private field (48h cards have none).
@@ -90,6 +88,13 @@ router.post('/cards', v2Gate, requireSignature, rateLimit('publish', LIMITS.publ
   // Verify card signature
   if (!verifyIntentCard(card)) {
     res.status(403).json({ error: 'Card signature verification failed' })
+    return
+  }
+
+  // The expiry queries compare expires_at as text, which is only correct for the
+  // toISOString form, so any other form is refused before it is stored
+  if (!isCanonicalTimestamp(card.expiresAt)) {
+    res.status(400).json({ error: 'expiresAt must be a UTC timestamp in the form 2026-01-01T00:00:00.000Z' })
     return
   }
 

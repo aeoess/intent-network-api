@@ -12,7 +12,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Server } from 'node:http'
-import { createIntentCard, generateKeyPair } from 'agent-passport-system'
+import { generateKeyPair } from 'agent-passport-system'
+import { createIntentCard } from './intent-card-helper.js'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'mingle-v2-gate-test-'))
 process.env.DB_PATH = join(tmpDir, 'v2gate.db')

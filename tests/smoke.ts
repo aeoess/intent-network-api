@@ -1,4 +1,5 @@
-import { createIntentCard, generateKeyPair } from 'agent-passport-system'
+import { generateKeyPair } from 'agent-passport-system'
+import { createIntentCard } from './intent-card-helper.js'
 
 const keysA = generateKeyPair()
 const keysB = generateKeyPair()
