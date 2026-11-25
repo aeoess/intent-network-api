@@ -73,10 +73,11 @@ test('SDK COMPAT: a receipt signed under 1.13 verifies through the trusted key s
   assert.equal(verify(DIGEST_113.replace(/^2/, '3'), RECEIPT_SIG_113, SERVER_PUB), false)
 })
 
-test('SDK COMPAT: isCardExpired keeps the 1.x rule, an unparseable expiresAt is not expired', () => {
+test('SDK COMPAT: isCardExpired keeps the 1.x answer for a valid expiresAt and fails closed on an unparseable one', () => {
   assert.equal(isCardExpired({ ...CARD_113, expiresAt: '2000-01-01T00:00:00.000Z' }), true)
   assert.equal(isCardExpired({ ...CARD_113, expiresAt: new Date(Date.now() + 60_000).toISOString() }), false)
-  assert.equal(isCardExpired({ ...CARD_113, expiresAt: 'not a date' }), false)
+  assert.equal(isCardExpired({ ...CARD_113, expiresAt: 'not a date' }), true)
+  assert.equal(isCardExpired({ ...CARD_113, expiresAt: undefined as any }), true)
 })
 
 test('SDK COMPAT: a small-order key with a degenerate signature is refused (1.13 accepted it for every message)', () => {
