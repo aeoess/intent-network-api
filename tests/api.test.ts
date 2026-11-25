@@ -167,6 +167,24 @@ test('POST /api/cards with no needs and no offers → 400', async () => {
   assert.match(json.error, /at least one need or offer/i)
 })
 
+test('POST /api/cards with a signed expiresAt not in toISOString form → 400, nothing stored', async () => {
+  for (const expiresAt of ['2099-12-31', '2099-12-31T00:00:00.000+00:00', 'Dec 31 2099']) {
+    const base = createIntentCard({
+      agentId: 'odd-expiry-agent', principalAlias: 'Odd',
+      publicKey: keysBob.publicKey, privateKey: keysBob.privateKey,
+      needs: [{ category: 'test', description: 'odd expiry', priority: 'low', tags: ['t'], visibility: 'public' }], offers: [], ttlSeconds: 3600,
+    })
+    const { signature, ...unsigned } = base as any
+    const resigned = { ...unsigned, expiresAt }
+    const card = { ...resigned, signature: sign(canonicalize(resigned), keysBob.privateKey) }
+    const { status, json } = await req('POST', '/api/cards', card)
+    assert.equal(status, 400, expiresAt)
+    assert.match(json.error, /expiresAt must be a UTC timestamp/)
+  }
+  const check = await req('GET', '/api/cards/odd-expiry-agent')
+  assert.equal(check.status, 404)
+})
+
 // ── Matching (cold model) ──
 
 test('GET /api/matches/:agentId without embeddings → pending-embeddings, zero matches', async () => {

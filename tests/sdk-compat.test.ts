@@ -11,7 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { sign, verify, canonicalize, publicKeyFromPrivate } from 'agent-passport-system'
-import { verifyIntentCard, isCardExpired } from '../src/intent-card.js'
+import { verifyIntentCard, isCardExpired, isCanonicalTimestamp } from '../src/intent-card.js'
 import { verifyReceiptWith, deriveIssuerKeyId } from '../src/server-key.js'
 
 const seed = (s: string) => createHash('sha256').update(s).digest('hex')
@@ -84,4 +84,23 @@ test('SDK COMPAT: a small-order key with a degenerate signature is refused (1.13
   const identity = '01' + '00'.repeat(31)
   const degenerate = '01' + '00'.repeat(31) + '00'.repeat(32)
   assert.equal(verify('any message', degenerate, identity), false)
+})
+
+test('isCanonicalTimestamp accepts only the toISOString form', () => {
+  assert.equal(isCanonicalTimestamp('2026-12-01T00:00:00.000Z'), true)
+  assert.equal(isCanonicalTimestamp(new Date().toISOString()), true)
+  for (const v of [
+    '2026-12-01',
+    '2026-12-01T00:00:00Z',
+    '2026-12-01T00:00:00.000+00:00',
+    '2026-12-01T09:00:00.000+09:00',
+    'Dec 1 2026',
+    '2026-02-30T00:00:00.000Z',
+    ' 2026-12-01T00:00:00.000Z',
+    'not a date',
+    '',
+    undefined,
+    null,
+    1798761600000,
+  ]) assert.equal(isCanonicalTimestamp(v), false, String(v))
 })

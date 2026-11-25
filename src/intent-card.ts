@@ -34,3 +34,16 @@ export function isCardExpired(card: IntentCard): boolean {
   const at = Date.parse(String(card.expiresAt))
   return Number.isNaN(at) || at < Date.now()
 }
+
+/** True when v is a UTC timestamp in exactly the form Date.toISOString writes,
+ *  such as 2026-01-01T00:00:00.000Z. The cards table stores expiresAt as text,
+ *  and every expiry query in db.ts compares that text with
+ *  strftime('%Y-%m-%dT%H:%M:%fZ','now'), so only this form sorts in time order.
+ *  Date.parse also accepts a date alone, an offset and other forms. Those parse
+ *  to a valid time but compare wrongly as text, so a card could stay listed
+ *  after it expired. The round trip also refuses dates that do not exist. */
+export function isCanonicalTimestamp(v: unknown): v is string {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(v)) return false
+  const at = Date.parse(v)
+  return !Number.isNaN(at) && new Date(at).toISOString() === v
+}
